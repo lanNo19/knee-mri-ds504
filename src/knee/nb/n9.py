@@ -47,7 +47,7 @@ def _load_units(base: Path, n: int, row_of: dict) -> dict:
     """{encoder: [N, 12] S2 predictions} from every attached unit (a rerun replaces the original)."""
     out: dict = {}
     seen: dict = {}
-    for p in sorted(base.glob("**/units/*_f*/predictions.csv")):
+    for p in paths.glob_outputs("private/*/units/*_f*/predictions.csv", base):
         enc, fold = p.parent.name.rsplit("_f", 1)
         key = (enc, int(fold))
         if key in seen and not common.is_rerun(p.parent):
@@ -266,7 +266,7 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
 
             # H3: floor A
             FA = None
-            for cand in sorted(base.glob("**/private/n8/predictions.csv")):
+            for cand in paths.glob_outputs("private/n8/predictions.csv", base):
                 FA = _load_csv(cand, d.n, row_of)
                 break
             if FA is not None and np.isfinite(FA[ev]).all():
@@ -319,19 +319,20 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
             s["per_language"] = per_lang
 
             # S5 KneeMRI (from the laptop)
-            km = None
-            if kneemri_json and str(kneemri_json).startswith("https://"):
-                import urllib.request
+            km, km_status = None, "not run"
+            try:
+                if kneemri_json and str(kneemri_json).startswith("https://"):
+                    import urllib.request
 
-                with urllib.request.urlopen(str(kneemri_json), timeout=60) as r:  # the repo's committed summary
-                    km = json.loads(r.read().decode())
-            elif kneemri_json and Path(kneemri_json).exists():
-                km = json.loads(Path(kneemri_json).read_text())
-            if km is not None:
-                agg._check(km)
-                s["s5_kneemri"] = km
-            else:
-                s["s5_kneemri"] = {"status": "not run"}
+                    with urllib.request.urlopen(str(kneemri_json), timeout=60) as r:  # the repo's committed summary
+                        km = json.loads(r.read().decode())
+                elif kneemri_json and Path(kneemri_json).exists():
+                    km = json.loads(Path(kneemri_json).read_text())
+                if km is not None:
+                    agg._check(km)
+            except Exception:  # noqa: BLE001 - S5 is optional; the freeze file must still be written
+                km, km_status = None, "agg_kneemri.json could not be read or failed the checks"
+            s["s5_kneemri"] = km if km is not None else {"status": km_status}
 
             # Per-finding Delta1 (exploratory: the same intervals, unadjusted; they decide nothing)
             s["h1"]["per_finding_exploratory"] = {

@@ -42,7 +42,10 @@ NOTEBOOKS = {
     "n7": (True, False, False, ["n0", "n3", "n5", "n6a", "n6b"], 14400),
     "n9": (False, False, False, ["n0", "n3", "n5", "n6p", "n6a", "n6b", "n7", "n8"], 7200),
     "bundle": (False, False, False, [], 3600),
-    "n10": (True, True, False, ["n6a"], 32400),  # internet OFF; the bundle dataset is attached by hand
+    # internet OFF; the bundle dataset comes from --bundle-dataset
+    "n10-canary": (False, True, False, ["n0"], 32400),
+    "n10": (True, True, False, ["n0", "n6a"], 32400),
+    "n10-convnext": (True, True, False, ["n0", "n6a"], 32400),
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
 }
 
@@ -82,18 +85,25 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> s
         return "from knee.nb import montage; montage.run()"
     if name == "bundle":
         return "from knee.nb import bundle; bundle.run()"
+    if name == "n10-canary":
+        return "from knee.nb import n10; n10.run(canary=True)"
     if name == "n10":
         return 'from knee.nb import n10; n10.run("dinov2_vits14")'
+    if name == "n10-convnext":
+        return 'from knee.nb import n10; n10.run("convnext_tiny")'
     raise KeyError(name)
 
 
 CELL1_OFFLINE = (
     "import glob, subprocess, sys\n"
-    'W = (glob.glob("/kaggle/input/*/private/bundle/wheels") + glob.glob("/kaggle/input/datasets/*/*/private/bundle/wheels"))[0]\n'
-    'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-index", "--find-links", W, "knee", "timm==1.0.31",'
+    'W = sorted(glob.glob("/kaggle/input/*/private/bundle/wheels") + glob.glob("/kaggle/input/notebooks/*/*/private/bundle/wheels")'
+    ' + glob.glob("/kaggle/input/datasets/*/*/private/bundle/wheels"))\n'
+    'assert W, "attach the knee bundle dataset"\n'
+    'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-index", "--find-links", W[0], "knee", "timm==1.0.31",'
     ' "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)\n'
     "import knee.safe_log as sl; sl.install()"
 )
+OFFLINE = ("n10", "n10-convnext", "n10-canary")
 
 
 def cell1(commit: str, offline: bool = False) -> str:
@@ -116,15 +126,17 @@ def notebook_json(commit: str, code: str, offline: bool = False) -> dict:
             "nbformat": 4, "nbformat_minor": 5}
 
 
-def metadata(user: str, name: str, dread_file: str | None = None) -> dict:
+def metadata(user: str, name: str, dread_file: str | None = None, bundle: str | None = None) -> dict:
     gpu, comp, tables, up, _ = NOTEBOOKS[name]
     datasets = list(TABLES) if tables else []
     if dread_file and name in ("smoke", "n0"):
         datasets.append(DREAD)
+    if name in OFFLINE and bundle:
+        datasets.append(bundle)
     meta = {
         "id": f"{user}/knee-{name}", "title": f"knee-{name}", "code_file": "notebook.ipynb",
         "language": "python", "kernel_type": "notebook", "is_private": True,
-        "enable_gpu": gpu, "enable_internet": name != "n10",
+        "enable_gpu": gpu, "enable_internet": name not in OFFLINE,
         "competition_sources": [COMPETITION] if comp else [],
         "dataset_sources": datasets,
         "kernel_sources": [f"{user}/knee-{u}" for u in up],
@@ -142,13 +154,14 @@ def main(argv=None):
     ap.add_argument("--out", default="notebooks")
     ap.add_argument("--dread-file", default=None)
     ap.add_argument("--dread-provenance-ok", action="store_true")
+    ap.add_argument("--bundle-dataset", default=None, help="owner/slug of the private bundle dataset (N10)")
     a = ap.parse_args(argv)
     for name in NOTEBOOKS:
         d = Path(a.out) / name
         d.mkdir(parents=True, exist_ok=True)
         code = cell2(name, a.dread_file, a.dread_provenance_ok)
-        (d / "notebook.ipynb").write_text(json.dumps(notebook_json(a.commit, code, offline=name == "n10"), indent=1))
-        (d / "kernel-metadata.json").write_text(json.dumps(metadata(a.user, name, a.dread_file), indent=1))
+        (d / "notebook.ipynb").write_text(json.dumps(notebook_json(a.commit, code, offline=name in OFFLINE), indent=1))
+        (d / "kernel-metadata.json").write_text(json.dumps(metadata(a.user, name, a.dread_file, a.bundle_dataset), indent=1))
         (d / "timeout_s").write_text(f"{NOTEBOOKS[name][4]}\n")
     print(f"wrote {len(NOTEBOOKS)} notebooks under {a.out}/")
 

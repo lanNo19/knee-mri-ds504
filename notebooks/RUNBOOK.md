@@ -25,8 +25,9 @@ N10 runs with the internet off, so its cell 1 installs everything from the bundl
 
 ```python
 import glob, subprocess, sys
-W = (glob.glob("/kaggle/input/*/private/bundle/wheels") + glob.glob("/kaggle/input/datasets/*/*/private/bundle/wheels"))[0]
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-index", "--find-links", W, "knee", "timm==1.0.31", "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)
+W = sorted(glob.glob("/kaggle/input/*/private/bundle/wheels") + glob.glob("/kaggle/input/notebooks/*/*/private/bundle/wheels") + glob.glob("/kaggle/input/datasets/*/*/private/bundle/wheels"))
+assert W, "attach the knee bundle dataset"
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-index", "--find-links", W[0], "knee", "timm==1.0.31", "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)
 import knee.safe_log as sl; sl.install()
 ```
 
@@ -45,7 +46,8 @@ import knee.safe_log as sl; sl.install()
 | knee-n8 | None (CPU) | On | Outputs of knee-n0, knee-n3 and knee-n5 (N5's usable mask) |
 | knee-n6a-smoke, knee-n6a, knee-n6b | GPU T4 x2 | On | Outputs of knee-n0, knee-n3 and knee-n5 |
 | knee-n7 | GPU T4 x2 | On | Outputs of knee-n0, knee-n3, knee-n5, knee-n6a and knee-n6b (and any rerun such as knee-n6a-r) |
-| knee-n10 | GPU T4 x2 | **Off** | Competition; the bundle dataset; output of knee-n6a (for the canary: knee-n6a-smoke) |
+| knee-n10-canary | None (CPU) | **Off** | Competition; the bundle dataset; output of knee-n0 |
+| knee-n10, knee-n10-convnext | GPU T4 x2 | **Off** | Competition; the bundle dataset; outputs of knee-n0 and knee-n6a |
 | knee-bundle | None (CPU) | On | None (public wheels and checkpoints only; with Ablay's OK its output becomes a private versioned dataset) |
 | knee-n9 | None (CPU) | On | Outputs of knee-n0, knee-n3, knee-n5, knee-n6p, knee-n6a, knee-n6b (and reruns), knee-n7 and knee-n8 |
 | knee-montage | None (CPU) | On | Outputs of the three N4 notebooks; after the pilot also knee-n6p (Claude starts it, never opens it) |
@@ -74,7 +76,8 @@ lixin73/rsna-knee-llm-report-labels-sol56. Ablay records each one's version and 
 | knee-n6b | `from knee.nb import n6; n6.run("n6b", encoders=("vit_s16",), demo=True, backstop_utc="2026-11-24T03:00:00Z")` | 1-2 h | as N6a; demo.curves has the three arms |
 | knee-n7 | `from knee.nb import n7; n7.run()` | 20-60 min | missing_units empty for every encoder; the consensus configs go to the repo as configs/consensus.json (for KneeMRI S5) |
 | knee-n9 | `from knee.nb import n9; n9.run(hidden={"dinov2_vits14": <score>, "convnext_tiny": <score>})` (leave out hidden if S4 did not run) | 5-15 min | main_complete and findings_match_pilot true; agg_results.json is the freeze file; decisions.H1-H4 are read from it, never recomputed by hand |
-| knee-n10 | offline cell 1 below, then `from knee.nb import n10; n10.run("dinov2_vits14")` (ConvNeXt-T likewise, in its own notebook) | 1-4 h on the hidden test | submission.layout wide; rows_without_prediction 0; then ask Ablay before submitting (at most 5 a day) |
+| knee-n10-canary | offline cell 1, then `from knee.nb import n10; n10.run(canary=True)` | 1-3 h on the hidden test | the commit run on the public test files passes; submitted after Ablay's OK; scored = at most 1% of hidden studies failed to decode, a scoring error = more than 1% (deliberate) |
+| knee-n10, knee-n10-convnext | offline cell 1, then `from knee.nb import n10; n10.run("dinov2_vits14")` (knee-n10-convnext: `from knee.nb import n10; n10.run("convnext_tiny")`) | 2-5 h on the hidden test | submission.layout wide; folds [0, 1, 2, 3, 4]; failed_share at most 0.01; then ask Ablay before submitting (at most 5 a day) |
 | knee-bundle | `from knee.nb import bundle; bundle.run()` | 5-10 min | wheels_ok and checkpoints_ok true; then ask Ablay before saving the output as a private versioned dataset |
 | knee-montage | `from knee.nb import montage; montage.run()` | 2 min | (Ablay looks at private/montage/*.png, including pairs.png after the pilot, in his own browser, and passes confirmed pair_ids to N3) |
 

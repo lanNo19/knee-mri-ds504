@@ -58,6 +58,22 @@ def find_file(name: str, root: Path | None = None, max_depth: int = 6) -> Path |
     return None
 
 
+def glob_outputs(pattern: str, root: Path | None = None) -> list[Path]:
+    """Files matching `pattern` inside attached outputs and datasets, without walking the competition.
+
+    Mounts differ between Kaggle images (input/<slug>/, input/notebooks/<owner>/<slug>/,
+    input/datasets/<owner>/<slug>/), so the pattern is tried under each of them."""
+    base = Path(root or INPUT)
+    hits = set()
+    for prefix in ("", "*/", "notebooks/*/*/", "datasets/*/*/"):
+        for p in base.glob(prefix + pattern):
+            rel = p.relative_to(base).parts
+            if rel and rel[0] in (COMPETITION, "competitions"):
+                continue
+            hits.add(p)
+    return sorted(hits)
+
+
 def find_label_table(key: str, root: Path | None = None) -> Path | None:
     """Path of one public label table, or None if it is not attached."""
     _, fname = LABEL_TABLES[key]

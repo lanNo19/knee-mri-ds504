@@ -79,6 +79,8 @@ class FitResult:
     seconds: float = 0.0
     model: object = None
     pruned: bool = False
+    steps_run: int = 0
+    final_lr: float = float("nan")
 
 
 class Bank:
@@ -232,9 +234,13 @@ def predict(bank: Bank, model, idx, cfg: Config, stats: dict, use_flip: bool = T
 
 def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs: int | None = None,
         seed: int = 0, stats: dict | None = None, forbidden=None, max_epochs: int = MAX_EPOCHS,
-        patience: int | None = PATIENCE, on_epoch=None) -> FitResult:
+        patience: int | None = PATIENCE, on_epoch=None, steps: int | None = None,
+        schedule_steps_per_epoch: int | None = None) -> FitResult:
     """Inner fit (val_idx given): early stopping on the validation macro AUC over `findings`.
     Refit (epochs given): exactly that many epochs of the 30-epoch schedule; no stopping rule.
+    Fixed-steps refit (steps given, KneeMRI S5): exactly `steps` optimiser steps of a schedule whose
+    epoch is `schedule_steps_per_epoch` steps (the RSNA refit's), so learning rate and step count
+    match the RSNA refit even though the dataset is smaller.
     on_epoch(epoch, score) -> True stops the fit as pruned (the HPO demo's successive halving)."""
     import torch
     import torch.nn.functional as F
@@ -251,6 +257,8 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
     if bank.device.type == "cuda":
         with torch.cuda.device(bank.device):
             torch.cuda.manual_seed(seed)
+    elif bank.device.type == "mps":
+        torch.mps.manual_seed(seed)
     model = model.to(bank.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8,
                             weight_decay=cfg.weight_decay)
@@ -258,8 +266,9 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
     n = len(train_idx)
     bs = max(1, int(cfg.batch_size))
     steps_per_epoch = math.ceil(n / bs)
-    total = MAX_EPOCHS * steps_per_epoch
-    warm = WARMUP_EPOCHS * steps_per_epoch
+    spe_sched = int(schedule_steps_per_epoch) if schedule_steps_per_epoch else steps_per_epoch
+    total = MAX_EPOCHS * spe_sched
+    warm = WARMUP_EPOCHS * spe_sched
 
     def lr_at(step):
         if step < warm:
@@ -271,13 +280,19 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
     pos, neg = (yb == 1).sum(0), (yb == 0).sum(0)
     pw = torch.tensor(np.minimum(neg / np.maximum(pos, 1), cfg.pos_cap), dtype=torch.float32, device=bank.device)
     tr_t = torch.as_tensor(train_idx, device=bank.device)
-    n_epochs = int(epochs) if epochs is not None else int(max_epochs)
+    if steps is not None:  # fixed number of optimiser steps: as many epochs as it takes
+        n_epochs = math.ceil(int(steps) / steps_per_epoch)
+    else:
+        n_epochs = int(epochs) if epochs is not None else int(max_epochs)
     res = FitResult(best_epoch=n_epochs, best_score=float("nan"))
     best, since = -np.inf, 0
+    done = 0
     for ep in range(1, n_epochs + 1):
         model.train()
         perm = tr_t[torch.randperm(n, generator=gen).to(bank.device)]
         for i in range(0, n, bs):
+            if steps is not None and done >= int(steps):
+                break
             b = perm[i:i + bs]
             logits = model(_inputs(bank, b, planes, stats))
             w = bank.w[b]
@@ -286,8 +301,11 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
+            res.final_lr = float(opt.param_groups[0]["lr"])
             sched.step()
+            done += 1
         res.epochs_run = ep
+        res.steps_run = done
         if val_idx is not None and epochs is None:
             pv = predict(bank, model, val_idx, cfg, stats, use_flip=False)
             yv = bank.eval_y[np.asarray(val_idx)]

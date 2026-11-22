@@ -61,10 +61,17 @@ def upstream(file_name: str, explicit: Path | None = None) -> tuple[Path, dict]:
 
 
 def is_rerun(path) -> bool:
-    """A rerun notebook's output (slug ending in -r or -r2..., e.g. knee-n6a-r, or a step named n6a_r)."""
+    """A rerun notebook's output: its slug ends in -r or -r2... (knee-n6a-r), or its step folder under
+    private/ does (n6a_r). Only those two path parts are checked, never an owner folder."""
     import re
 
-    return any(re.search(r"[-_]r\d*$", part) for part in Path(path).parts)
+    parts = Path(path).parts
+    cands = [p for p in parts if p.startswith("knee-")]
+    if "private" in parts:
+        i = parts.index("private")
+        if i + 1 < len(parts):
+            cands.append(parts[i + 1])
+    return any(re.search(r"[-_]r\d*$", p) for p in cands)
 
 
 def expect(info: dict, sha16_prefix: str | None) -> None:

@@ -33,9 +33,8 @@ from . import common
 
 def unit_configs(root: Path | None = None) -> dict:
     """{encoder: {fold: unit summary}} from every attached Stage A unit (a rerun replaces the original)."""
-    base = Path(root) if root else paths.INPUT
     found: dict = {}
-    for p in sorted(base.glob("**/units/*_f*/config.json")):
+    for p in paths.glob_outputs("private/*/units/*_f*/config.json", root):
         u = json.loads(p.read_text())
         prev = found.setdefault(u["encoder"], {}).get(int(u["fold"]))
         if prev is None or common.is_rerun(p.parent):

@@ -29,6 +29,7 @@ import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import replace
 from pathlib import Path
 
@@ -117,6 +118,7 @@ def _guarded(fn, task, out_dir: Path):
     try:
         return fn(task, out_dir)
     except BaseException as e:  # noqa: BLE001
+        _signal_fold0(task, "failed")
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "error.log").write_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
@@ -162,12 +164,28 @@ def _fold_mode(task: dict) -> str:
         return modes[k]
 
 
-def _fold0_l2(task: dict, enc: str, wait_s: float = 1800.0) -> tuple[dict | None, str]:
-    """L2 settings found on fold 0 for this encoder (simplified tuning reuses them for every fold)."""
+def _signal_fold0(task: dict, state: str) -> None:
+    """Fold 0 tells the other folds' units that its L2 settings are ready ("done") or will not come."""
+    shared = _W.get("shared")
+    if shared is not None and task.get("fold") == 0 and "encoder" in task:
+        shared["fold0"][task["encoder"]] = state
+
+
+def _fold0_l2(task: dict, enc: str) -> tuple[dict | None, str]:
+    """L2 settings found on fold 0 for this encoder (simplified tuning reuses them for every fold).
+
+    Waits until fold 0's unit has finished or failed, bounded by the soft stop (0.75 x budget)."""
     p = Path(task["dir"]).parent / f"{enc}_f0" / "config.json"
-    t0 = time.time()
-    while not p.exists() and time.time() - t0 < wait_s and task["fold"] != 0:
-        time.sleep(30)
+    if not task.get("fold0_in_run", True):  # e.g. a rerun of one fold: use the attached original fold 0
+        hits = paths.glob_outputs(f"private/*/units/{enc}_f0/config.json", Path(_W["root"]) if _W.get("root") else None)
+        p = hits[0] if hits else p
+    shared = _W.get("shared")
+    while task.get("fold0_in_run", True) and not p.exists() and time.time() < task["soft_stop"]:
+        if shared is not None and shared["fold0"].get(enc) == "failed":
+            break
+        if shared is None and not Path(task["dir"]).parent.joinpath(f"{enc}_f0").exists():
+            break  # tests without a manager: nothing to wait for
+        time.sleep(15)
     if not p.exists():
         return None, "defaults"
     c = json.loads(p.read_text())["config"]
@@ -278,6 +296,7 @@ def _unit(task: dict, od: Path) -> dict:
                "inner_k": len(folds_in), "seconds": round(time.time() - t0, 1),
                "predictions_sha16": common.sha16(od / "predictions.csv")}
     (od / "config.json").write_text(json.dumps(summary, indent=1))
+    _signal_fold0(task, "done")
     shared = _W.get("shared")
     if shared is not None and mode == "nested":
         shared["durations"].append(time.time() - t0)
@@ -412,39 +431,58 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
                          "unit_s_est": unit_hours_est * 3600 if unit_hours_est else None,
                          "n_trials": n_trials, "l1_grid": l1_grid}
             # fold by fold, so both encoders of a fold start (and are switched or skipped) together
-            tasks = [{**base_task, "id": f"{e}_f{k}", "encoder": e, "fold": k, "dir": str(od / "units" / f"{e}_f{k}")}
+            tasks = [{**base_task, "id": f"{e}_f{k}", "encoder": e, "fold": k, "dir": str(od / "units" / f"{e}_f{k}"),
+                      "fold0_in_run": 0 in fold_list}
                      for k in fold_list for e in encoders]
             n_gpus = torch.cuda.device_count()
             ctx = mp.get_context("spawn")
             counter = ctx.Value("i", 0)
             mgr = ctx.Manager()
-            shared = {"lock": mgr.Lock(), "modes": mgr.dict(), "durations": mgr.list()}
+            shared = {"lock": mgr.Lock(), "modes": mgr.dict(), "durations": mgr.list(), "fold0": mgr.dict()}
             units, fails = {}, {}
+            demo_task = ({"id": "demo", "encoder": "dinov2_vits14", "seed": seed, "eligible": elig,
+                          "dir": str(od / "demo"), "demo_epochs": demo_epochs} if demo else None)
+            pending = list(tasks)
             try:
-                with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=ctx, initializer=_init,
-                                         initargs=(counter, n_gpus, str(root) if root else None, expect, shared)) as ex:
-                    futs = {ex.submit(_unit_task, t): t["id"] for t in tasks}
-                    if demo:
-                        futs[ex.submit(_demo_task, {"id": "demo", "encoder": "dinov2_vits14", "seed": seed,
-                                                    "eligible": elig, "dir": str(od / "demo"),
-                                                    "demo_epochs": demo_epochs})] = "demo"
-                    for f in as_completed(futs):
-                        try:
-                            r = f.result()
-                        except BaseException as e:  # noqa: BLE001 - a worker crash loses only its task
-                            r = {"task": futs[f], "ok": False, "error": safe_log.describe(type(e), e.__traceback__)}
-                        if r["task"] == "demo":
-                            s["demo"] = r.get("summary") or {"ok": False, "error": r.get("error")}
-                            continue
-                        if r.get("ok"):
-                            u = r["summary"]
-                            agg.write(f"{name}_{r['task']}", u)  # written as each unit completes
-                            units[r["task"]] = {"ok": True, "tuning": u["tuning"], "l1_winner": u["l1_winner"],
-                                                "E": u["E"], "best_inner_score": u["best_inner_score"],
-                                                "seconds": u["seconds"]}
-                        else:
-                            units[r["task"]] = {"ok": False, "skipped": bool(r.get("skipped")), "error": r.get("error")}
-                            fails[r["task"]] = r.get("error")
+                for attempt in (1, 2):
+                    # a hard worker crash breaks the whole pool: the tasks it took down run once more
+                    # in a fresh pool (finished units keep their outputs)
+                    crashed = []
+                    with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=ctx, initializer=_init,
+                                             initargs=(counter, n_gpus, str(root) if root else None, expect,
+                                                       shared)) as ex:
+                        futs = {ex.submit(_unit_task, t): t for t in pending}
+                        if demo_task is not None:
+                            futs[ex.submit(_demo_task, demo_task)] = demo_task
+                        for f in as_completed(futs):
+                            t = futs[f]
+                            try:
+                                r = f.result()
+                            except BrokenProcessPool:
+                                crashed.append(t)
+                                continue
+                            except BaseException as e:  # noqa: BLE001
+                                r = {"task": t["id"], "ok": False, "error": safe_log.describe(type(e), e.__traceback__)}
+                            if r["task"] == "demo":
+                                s["demo"] = r.get("summary") or {"ok": False, "error": r.get("error")}
+                                demo_task = None
+                                continue
+                            if r.get("ok"):
+                                u = r["summary"]
+                                agg.write(f"{name}_{r['task']}", u)  # written as each unit completes
+                                units[r["task"]] = {"ok": True, "tuning": u["tuning"], "l1_winner": u["l1_winner"],
+                                                    "E": u["E"], "best_inner_score": u["best_inner_score"],
+                                                    "seconds": u["seconds"]}
+                            else:
+                                units[r["task"]] = {"ok": False, "skipped": bool(r.get("skipped")), "error": r.get("error")}
+                                fails[r["task"]] = r.get("error")
+                    pending = [t for t in crashed if t["id"] != "demo"]
+                    if not crashed:
+                        break
+                for t in pending:  # crashed twice
+                    units[t["id"]] = {"ok": False, "skipped": False, "error": "worker crashed twice"}
+                if demo_task is not None and "demo" not in s:
+                    s["demo"] = {"ok": False, "error": "worker crashed twice"}
                 s["fold_modes"] = {f"fold_{k}": v for k, v in dict(shared["modes"]).items()}
             finally:
                 mgr.shutdown()

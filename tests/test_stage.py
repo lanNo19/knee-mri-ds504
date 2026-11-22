@@ -120,6 +120,35 @@ def test_heads_learn_and_respect_the_leakage_guard(pooling):
         heads.fit(bank, cfg, tr, np.arange(190, 250), forbidden=te)  # validation overlaps training
 
 
+def test_fixed_steps_fit_follows_the_rsna_schedule():
+    import math
+
+    from knee import heads
+
+    bank, _ = _bank(n=80)
+    cfg = heads.Config(pooling="mean", batch_size=16, lr=1e-3)  # 5 steps per epoch on this data
+    r = heads.fit(bank, cfg, np.arange(80), steps=60, schedule_steps_per_epoch=20)
+    assert r.steps_run == 60 and r.epochs_run == 12  # 12 small epochs = 3 RSNA epochs of 20 steps
+    warm, total = 20, heads.MAX_EPOCHS * 20
+    want = 1e-3 * 0.5 * (1 + math.cos(math.pi * (59 - warm) / (total - warm)))
+    assert r.final_lr == pytest.approx(want, rel=1e-6)  # the RSNA refit's learning rate at its last step
+
+
+def test_rerun_rule_and_output_search(tmp_path):
+    from knee import paths as kp
+    from knee.nb.common import is_rerun
+
+    assert is_rerun("/kaggle/input/knee-n6a-r/private/n6a/units/x_f0")
+    assert is_rerun("/w/private/n6a_r/units/x_f0")
+    assert not is_rerun("/kaggle/input/notebooks/mr-r/knee-n6a/private/n6a/units/x_f0")  # owner folders are ignored
+    for d in ("knee-n6a/private/n6a/units/a_f0", "notebooks/o/knee-n6b/private/n6b/units/b_f1",
+              f"{kp.COMPETITION}/private/x/units/c_f2"):
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / "config.json").write_text("{}")
+    found = [p.parent.name for p in kp.glob_outputs("private/*/units/*_f*/config.json", tmp_path)]
+    assert found == ["a_f0", "b_f1"]  # the competition folder is never searched
+
+
 def test_refit_runs_exactly_e_epochs():
     from knee import heads
 

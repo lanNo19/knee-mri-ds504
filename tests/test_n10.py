@@ -27,11 +27,20 @@ def comp_env(tmp_path, monkeypatch):
     shutil.copy(comp / "train_series.csv", comp / "test_series.csv")
     uids = sorted(pd.read_csv(comp / "test_series.csv")[UID].astype(str).unique())
     pd.DataFrame({UID: uids, **{f: 0.5 for f in FINDINGS}}).to_csv(comp / "sample_submission.csv", index=False)
-    # the offline bundle: a full-size checkpoint (random weights; nothing is downloaded)
+    # the offline bundle: a full-size checkpoint (random weights; nothing is downloaded) and its manifest
     ck = inp / "knee-bundle" / "private" / "bundle" / "checkpoints"
     ck.mkdir(parents=True)
     enc = encoders.Encoder("dinov2_vits14", "cpu", pretrained=False)
     torch.save(enc.model.state_dict(), ck / "dinov2_vits14.pth")
+    import hashlib
+
+    sha = hashlib.sha256((ck / "dinov2_vits14.pth").read_bytes()).hexdigest()
+    (ck.parent / "manifest.json").write_text(json.dumps({"commit": "abcdef1234567890",
+                                                         "files_sha256": {"dinov2_vits14.pth": sha}}))
+    # N0's summary: the training prevalence for the per-study fallback
+    n0 = inp / "knee-n0"
+    n0.mkdir()
+    (n0 / "agg_n0.json").write_text(json.dumps({"labels": {"prevalence_training": {f: 0.2 for f in FINDINGS}}}))
     # two Stage A units
     cfg = heads.Config(pooling="gated", planes="all")
     for k in (0, 1):
@@ -61,7 +70,29 @@ def test_n10_writes_a_complete_submission(comp_env, capfd):
     v = sub[FINDINGS].to_numpy()
     assert np.isfinite(v).all() and ((v > 0) & (v < 1)).all()
     assert s["submission"]["layout"] == "wide" and s["folds"] == [0, 1]
+    assert s["bundle_commit"] == "abcdef123456" and s["failed_share"] == 0.0
     assert set(p.name for p in paths.WORKING.iterdir() if p.is_file()) <= {"submission.csv", "agg_n10.json", "run.json"}
+    assert not (paths.WORKING / "private").exists() or not any((paths.WORKING / "private").rglob("*.u8"))  # caches in /tmp
+
+
+def test_n10_canary_submits_prevalence_and_fails_on_purpose(comp_env):
+    from knee import safe_log
+    from knee.nb import n10
+
+    s = n10.run(canary=True, workers=2, quiet=True)
+    sub = pd.read_csv(paths.WORKING / "submission.csv")
+    assert np.allclose(sub[FINDINGS].to_numpy(), 0.2) and s["folds"] == []
+    # one study's coronal series all go missing: 1 of 7 studies (> 1%) cannot be decoded
+    comp = paths.INPUT / paths.COMPETITION
+    ser = pd.read_csv(comp / "test_series.csv")
+    cor = ser[ser["Anatomical_Plane"].astype(str).str.lower().str.startswith("cor")]
+    study = cor[UID].iloc[0]
+    for se in cor.loc[cor[UID] == study, "SeriesInstanceUID"]:
+        shutil.rmtree(comp / "test_series" / str(study) / str(se))
+    with pytest.raises(safe_log.StepFailed):
+        n10.run(canary=True, workers=2, quiet=True)
+    out = json.loads((paths.WORKING / "agg_n10.json").read_text())
+    assert out["failed_share"] > 0.01
 
 
 def test_unknown_submission_layout_is_refused():

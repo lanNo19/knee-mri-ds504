@@ -43,5 +43,7 @@ def test_kneemri_cache_embed_indomain(tmp_path):
     out = json.loads((tmp_path / "out" / "agg_kneemri.json").read_text())
     agg._check(out)  # N9 runs the same check
     assert set(out["in_domain_acl_auc"]) == set(SMALL)
-    assert all(v["epochs"] >= 1 for v in s["by_encoder"].values())
+    for v in s["by_encoder"].values():
+        # 30 RSNA steps (E = 10, so 3 steps per RSNA epoch) on about 48 exams in batches of 16
+        assert v["steps"] == 30 and v["epochs"] == 10 and v["final_lr"] > 0
     assert "delta_dinov2_minus_convnext" in out
