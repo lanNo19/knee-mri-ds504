@@ -33,6 +33,9 @@ import knee.safe_log as sl; sl.install()
 | knee-n5 | GPU T4 x2 | On | Outputs of the three N4 notebooks |
 | knee-n6p | GPU T4 x2 | On | Outputs of knee-n0, knee-n3 and knee-n5 |
 | knee-n8 | None (CPU) | On | Outputs of knee-n0 and knee-n3 |
+| knee-n6a-smoke, knee-n6a, knee-n6b | GPU T4 x2 | On | Outputs of knee-n0, knee-n3 and knee-n5 |
+| knee-n7 | GPU T4 x2 | On | Outputs of knee-n0, knee-n3, knee-n5, knee-n6a and knee-n6b (and any rerun such as knee-n6a-r) |
+| knee-n9 | None (CPU) | On | Outputs of knee-n0, knee-n3, knee-n5, knee-n6p, knee-n6a, knee-n6b (and reruns), knee-n7 and knee-n8 |
 | knee-montage | None (CPU) | On | Outputs of the three N4 notebooks; after the pilot also knee-n6p (Claude starts it, never opens it) |
 
 Keep the editor on accelerator None while editing; switch to GPU T4 x2 only for the
@@ -54,6 +57,11 @@ lixin73/rsna-knee-llm-report-labels-sol56. Ablay records each one's version and 
 | knee-n5 | `from knee.nb import n5; n5.run()` | 20-45 min | checks: study_tables_match, all_finite, missing_rows_zero, features_vary, gpu_agreement and normalisation_as_planned all true; usable_share at least 0.98; the summary block shows index_sha16 |
 | knee-n6p | `from knee.nb import n6p; n6p.run(expect={"n0_studies": "<8 chars>", "n3_folds": "<8 chars>", "n5_index": "<8 chars>"})` | 20-40 min | positive_control.all_passed true (else the alignment audit before Stage A); overlap_control.passed true (known_answer_detected false = underpowered, reported, no audit); leakage_assertion_passed true; write half_width_delta1.union into Phase 1 before Stage A; near_duplicates.to_review pairs go to the montage |
 | knee-n8 | `from knee.nb import n8; n8.run()` | 20-60 min | leakage_assertion_passed true; n_folds as in N3; s2_macro_auc recorded (H3 is decided in N9) |
+| knee-n6a-smoke | `from knee.nb import n6; n6.run("n6a_smoke", encoders=("dinov2_vits14",), folds=(0,))` | 15-40 min | all_units_ok and leakage_assertion_passed true; the unit's seconds times 10 / 4 workers is N6a's expected wall time |
+| knee-n6a | `from knee.nb import n6; n6.run("n6a", encoders=("dinov2_vits14", "convnext_tiny"))` | 1.5-3 h | all_units_ok and leakage_assertion_passed true (a failed unit: rerun it alone in knee-n6a-r with `folds=(k,)`) |
+| knee-n6b | `from knee.nb import n6; n6.run("n6b", encoders=("vit_s16",), demo=True)` | 1-2 h | as N6a; demo.curves has the three arms |
+| knee-n7 | `from knee.nb import n7; n7.run()` | 20-60 min | missing_units empty for every encoder; the consensus configs go to the repo as configs/consensus.json (for KneeMRI S5) |
+| knee-n9 | `from knee.nb import n9; n9.run(hidden={"dinov2_vits14": <score>, "convnext_tiny": <score>})` (leave out hidden if S4 did not run) | 5-15 min | main_complete and findings_match_pilot true; agg_results.json is the freeze file; decisions.H1-H4 are read from it, never recomputed by hand |
 | knee-montage | `from knee.nb import montage; montage.run()` | 2 min | (Ablay looks at private/montage/*.png, including pairs.png after the pilot, in his own browser, and passes confirmed pair_ids to N3) |
 
 Counts in every summary: 1-4 show as "<5" and larger counts are rounded to the nearest 5, so a

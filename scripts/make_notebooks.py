@@ -36,6 +36,11 @@ NOTEBOOKS = {
     "n5": (True, False, False, ["n4-sagittal", "n4-coronal", "n4-axial"], 14400),
     "n6p": (True, False, False, ["n0", "n3", "n5"], 14400),
     "n8": (False, False, False, ["n0", "n3"], 10800),
+    "n6a-smoke": (True, False, False, ["n0", "n3", "n5"], 7200),
+    "n6a": (True, False, False, ["n0", "n3", "n5"], 32400),
+    "n6b": (True, False, False, ["n0", "n3", "n5"], 32400),
+    "n7": (True, False, False, ["n0", "n3", "n5", "n6a", "n6b"], 14400),
+    "n9": (False, False, False, ["n0", "n3", "n5", "n6p", "n6a", "n6b", "n7", "n8"], 7200),
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
 }
 
@@ -54,6 +59,16 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> s
         return "from knee.nb import n6p; n6p.run()"
     if name == "n8":
         return "from knee.nb import n8; n8.run()"
+    if name == "n7":
+        return "from knee.nb import n7; n7.run()"
+    if name == "n9":
+        return "from knee.nb import n9; n9.run()"
+    if name == "n6a-smoke":
+        return 'from knee.nb import n6; n6.run("n6a_smoke", encoders=("dinov2_vits14",), folds=(0,))'
+    if name == "n6a":
+        return 'from knee.nb import n6; n6.run("n6a", encoders=("dinov2_vits14", "convnext_tiny"))'
+    if name == "n6b":
+        return 'from knee.nb import n6; n6.run("n6b", encoders=("vit_s16",), demo=True)'
     if name == "n0":
         arg = f"dread_file={dread_file!r}, dread_provenance_ok={bool(dread_ok)}" if dread_file else ""
         return f"from knee.nb import n0; n0.run({arg})"

@@ -51,6 +51,18 @@ def test_macro_is_nan_when_a_fixed_finding_is_undefined():
 
 # ---------------------------------------------------------------- intervals
 
+def test_intervals_refuse_studies_without_a_group():
+    with pytest.raises(ValueError):
+        intervals.cluster_bootstrap(lambda w: 0.0, np.array(["A", None, "B"], dtype=object), n_boot=5)
+
+
+def test_scoring_rule_counts_uncertain_as_negative():
+    from knee import heads
+
+    b = np.array([[1.0, np.nan], [0.0, 1.0]])
+    assert heads.scoring_labels(b).tolist() == [[1.0, 0.0], [0.0, 1.0]]
+
+
 def test_decision_rule_order():
     assert intervals.decide(-0.01, 0.015) == "equivalent"
     assert intervals.decide(0.001, 0.05) == "A better"
@@ -136,8 +148,10 @@ def test_n6p_pilot(stage_env, monkeypatch, capfd):
     printed = capfd.readouterr()
     text = printed.out + printed.err + (paths.WORKING / "agg_pilot.json").read_text()
     assert not [u for u in facts["uids"] if u in text]
-    assert len(s["eligible_findings"]) == 12
-    assert s["positive_control"]["all_passed"]
+    assert s["findings"] == list(__import__("knee.labels", fromlist=["FINDINGS"]).FINDINGS)  # all 12
+    pc = s["positive_control"]
+    assert pc["all_passed"] and set(pc) == {"min", "passed", "all_passed", "lowest_s2_macro_auc"}
+    assert (paths.WORKING / "private" / "n6p" / "positive_control.json").exists()  # values stay private
     hw = s["half_width_delta1"]
     assert hw["union"] >= max(hw["bootstrap"], hw["jackknife"]) - 1e-9
     assert "estimate" not in hw and "lo" not in hw  # the pilot shows no direction for H1
@@ -147,7 +161,8 @@ def test_n6p_pilot(stage_env, monkeypatch, capfd):
     pairs = pd.read_csv(paths.WORKING / "private" / "n6p" / "pairs.csv")
     got = {frozenset(x) for x in zip(pairs["uid_a"], pairs["uid_b"])}
     assert all(frozenset(p) in got for p in facts["dup_pairs"])
-    assert s["projection"]["n6a_hours_one_process"] > 0
+    wall = s["projection"]["n6a_wall_hours"]
+    assert 0 < wall["low"] <= wall["high"]
     json.loads((paths.WORKING / "agg_pilot.json").read_text())
 
 
@@ -176,3 +191,63 @@ def test_n8_floor_a(stage_env, monkeypatch, capfd):
     assert gold & set(pred["StudyInstanceUID"])  # gold studies are scored by their fold's model
     trials = pd.read_csv(paths.WORKING / "private" / "n8" / "trials.csv")
     assert len(trials) == 5 * 3
+
+
+# ---------------------------------------------------------------- N6 Stage A
+
+def test_n6_stage_a_units_and_demo(stage_env, monkeypatch, capfd):
+    pytest.importorskip("optuna")
+    from knee.nb import n6
+
+    root, facts = stage_env
+    monkeypatch.setattr(paths, "WORKING", root / "working_n6")
+    s = n6.run("n6a", encoders=("dinov2_vits14",), folds=(0, 1), demo=True, root=root / "input", workers=2,
+               n_trials=3, l1_grid=[("mean", "sag"), ("gated", "all")], demo_epochs=60, quiet=True)
+    # (slow on 2 CPU cores: two units, the L1 grid and 30 trials are cut down; the logic is the same)
+    printed = capfd.readouterr()
+    agg_files = list(paths.WORKING.glob("agg_*.json"))
+    text = printed.out + printed.err + "".join(f.read_text() for f in agg_files)
+    assert not [u for u in facts["uids"] if u in text]
+    assert s["all_units_ok"], s["units"]
+    assert s["leakage_assertion_passed"]
+    assert {f.name for f in agg_files} >= {"agg_n6a.json", "agg_n6a_dinov2_vits14_f0.json", "agg_n6a_dinov2_vits14_f1.json"}
+    folds = pd.read_csv(root / "input" / "n3" / "private" / "n3" / "folds.csv").set_index("StudyInstanceUID")
+    for k in (0, 1):
+        ud = paths.WORKING / "private" / "n6a" / "units" / f"dinov2_vits14_f{k}"
+        pred = pd.read_csv(ud / "predictions.csv").set_index("StudyInstanceUID")
+        f = folds.loc[pred.index]
+        # only the test fold and the gold studies of that fold are predicted by this unit
+        assert ((f["s2_fold"] == k) & (f["train"] | f["is_gold"])).all()
+        assert (ud / "head.pt").exists() and (ud / "trials.csv").exists()
+        trials = pd.read_csv(ud / "trials.csv")
+        assert len(trials) == 3 and trials.loc[0, "lr"] == pytest.approx(3e-4)  # trial 0 = the defaults
+    demo = s["demo"]
+    assert set(demo["curves"]) == {"random", "successive_halving", "gp"}
+
+
+# ---------------------------------------------------------------- N7 and N9
+
+def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
+    from knee.nb import n7, n9
+    from tests.synth_stage import make_units
+
+    root, facts = stage_env
+    make_units(root / "input")
+    monkeypatch.setattr(paths, "WORKING", root / "input" / "n7out")  # N9 then finds N7's csvs under input
+    s7 = n7.run(root=root / "input", device="cpu", quiet=True)
+    con = s7["consensus"]["dinov2_vits14"]
+    assert con["config"]["pooling"] == "gated" and con["E"] == 6  # gated won 3 of 5 folds
+    assert not any(v["folds"] for v in s7["missing_units"].values())
+    monkeypatch.setattr(paths, "WORKING", root / "working_n9")
+    s9 = n9.run(root=root / "input", n_boot=200, hidden={"dinov2_vits14": 0.9, "convnext_tiny": 0.85}, quiet=True)
+    printed = capfd.readouterr()
+    text = printed.out + printed.err + (paths.WORKING / "agg_results.json").read_text()
+    assert not [u for u in facts["uids"] if u in text]
+    assert s9["main_complete"]
+    assert s9["h1"]["g_lang"]["category"] == "DINOv2 better"
+    assert s9["h1"]["decision"] in ("DINOv2 better", "inconclusive (grouping-sensitive)")
+    assert s9["h2"]["category"] in ("supported", "opposite", "equivalent", "inconclusive")
+    assert s9["h3"]["supported"] is True and s9["decisions"]["H3"] == "supported"
+    assert s9["s3_gold"]["consistent"] and s9["s4_hidden"]["consistent"]
+    assert s9["anti_claim_1"]["d_pre"]["estimate"] > 0
+    assert s9["decisions"]["H4"].startswith("not run")

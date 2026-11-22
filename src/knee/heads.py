@@ -36,6 +36,12 @@ WARMUP_EPOCHS = 1
 N_OUT = 12
 
 guard_checks = 0  # fits whose index sets passed the leakage assertion
+_INIT_LOCK = None  # serialises seeded weight initialisation across threads (N6p runs two GPUs)
+
+
+def scoring_labels(binary) -> np.ndarray:
+    """The plan's scoring rule: uncertain (exactly 0.5 or masked) counts as negative."""
+    return np.nan_to_num(np.asarray(binary, float), nan=0.0)
 
 
 class LeakageError(AssertionError):
@@ -70,18 +76,21 @@ class FitResult:
     epochs_run: int = 0
     seconds: float = 0.0
     model: object = None
+    pruned: bool = False
 
 
 class Bank:
     """One encoder's slice embeddings and the labels, on one device.
 
     emb[plane]: float16 [N, S, D]; soft, weight: float32 [N, 12] (soft NaN = masked);
-    binary: float [N, 12] with NaN for uncertain; flip[plane]: float16 [M, S, D] for
-    unresolved-laterality studies (flip_row >= 0), coronal and axial only.
+    binary: float [N, 12] with NaN for uncertain (positive weights only); eval_y: the
+    scoring labels (plan: uncertain counts as negative), used for inner validation;
+    flip[plane]: float16 [M, S, D] for unresolved-laterality studies (flip_row >= 0),
+    coronal and axial only.
     """
 
     def __init__(self, emb: dict, soft, weight, binary, flip: dict | None = None, flip_row=None,
-                 device: str = "cpu"):
+                 device: str = "cpu", eval_y=None):
         import torch
 
         self.device = torch.device(device)
@@ -91,6 +100,7 @@ class Bank:
         self.y = torch.from_numpy(np.nan_to_num(soft, nan=0.0)).to(self.device)
         self.w = torch.from_numpy(np.nan_to_num(wt, nan=0.0).astype(np.float32)).to(self.device)
         self.binary = np.asarray(binary, float)
+        self.eval_y = scoring_labels(self.binary) if eval_y is None else np.asarray(eval_y, float)
         self.n = len(soft)
         self.flip = {p: torch.from_numpy(np.ascontiguousarray(a)).to(self.device) for p, a in (flip or {}).items()}
         self.flip_row = np.full(self.n, -1, int) if flip_row is None else np.asarray(flip_row, int)
@@ -106,6 +116,7 @@ class Bank:
         b.y = torch.from_numpy(np.nan_to_num(soft, nan=0.0)).to(self.device)
         b.w = torch.from_numpy(np.nan_to_num(wt, nan=0.0).astype(np.float32)).to(self.device)
         b.binary = np.asarray(binary, float)
+        b.eval_y = scoring_labels(b.binary)
         return b
 
     def stats(self, idx) -> dict:
@@ -218,20 +229,31 @@ def predict(bank: Bank, model, idx, cfg: Config, stats: dict, use_flip: bool = T
 
 def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs: int | None = None,
         seed: int = 0, stats: dict | None = None, forbidden=None, max_epochs: int = MAX_EPOCHS,
-        patience: int | None = PATIENCE) -> FitResult:
+        patience: int | None = PATIENCE, on_epoch=None) -> FitResult:
     """Inner fit (val_idx given): early stopping on the validation macro AUC over `findings`.
-    Refit (epochs given): exactly that many epochs of the 30-epoch schedule; no stopping rule."""
+    Refit (epochs given): exactly that many epochs of the 30-epoch schedule; no stopping rule.
+    on_epoch(epoch, score) -> True stops the fit as pruned (the HPO demo's successive halving)."""
     import torch
     import torch.nn.functional as F
 
     _check_guard(train_idx, val_idx, forbidden)
     t0 = time.time()
-    torch.manual_seed(seed)
+    global _INIT_LOCK
+    if _INIT_LOCK is None:
+        import threading
+
+        _INIT_LOCK = threading.Lock()
     gen = torch.Generator().manual_seed(seed)
     planes = PLANE_SETS[cfg.planes]
     stats = stats or bank.stats(train_idx)
     dim = bank.x[planes[0]].shape[-1]
-    model = make_head(cfg, dim, len(planes)).to(bank.device)
+    with _INIT_LOCK:  # the CPU generator only, so another device's dropout stream is untouched
+        torch.default_generator.manual_seed(seed)
+        model = make_head(cfg, dim, len(planes))
+    if bank.device.type == "cuda":
+        with torch.cuda.device(bank.device):
+            torch.cuda.manual_seed(seed)
+    model = model.to(bank.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8,
                             weight_decay=cfg.weight_decay)
     train_idx = np.asarray(train_idx)
@@ -270,7 +292,7 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
         res.epochs_run = ep
         if val_idx is not None and epochs is None:
             pv = predict(bank, model, val_idx, cfg, stats, use_flip=False)
-            yv = bank.binary[np.asarray(val_idx)]
+            yv = bank.eval_y[np.asarray(val_idx)]
             score = metrics.macro_available(pv, yv, findings or list(range(N_OUT)))
             res.history.append(round(float(score), 4) if np.isfinite(score) else None)
             if np.isfinite(score) and score > best:
@@ -280,6 +302,9 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
                 since += 1
                 if patience is not None and since >= patience:
                     break
+            if on_epoch is not None and on_epoch(ep, float(score) if np.isfinite(score) else None):
+                res.pruned = True
+                break
     res.seconds = time.time() - t0
     res.model = model
     return res

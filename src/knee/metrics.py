@@ -94,7 +94,7 @@ def strata_codes(*cols) -> np.ndarray:
     for c in df.columns:
         col = df[c]
         bad |= col.isna().to_numpy()
-        if np.issubdtype(col.dtype, np.number):
+        if pd.api.types.is_numeric_dtype(col):
             bad |= (col.fillna(-1) < 0).to_numpy()
     codes = df.astype(str).agg("|".join, axis=1).astype("category").cat.codes.to_numpy().astype(int)
     codes[bad] = -1

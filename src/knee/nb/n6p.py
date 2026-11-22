@@ -1,33 +1,37 @@
-"""N6p: the pilot (GPU), before Stage A. Every rule below was fixed in the plan before it runs.
+"""N6p: the pilot (GPU T4 x2), before Stage A. Every rule below was fixed in the plan before it runs.
 
-1. S2 macro findings (labels only): findings with at least 5 positives and 5
-   negatives among the scored studies of every S2 test fold. This list is fixed
-   here for every later setting and resample.
-2. Positive control: default heads (gated attention over all three planes, the
+Scoring everywhere uses the plan's rule: uncertain labels count as negative.
+The S2 macro is the mean over all 12 findings (fold-stratified, pair-weighted).
+1. Positive control: default heads (gated attention over all three planes, the
    L2 defaults), early-stopped on inner fold 0 of each outer fold, must reach an
-   S2 fold-stratified macro AUC of at least 0.65 for every encoder.
-3. RSNA half-width: the decision interval of Delta1 (DINOv2 - ConvNeXt) on the
-   default-head predictions. Only widths are reported (no estimate, no bounds),
-   so the pilot shows nothing about H1's direction.
-4. Train-test overlap control (DINOv2): labels permuted across training
+   S2 macro AUC of at least 0.65 for every encoder. Only pass flags and the
+   lowest value are shown; per-encoder values stay private (positive_control.json,
+   for Ablay's alignment audit), so the pilot shows nothing about H1's direction.
+2. RSNA half-width: the decision interval of Delta1 (DINOv2 - ConvNeXt) on the
+   default-head predictions; only widths are reported (no estimate, no bounds).
+3. Train-test overlap control (DINOv2): labels permuted across training
    studies; gated attention over all planes; 30 fixed epochs; weight decay
    1e-6. Pass band 0.5 +/- 0.02. Known-answer test: the same with 10% of each
    test fold copied into training must fall outside the band (else the control
    is reported as underpowered; that triggers no audit).
-5. Patient overlap: pairs of studies with cosine above 0.98 between z-scored
+4. Patient overlap: pairs of studies with cosine above 0.98 between z-scored
    DINOv2 study vectors -> private/n6p/pairs.csv (pair_id, uid_a, uid_b,
    cosine), for N3 (flagged pairs stay together in S1) and the montage notebook.
-6. Timings, the epoch plateau and the projected Stage A hours.
+5. Timings, the epoch plateau and the projected Stage A hours.
+Both GPUs are used: the control encoder (with the overlap control) on one,
+the other encoders on the other.
 """
 from __future__ import annotations
 
+import json
+import threading
 import time
 from dataclasses import replace
 
 import numpy as np
 import pandas as pd
 
-from .. import agg, encoders, heads, intervals, labels, metrics, paths, stage
+from .. import agg, encoders, heads, intervals, metrics, paths, stage
 from ..labels import FINDINGS
 from . import common
 
@@ -35,16 +39,20 @@ POSITIVE_CONTROL_MIN = 0.65
 BAND = 0.02
 DUP_COSINE = 0.98
 KNOWN_ANSWER_SHARE = 0.10
-
-
-def _robust_macro(p, y, strata, findings) -> float:
-    vals = [metrics.stratified_auc(p[:, j], y[:, j], strata)[0] for j in findings]
-    vals = [v for v in vals if np.isfinite(v)]
-    return float(np.mean(vals)) if vals else float("nan")
+ALL = list(range(len(FINDINGS)))
 
 
 def _r(x, nd=3):
     return round(float(x), nd) if x is not None and np.isfinite(x) else None
+
+
+def _devices(device):
+    import torch
+
+    if device:
+        return [device]
+    n = torch.cuda.device_count()
+    return [f"cuda:{i}" for i in range(min(n, 2))] or ["cpu"]
 
 
 def run(encoder_names: tuple[str, ...] = tuple(encoders.SPECS), root=None, expect: dict | None = None,
@@ -56,7 +64,7 @@ def run(encoder_names: tuple[str, ...] = tuple(encoders.SPECS), root=None, expec
     with common.notebook("n6p", cfg, quiet=quiet, budget_h=budget_h):
         import torch
 
-        dev = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        devs = _devices(device)
         t0 = time.time()
         d = stage.StageData(root, expect)
         od = paths.out_dir("private", "n6p")
@@ -64,74 +72,92 @@ def run(encoder_names: tuple[str, ...] = tuple(encoders.SPECS), root=None, expec
         K = d.n_folds("s2")
         tr_all = np.flatnonzero(d.train & (f2 >= 0))
         ev = tr_all[d.scored[tr_all]]
+        Y = d.eval_y
         s["upstream"] = d.upstream
         s["data"] = {"studies": agg.count(d.n), "usable": agg.count(int(d.usable.sum())),
                      "training": agg.count(len(tr_all)), "scored_training": agg.count(len(ev)),
                      "n_folds": K, "n_groups": int(pd.Series(d.g_lang[tr_all]).nunique())}
-        elig = metrics.eligible(d.binary[ev], f2[ev]) if K >= 2 else []
-        s["eligible_findings"] = [FINDINGS[j] for j in elig]
-        if K < 2 or not elig:
-            # Too few groups or findings (SMOKE-ALL's 20 studies): still exercise loading, a
-            # one-epoch fit and the near-duplicate pass on the real arrays, then stop.
+        s["findings"] = list(FINDINGS)
+        # sensitivity set only (labels and folds only): >= 5 positives and 5 negatives in every test fold
+        s["sensitivity_5x5_findings"] = [FINDINGS[j] for j in metrics.eligible(Y[ev], f2[ev])] if K >= 2 else []
+        if K < 2:
+            # Too few groups (SMOKE-ALL's 20 studies): still exercise loading, a one-epoch fit
+            # and the near-duplicate pass on the real arrays, then stop.
             s["status"] = "not_testable"
             rows = np.flatnonzero(d.usable & d.train)
             if control_encoder in encoder_names and len(rows) >= 2:
-                bank = d.bank(control_encoder, dev)
+                bank = d.bank(control_encoder, devs[0])
                 cfg0 = heads.default_config(20.0)
                 r = heads.fit(bank, cfg0, rows, epochs=1, seed=seed)
                 p = heads.predict(bank, r.model, rows[:8], cfg0, bank.stats(rows))
-                pairs = stage.near_duplicates(d.study_vectors(control_encoder), np.flatnonzero(d.usable), DUP_COSINE, dev)
+                pairs = stage.near_duplicates(d.study_vectors(control_encoder), np.flatnonzero(d.usable),
+                                              DUP_COSINE, devs[0])
                 s["smoke"] = {"fit_ok": bool(np.isfinite(p).all()), "pairs_ok": bool(len(pairs) >= 0)}
             agg.write("pilot", s)
         else:
-            U = labels.pos_weight_cap_upper(pd.DataFrame(d.binary[tr_all], columns=FINDINGS))
+            U = d.pos_cap_upper()
             cfg0 = heads.default_config(U)
             s["default_config"] = cfg0.to_dict()
-            preds = {}
-            fits = []
-            ctrl = {}
-            for enc in encoder_names:
-                bank = d.bank(enc, dev)
-                P = np.full((d.n, heads.N_OUT), np.nan, np.float32)
-                for k in range(K):
-                    tr, te, _ = d.split(k)
-                    inner = d.inner(k)
-                    val = tr[(inner[tr] == 0) & d.scored[tr]]
-                    fit_tr = tr[inner[tr] != 0]
-                    stats = bank.stats(tr)
-                    forbid = np.concatenate([te, d.gold_rows()])
-                    r = heads.fit(bank, cfg0, fit_tr, val, elig, stats=stats, forbidden=forbid, seed=seed)
-                    rows = np.concatenate([te, d.gold_rows(k)])
-                    P[rows] = heads.predict(bank, r.model, rows, cfg0, stats)
-                    fits.append({"encoder": enc, "fold": k, "best_epoch": r.best_epoch, "epochs_run": r.epochs_run,
-                                 "seconds": r.seconds, "per_epoch_s": r.seconds / max(r.epochs_run, 1),
-                                 "best_inner": r.best_score})
-                preds[enc] = P
-                np.save(od / f"preds_default_{enc}.npy", P)
-                if enc == control_encoder:
-                    ctrl = _overlap_control(d, bank, cfg0, K, tr_all, ev, elig, seed)
-                del bank
-                if dev.startswith("cuda"):
-                    torch.cuda.empty_cache()
+            preds, fits, ctrl, errors = {}, [], {}, []
+            lock = threading.Lock()
+
+            def work(dev, encs):
+                try:
+                    for enc in encs:
+                        bank = d.bank(enc, dev)
+                        P = np.full((d.n, heads.N_OUT), np.nan, np.float32)
+                        for k in range(K):
+                            tr, te, _ = d.split(k)
+                            inner = d.inner(k)
+                            val = tr[(inner[tr] == 0) & d.scored[tr]]
+                            fit_tr = tr[inner[tr] != 0]
+                            stats = bank.stats(tr)
+                            forbid = np.concatenate([te, d.gold_rows()])
+                            r = heads.fit(bank, cfg0, fit_tr, val, ALL, stats=stats, forbidden=forbid, seed=seed)
+                            rows = np.concatenate([te, d.gold_rows(k)])
+                            P[rows] = heads.predict(bank, r.model, rows, cfg0, stats)
+                            with lock:
+                                fits.append({"encoder": enc, "fold": k, "best_epoch": r.best_epoch,
+                                             "epochs_run": r.epochs_run, "seconds": r.seconds,
+                                             "per_epoch_s": r.seconds / max(r.epochs_run, 1), "best_inner": r.best_score})
+                        np.save(od / f"preds_default_{enc}.npy", P)
+                        with lock:
+                            preds[enc] = P
+                        if enc == control_encoder:
+                            ctrl.update(_overlap_control(d, bank, cfg0, K, tr_all, ev, seed))
+                        del bank
+                        if dev.startswith("cuda"):
+                            torch.cuda.empty_cache()
+                except BaseException as e:  # noqa: BLE001 - re-raised below
+                    errors.append(e)
+
+            first = [e for e in encoder_names if e == control_encoder]
+            rest = [e for e in encoder_names if e != control_encoder]
+            plan = ({devs[0]: first + rest} if len(devs) == 1 else {devs[0]: first, devs[1]: rest})
+            threads = [threading.Thread(target=work, args=(dv, es), daemon=True) for dv, es in plan.items() if es]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if errors:
+                raise errors[0]
             pd.DataFrame(fits).to_csv(od / "fits.csv", index=False)
 
-            # 2. Positive control
-            y = d.binary
-            pc = {}
-            for enc in encoder_names:
-                a = metrics.macro(preds[enc][ev], y[ev], f2[ev], elig)
-                pc[enc] = {"s2_macro_auc": _r(a), "mean_of_fold_macros": _r(metrics.per_fold_macro_mean(preds[enc][ev], y[ev], f2[ev], elig)),
-                           "passed": bool(np.isfinite(a) and a >= POSITIVE_CONTROL_MIN)}
-            s["positive_control"] = {"min": POSITIVE_CONTROL_MIN, "by_encoder": pc,
-                                     "all_passed": all(v["passed"] for v in pc.values())}
+            # 1. Positive control: flags and the lowest value only (values stay private)
+            vals = {enc: metrics.macro(preds[enc][ev], Y[ev], f2[ev], ALL) for enc in encoder_names}
+            (od / "positive_control.json").write_text(json.dumps({k: _r(v) for k, v in vals.items()}, indent=1))
+            passed = {enc: bool(np.isfinite(v) and v >= POSITIVE_CONTROL_MIN) for enc, v in vals.items()}
+            finite = [v for v in vals.values() if np.isfinite(v)]
+            s["positive_control"] = {"min": POSITIVE_CONTROL_MIN, "passed": passed, "all_passed": all(passed.values()),
+                                     "lowest_s2_macro_auc": _r(min(finite)) if finite else None}
 
-            # 3. Half-width of Delta1 (widths only)
+            # 2. Half-width of Delta1 (widths only)
             if all(m in preds for m in encoders.MAIN):
                 A, B = preds[encoders.MAIN[0]][ev], preds[encoders.MAIN[1]][ev]
-                ye, fe = y[ev], f2[ev]
+                ye, fe = Y[ev], f2[ev]
 
                 def delta(w):
-                    return metrics.macro(A, ye, fe, elig, w) - metrics.macro(B, ye, fe, elig, w)
+                    return metrics.macro(A, ye, fe, ALL, w) - metrics.macro(B, ye, fe, ALL, w)
 
                 di = intervals.decision_interval(delta, d.g_lang[ev], n_boot=n_boot, seed=seed)
                 bw = (di["bootstrap"]["hi"] - di["bootstrap"]["lo"]) / 2 if di["bootstrap"]["lo"] is not None else None
@@ -142,28 +168,27 @@ def run(encoder_names: tuple[str, ...] = tuple(encoders.SPECS), root=None, expec
             else:
                 s["half_width_delta1"] = None
 
-            # 4. Overlap control
-            s["overlap_control"] = ctrl
+            # 3. Overlap control
+            s["overlap_control"] = ctrl or None
 
-            # 5. Near-duplicate pairs (DINOv2 study vectors)
+            # 4. Near-duplicate pairs (DINOv2 study vectors)
             pairs = pd.DataFrame(columns=["row_a", "row_b", "cosine"])
             if control_encoder in encoder_names:
                 vec = d.study_vectors(control_encoder)
-                pairs = stage.near_duplicates(vec, np.flatnonzero(d.usable), DUP_COSINE, dev)
-            out = pd.DataFrame({"pair_id": np.arange(len(pairs)), "uid_a": d.uids[pairs["row_a"].astype(int)] if len(pairs) else [],
-                                "uid_b": d.uids[pairs["row_b"].astype(int)] if len(pairs) else [],
-                                "cosine": pairs["cosine"].round(5) if len(pairs) else []})
-            out.to_csv(od / "pairs.csv", index=False)
+                pairs = stage.near_duplicates(vec, np.flatnonzero(d.usable), DUP_COSINE, devs[0])
             ra, rb = pairs["row_a"].astype(int).to_numpy(), pairs["row_b"].astype(int).to_numpy()
+            out = pd.DataFrame({"pair_id": np.arange(len(pairs)), "uid_a": d.uids[ra], "uid_b": d.uids[rb],
+                                "cosine": pairs["cosine"].astype(float).round(5).to_numpy()})
+            out.to_csv(od / "pairs.csv", index=False)
             s["near_duplicates"] = {
                 "threshold": DUP_COSINE, "flagged_pairs": agg.count(len(pairs)),
-                "across_language_groups": agg.count(int((d.g_lang[ra] != d.g_lang[rb]).sum())) if len(pairs) else 0,
-                "across_s2_folds": agg.count(int((f2[ra] != f2[rb]).sum())) if len(pairs) else 0,
+                "across_language_groups": agg.count(int((d.g_lang[ra] != d.g_lang[rb]).sum())),
+                "across_s2_folds": agg.count(int((f2[ra] != f2[rb]).sum())),
                 "to_review": agg.count(min(10, len(pairs))),
                 "pairs_sha16": common.sha16(od / "pairs.csv"),
             }
 
-            # 6. Plateau and projected Stage A hours
+            # 5. Plateau and projected Stage A hours
             fdf = pd.DataFrame(fits)
             s["plateau"] = {"best_epoch": agg.quantiles(fdf["best_epoch"]),
                             "share_best_by_20": agg.share((fdf["best_epoch"] <= 20).mean()),
@@ -172,19 +197,20 @@ def run(encoder_names: tuple[str, ...] = tuple(encoders.SPECS), root=None, expec
             s["leakage_assertion_passed"] = True  # heads.fit raises LeakageError otherwise
             s["seconds"] = round(time.time() - t0, 1)
             agg.write("pilot", s)
-    summ = {k: s.get(k) for k in ("eligible_findings", "positive_control", "half_width_delta1", "overlap_control",
-                                  "near_duplicates", "projection", "status")}
+    summ = {k: s.get(k) for k in ("positive_control", "half_width_delta1", "overlap_control", "near_duplicates",
+                                  "projection", "status")}
     common.summary({k: v for k, v in summ.items() if v is not None})
     return s
 
 
-def _overlap_control(d, bank, cfg0, K, tr_all, ev, elig, seed) -> dict:
+def _overlap_control(d, bank, cfg0, K, tr_all, ev, seed) -> dict:
     """Permuted labels: the null (pass band) and the known-answer test (10% of each test fold copied in)."""
     rng = np.random.default_rng(seed + 1)
     perm = rng.permutation(tr_all)
     soft, weight, binary = d.soft.copy(), d.weight.copy(), d.binary.copy()
     soft[tr_all], weight[tr_all], binary[tr_all] = d.soft[perm], d.weight[perm], d.binary[perm]
     bp = bank.with_labels(soft, weight, binary)
+    yp = heads.scoring_labels(binary)
     cfg_c = replace(cfg0, pooling="gated", planes="all", weight_decay=1e-6)
     f2 = d.folds["s2_fold"]
     null = np.full((d.n, heads.N_OUT), np.nan, np.float32)
@@ -192,14 +218,15 @@ def _overlap_control(d, bank, cfg0, K, tr_all, ev, elig, seed) -> dict:
     for k in range(K):
         tr, te, _ = d.split(k)
         stats = bp.stats(tr)
-        r = heads.fit(bp, cfg_c, tr, None, epochs=heads.MAX_EPOCHS, stats=stats, forbidden=te, seed=seed)
+        r = heads.fit(bp, cfg_c, tr, None, epochs=heads.MAX_EPOCHS, stats=stats,
+                      forbidden=np.concatenate([te, d.gold_rows()]), seed=seed)
         null[te] = heads.predict(bp, r.model, te, cfg_c, stats, use_flip=False)
         add = rng.choice(te, size=max(1, int(round(KNOWN_ANSWER_SHARE * len(te)))), replace=False)
         # deliberately leaky (the known answer), so no forbidden set here
         r2 = heads.fit(bp, cfg_c, np.concatenate([tr, add]), None, epochs=heads.MAX_EPOCHS, stats=stats, seed=seed)
         known[te] = heads.predict(bp, r2.model, te, cfg_c, stats, use_flip=False)
-    a0 = _robust_macro(null[ev], binary[ev], f2[ev], elig)
-    a1 = _robust_macro(known[ev], binary[ev], f2[ev], elig)
+    a0 = metrics.macro(null[ev], yp[ev], f2[ev], ALL)
+    a1 = metrics.macro(known[ev], yp[ev], f2[ev], ALL)
     passed = bool(np.isfinite(a0) and abs(a0 - 0.5) <= BAND)
     detected = bool(np.isfinite(a1) and abs(a1 - 0.5) > BAND)
     return {"null_macro_auc": _r(a0, 4), "known_answer_macro_auc": _r(a1, 4), "band": [0.5 - BAND, 0.5 + BAND],
@@ -207,7 +234,12 @@ def _overlap_control(d, bank, cfg0, K, tr_all, ev, elig, seed) -> dict:
 
 
 def _projection(d, fdf: pd.DataFrame, K: int) -> dict:
-    """Projected Stage A GPU-hours from the default fits (gated pooling: an upper bound per epoch)."""
+    """Projected Stage A hours from the default fits (gated pooling: an upper bound per epoch).
+
+    N6a runs 4 worker processes on 2 GPUs: the wall time lies between one process's
+    total / 4 (CPU-bound) and / 2 (GPU-bound); the upper end is compared with the plan's
+    8-hour trigger.
+    """
     ks = [int(d.inner(k)[d.inner(k) >= 0].max() + 1) for k in range(K) if (d.inner(k) >= 0).any()]
     k_in = int(np.median(ks)) if ks else 4
     out = {"inner_k": k_in}
@@ -217,11 +249,15 @@ def _projection(d, fdf: pd.DataFrame, K: int) -> dict:
         avg_epochs = min(heads.MAX_EPOCHS, float(g["best_epoch"].median()) + heads.PATIENCE)
         fits = (len(heads.L1_GRID) + 30) * k_in
         unit[enc] = (fits * avg_epochs + float(g["best_epoch"].median())) * per_epoch / 3600
-    out["unit_hours"] = {k: round(v, 2) for k, v in unit.items()}
+    out["unit_hours_one_process"] = {k: round(v, 2) for k, v in unit.items()}
     main = [unit[e] for e in encoders.MAIN if e in unit]
-    out["n6a_hours_one_process"] = round(K * sum(main), 2) if main else None
+    if main:
+        one = K * sum(main)
+        out["n6a_wall_hours"] = {"low": round(one / 4, 2), "high": round(one / 2, 2)}
+        out["n6a_over_8h_trigger"] = one / 2 > 8
     if "vit_s16" in unit:
-        demo = 3 * 900 * float(fdf.loc[fdf["encoder"] == encoders.MAIN[0], "per_epoch_s"].median()) / 3600 \
-            if (fdf["encoder"] == encoders.MAIN[0]).any() else 0.0
-        out["n6b_hours_one_process"] = round(K * unit["vit_s16"] + demo, 2)
+        dm = fdf.loc[fdf["encoder"] == encoders.MAIN[0], "per_epoch_s"]
+        demo = 3 * 900 * float(dm.median()) / 3600 if len(dm) else 0.0
+        one = K * unit["vit_s16"] + demo
+        out["n6b_wall_hours"] = {"low": round(one / 4, 2), "high": round(one / 2, 2)}
     return out

@@ -83,6 +83,12 @@ def run(expect_gpu: bool = True, dread_file: str | None = None) -> dict:
             for col in ("Anatomical_Plane", "Fluid_Sensitive", "Fat_Suppression"):
                 if col in ser.columns:
                     out[f"values_{col}"] = _categories(ser[col])
+            # what N10 must write: the submission and test file layouts (names and row counts only)
+            for fname in ("sample_submission.csv", "test.csv", "test_series.csv"):
+                fp = root / fname
+                if fp.exists():
+                    t = pd.read_csv(fp)
+                    out[fname.replace(".", "_")] = {**agg.safe_columns(t.columns), "rows": agg.count(len(t))}
         except FileNotFoundError:
             out["checks"]["competition_attached"] = False
         tables = {}

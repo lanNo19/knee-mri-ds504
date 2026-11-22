@@ -62,10 +62,22 @@ class StageData:
             self.upstream["n5_index"] = info
             index = pd.read_csv(idx_path)
             self.n5_dir = n5d
-        else:  # N8: no embeddings; rows follow N0's studies
+            self.usable_from_n5 = True
+        else:  # N8: no embeddings; rows follow N0's studies, usable from N5's index when attached
             index = pd.DataFrame({"row": np.arange(len(studies)), UID: studies.index.astype(str),
                                   "usable": True, "flip_row": -1})
             self.n5_dir = None
+            n5_index = Path(n5_dir) / "index.csv" if n5_dir is not None else None
+            if n5_index is None:
+                p = paths.find_file("emb_dinov2_vits14_sagittal.npy", root)
+                n5_index = p.parent / "index.csv" if p is not None else None
+            self.usable_from_n5 = bool(n5_index is not None and n5_index.exists())
+            if self.usable_from_n5:
+                ip, info = common.upstream("index.csv", n5_index)
+                common.expect(info, expect.get("n5_index"))
+                self.upstream["n5_index"] = info
+                u = pd.read_csv(ip).astype({UID: str}).set_index(UID)["usable"]
+                index["usable"] = index[UID].map(u).fillna(False).astype(bool).to_numpy()
         index[UID] = index[UID].astype(str)
         self.uids = index[UID].to_numpy()
         self.n = len(index)
@@ -85,10 +97,29 @@ class StageData:
         self.soft = labels_frame(n0d / "labels_soft.csv", self.uids)
         self.weight = labels_frame(n0d / "labels_weight.csv", self.uids, fill=0.0)
         self.binary = labels_frame(n0d / "labels_binary.csv", self.uids)
+        # Scoring labels (plan): uncertain counts as negative; the NaN version is kept for the
+        # sensitivity analysis (uncertain dropped) and for LightGBM training.
+        self.eval_y = heads.scoring_labels(self.binary)
         gp = n0d / "labels_gold.csv"
         self.gold_y = labels_frame(gp, self.uids) if gp.exists() else np.full((self.n, len(FINDINGS)), np.nan)
         self.tags_path = n0d / "tags.csv"
         self.n0_dir = n0d
+        self.n0_agg = {}
+        for cand in (n0d.parent.parent / "agg_n0.json", n0d.parent / "agg_n0.json"):
+            if cand.exists():
+                import json
+
+                self.n0_agg = json.loads(cand.read_text())
+                break
+
+    def pos_cap_upper(self) -> float:
+        """U of the L2 table, as N0 set it before any head trained (recomputed only if N0's file is absent)."""
+        from . import labels
+
+        u = self.n0_agg.get("labels", {}).get("pos_weight_cap_upper")
+        if u is not None:
+            return float(u)
+        return labels.pos_weight_cap_upper(pd.DataFrame(self.binary[self.train], columns=FINDINGS))
 
     # ---- index sets
     def outer(self, scheme: str = "s2"):
@@ -126,7 +157,8 @@ class StageData:
             if p in heads.FLIP_PLANES and fp.exists():
                 flip[p] = np.load(fp, mmap_mode="r")
         soft, weight, binary = labels_override or (self.soft, self.weight, self.binary)
-        return heads.Bank(emb, soft, weight, binary, flip=flip, flip_row=self.flip_row, device=device)
+        return heads.Bank(emb, soft, weight, binary, flip=flip, flip_row=self.flip_row, device=device,
+                          eval_y=None if labels_override else self.eval_y)
 
     def study_vectors(self, encoder: str) -> np.ndarray:
         """Per-plane mean of the slice features, three planes joined (float32 [N, 3D])."""

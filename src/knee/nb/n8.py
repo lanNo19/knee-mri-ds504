@@ -4,7 +4,11 @@ Features (N0's private tags.csv): manufacturer and model as categories (a
 missing value is its own category), field strength, and for each plane the
 repetition time, echo time, slice thickness and pixel spacing (numeric;
 LightGBM sends missing values down their own branch). No demographic tags.
-Labels: the binary labels; uncertain cells are left out of that finding.
+Labels: the binary labels; uncertain cells are left out of training for that
+finding (plan). Scoring, early stopping and selection use the plan's scoring
+rule (uncertain counts as negative). The S2 macro is over all 12 findings.
+Studies are those N5 can embed (all planes decoded), so floor A is scored on
+the same studies as the image models.
 
 Nested, per S2 outer fold: 40 random-search trials, each scored by the mean
 over the inner folds of the inner validation macro AUC (the S2 macro
@@ -61,7 +65,8 @@ def features(tags: pd.DataFrame, uids) -> pd.DataFrame:
     return X.reset_index(drop=True)
 
 
-def _fit_one(X, y, tr, va, params, rounds=None, seed=0):
+def _fit_one(X, y, tr, va, params, rounds=None, seed=0, y_eval=None):
+    """y: training labels (NaN = uncertain, left out); y_eval: validation labels (scoring rule)."""
     import lightgbm as lgb
 
     p = {"objective": "binary", "verbosity": -1, "num_threads": 1, "seed": seed, "deterministic": True,
@@ -70,8 +75,9 @@ def _fit_one(X, y, tr, va, params, rounds=None, seed=0):
     dtr = lgb.Dataset(X.iloc[m_tr], label=y[m_tr], free_raw_data=False)
     if rounds is not None:
         return lgb.train(p, dtr, num_boost_round=int(rounds)), int(rounds)
-    m_va = va[~np.isnan(y[va])]
-    yv = y[m_va]
+    ye = y if y_eval is None else y_eval
+    m_va = va[~np.isnan(ye[va])]
+    yv = ye[m_va]
     if len(m_va) == 0 or yv.min() == yv.max():
         return lgb.train(p, dtr, num_boost_round=200), 200
     dva = lgb.Dataset(X.iloc[m_va], label=yv, reference=dtr)
@@ -90,14 +96,16 @@ def run(root=None, expect: dict | None = None, n_trials: int = N_TRIALS, workers
         od = paths.out_dir("private", "n8")
         tags = pd.read_csv(d.tags_path)
         X = features(tags, d.uids)
-        Y = d.binary
+        Y = d.binary  # training labels (uncertain left out)
+        YE = d.eval_y  # scoring labels (uncertain = negative)
         f2 = d.folds["s2_fold"]
         K = d.n_folds("s2")
         tr_all = np.flatnonzero(d.train & (f2 >= 0))
         ev = tr_all[d.scored[tr_all]]
-        elig = metrics.eligible(Y[ev], f2[ev]) if K >= 2 else []
+        elig = list(range(len(FINDINGS))) if K >= 2 else []
         s["upstream"] = d.upstream
-        s["eligible_findings"] = [FINDINGS[j] for j in elig]
+        s["usable_from_n5"] = d.usable_from_n5
+        s["findings"] = [FINDINGS[j] for j in elig]
         s["features"] = {"categorical": CATEGORICAL, "numeric": NUMERIC,
                          "missing_share": {c: agg.share(X[c].isna().mean()) for c in NUMERIC}}
         P = np.full((d.n, len(FINDINGS)), np.nan, np.float32)
@@ -119,12 +127,13 @@ def run(root=None, expect: dict | None = None, n_trials: int = N_TRIALS, workers
                         guard_ok = False
                         raise AssertionError("a test study reached floor A's tuning")
                     with ThreadPoolExecutor(workers) as ex:
-                        res = list(ex.map(lambda j: _fit_one(X, Y[:, j], itr, iva, params, seed=seed), elig))
+                        res = list(ex.map(lambda j: _fit_one(X, Y[:, j], itr, iva, params, seed=seed,
+                                                             y_eval=YE[:, j]), elig))
                     pv = np.full((len(iva), len(FINDINGS)), np.nan)
                     for j, (b, it) in zip(elig, res):
                         pv[:, j] = b.predict(X.iloc[iva], num_iteration=it)
                         iters[j].append(it)
-                    scores.append(metrics.macro_available(pv, Y[iva], elig))
+                    scores.append(metrics.macro_available(pv, YE[iva], elig))
                 score = float(np.nanmean(scores)) if scores else float("nan")
                 trials.append({"fold": k, "trial": t, **params, "inner_score": round(score, 5)})
                 if np.isfinite(score) and (best is None or score > best[0]):
@@ -135,6 +144,9 @@ def run(root=None, expect: dict | None = None, n_trials: int = N_TRIALS, workers
             chosen[f"fold_{k}"] = {**{a: (round(v, 5) if isinstance(v, float) else v) for a, v in params.items()},
                                    "inner_score": round(score, 4)}
             rows = np.concatenate([te, d.gold_rows(k)])
+            if forbidden & set(tr.tolist()):
+                guard_ok = False
+                raise AssertionError("a test study reached floor A's refit")
             with ThreadPoolExecutor(workers) as ex:
                 res = list(ex.map(lambda j: _fit_one(X, Y[:, j], tr, None, params, rounds=max(1, rounds[j]), seed=seed),
                                   elig))
@@ -147,8 +159,8 @@ def run(root=None, expect: dict | None = None, n_trials: int = N_TRIALS, workers
         out = out[np.isfinite(P).any(axis=1)]
         out.to_csv(od / "predictions.csv", index=False)
         if elig and K >= 2:
-            s["s2_macro_auc"] = round(metrics.macro(P[ev], Y[ev], f2[ev], elig), 4)
-            s["mean_of_fold_macros"] = round(metrics.per_fold_macro_mean(P[ev], Y[ev], f2[ev], elig), 4)
+            s["s2_macro_auc"] = round(metrics.macro(P[ev], YE[ev], f2[ev], elig), 4)
+            s["mean_of_fold_macros"] = round(metrics.per_fold_macro_mean(P[ev], YE[ev], f2[ev], elig), 4)
         else:
             # SMOKE-ALL's 20 studies: still exercise the features and one fit on the real tags
             s["status"] = "not_testable"

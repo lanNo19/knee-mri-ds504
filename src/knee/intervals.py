@@ -27,7 +27,10 @@ def _codes(groups) -> tuple[np.ndarray, int]:
     import pandas as pd
 
     g = pd.Series(np.asarray(groups)).astype("category")
-    return g.cat.codes.to_numpy().astype(int), len(g.cat.categories)
+    codes = g.cat.codes.to_numpy().astype(int)
+    if (codes < 0).any():
+        raise ValueError("a study without a site group reached an interval")
+    return codes, len(g.cat.categories)
 
 
 def cluster_bootstrap(stat: Callable[[np.ndarray], float], groups, n_boot: int = N_BOOT, seed: int = 0) -> dict:

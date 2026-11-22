@@ -113,3 +113,38 @@ def make_stage(root: Path, n: int = 800, n_groups: int = 8, S: int = 8, D: int =
                 np.save(n5 / f"emb_{e}_{p}_flip.npy", (x[unresolved] + rng.normal(0, 0.05, (int(unresolved.sum()), S, D))).astype(np.float16))
     (root / "n5" / "run.json").write_text(json.dumps({"commit": "synthetic000"}))
     return {"uids": uids.tolist(), "dup_pairs": [(uids[a], uids[b]) for a, b in dup_pairs], "n": n}
+
+
+def make_units(root: Path, name: str = "n6a", strengths: dict | None = None, seed: int = 1) -> None:
+    """Synthetic Stage A unit outputs (predictions.csv + config.json per encoder and fold) from make_stage's files."""
+    rng = np.random.default_rng(seed)
+    strengths = strengths or {"dinov2_vits14": 1.6, "convnext_tiny": 0.9, "vit_s16": 1.1}
+    n0 = root / "n0" / "private" / "n0"
+    lab = pd.read_csv(n0 / "labels_binary.csv").set_index(UID)
+    folds = pd.read_csv(root / "n3" / "private" / "n3" / "folds.csv").set_index(UID)
+    y = lab.loc[folds.index, FINDINGS].fillna(0.5).to_numpy()
+    for e, st in strengths.items():
+        for k in range(5):
+            rows = ((folds["s2_fold"] == k) & (folds["train"] | folds["is_gold"])).to_numpy()
+            ud = root / name / "private" / name / "units" / f"{e}_f{k}"
+            ud.mkdir(parents=True, exist_ok=True)
+            p = 1 / (1 + np.exp(-(st * (y[rows] - 0.3) * 3 + rng.normal(0, 1, (int(rows.sum()), 12)))))
+            df = pd.DataFrame(p, columns=FINDINGS)
+            df.insert(0, "is_gold", folds["is_gold"].to_numpy()[rows])
+            df.insert(0, "s2_fold", k)
+            df.insert(0, UID, folds.index[rows])
+            df.to_csv(ud / "predictions.csv", index=False)
+            cfg = {"pooling": "mean" if k % 2 else "gated", "planes": "all", "lr": 3e-3, "weight_decay": 3e-4,
+                   "dropout": 0.25, "attn_hidden": 192, "pos_cap": 4.47, "batch_size": 48}
+            (ud / "config.json").write_text(json.dumps({
+                "encoder": e, "fold": k, "l1_winner": {"pooling": cfg["pooling"], "planes": "all"},
+                "config": cfg, "best_inner_score": 0.7 + 0.01 * k, "E": 6}))
+    # floor A: a weak scanner signal
+    fa = root / "n8" / "private" / "n8"
+    fa.mkdir(parents=True, exist_ok=True)
+    rows = ((folds["s2_fold"] >= 0) & (folds["train"] | folds["is_gold"])).to_numpy()
+    p = 1 / (1 + np.exp(-(0.6 * (y[rows] - 0.3) + rng.normal(0, 1, (int(rows.sum()), 12)))))
+    df = pd.DataFrame(p, columns=FINDINGS)
+    df.insert(0, "s2_fold", folds["s2_fold"].to_numpy()[rows])
+    df.insert(0, UID, folds.index[rows])
+    df.to_csv(fa / "predictions.csv", index=False)
