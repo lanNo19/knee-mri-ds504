@@ -1,34 +1,42 @@
-"""N0: data understanding, labels and site groups (CPU).
+"""N0: data understanding, labels, site groups and floor-A tags (CPU).
 
 Writes to /kaggle/working:
-  n0/studies.csv   one row per study: chosen series, laterality, fingerprint,
-                   language, groups, flags (private; never printed)
-  n0/labels_soft.csv, n0/labels_weight.csv, n0/labels_binary.csv (private)
-  agg_n0.json      counts, coverage and checks only
-  run.json
+  private/n0/studies.csv        one row per study: chosen series, laterality, fingerprint,
+                                language, groups, flags
+  private/n0/labels_soft.csv, labels_weight.csv, labels_binary.csv
+  private/n0/tags.csv           acquisition tags for floor A
+  agg_n0.json, run.json         summaries only (agg checks enforced)
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from .. import agg, dicom_io, groups, labels, paths, safe_log, study_table
+from .. import agg, dicom_io, groups, labels, paths, study_table
 from ..labels import FINDINGS, UID
+from . import common
+
+TAGS = ("repetition_time", "echo_time", "slice_thickness", "pixel_spacing")
+PLANES = ("sagittal", "coronal", "axial")
 
 
-def _q(s) -> dict:
-    s = pd.to_numeric(pd.Series(s), errors="coerce").dropna()
-    if s.empty:
-        return {}
-    q = s.quantile([0.05, 0.25, 0.5, 0.75, 0.95])
-    return {k: round(float(v), 3) for k, v in zip(["p5", "p25", "median", "p75", "p95"], q)}
+def ts_name(ts) -> str:
+    """Transfer syntax by name (its UID looks like a data UID to the summary checks)."""
+    if ts is None or (isinstance(ts, float) and np.isnan(ts)) or str(ts) == "":
+        return "missing"
+    try:
+        from pydicom.uid import UID as _UID
+
+        name = _UID(str(ts)).name
+        return name if name and name != str(ts) else "other"
+    except Exception:  # noqa: BLE001
+        return "other"
 
 
 def _decode_tests(chosen: pd.DataFrame, images, max_per_ts: int = 3) -> dict:
     out = {}
     for ts, sub in chosen.dropna(subset=["transfer_syntax"]).groupby("transfer_syntax"):
-        ok, decs = 0, set()
-        tried = 0
+        ok, tried, decs = True, 0, set()
         for _, r in sub.head(max_per_ts).iterrows():
             files = dicom_io.list_dcm(images / str(r[UID]) / str(r["SeriesInstanceUID"]))
             if not files:
@@ -36,84 +44,111 @@ def _decode_tests(chosen: pd.DataFrame, images, max_per_ts: int = 3) -> dict:
             tried += 1
             try:
                 _, dec = dicom_io.decode(files[len(files) // 2])
-                ok += 1
                 decs.add(dec)
             except Exception:  # noqa: BLE001
-                pass
-        out[str(ts)] = {"series": agg.count(len(sub)), "tried": tried, "decoded": ok, "decoders": sorted(decs)}
+                ok = False
+        key = ts_name(ts)
+        prev = out.get(key, {"series": 0, "all_decoded": True, "decoders": []})
+        out[key] = {"series": agg.count(len(sub)), "all_decoded": bool(ok and tried > 0 and prev["all_decoded"]),
+                    "decoders": sorted(set(prev["decoders"]) | decs)}
     return out
 
 
-def run(limit: int | None = None, workers: int = 4, dread_provenance_ok: bool = False,
-        quiet: bool = True) -> dict:
-    """dread_provenance_ok: set True only if Ablay recorded that dreaddevelopment's
-    labels are LLM output on report text with no gold, image-model or other-table input."""
-    summary: dict = {}
-    with safe_log.step("n0", quiet=quiet):
+def _report_column(columns) -> str:
+    for c in columns:
+        if str(c).strip().lower() == "report":
+            return c
+    raise labels.SchemaError("train.csv: no Report column")
+
+
+def _geometry_agreement(chosen: pd.DataFrame) -> dict:
+    """Tag-vs-geometry laterality agreement at several margins (the plan names none; 20 mm is used)."""
+    tag = (chosen.dropna(subset=["laterality_tag"]).groupby(UID)["laterality_tag"]
+           .agg(lambda x: x.iloc[0] if x.nunique() == 1 else np.nan).dropna())
+    cx = {}
+    for uid, sub in chosen.groupby(UID):
+        for p in ("coronal", "axial"):
+            v = sub.loc[sub["plane"] == p, "center_x"]
+            if len(v) and pd.notna(v.iloc[0]):
+                cx[uid] = float(v.iloc[0])
+                break
+    out = {}
+    for m in (0, 10, 20):
+        pairs = [(tag[u], dicom_io.geometry_laterality(cx[u], m)) for u in tag.index if u in cx]
+        decided = [(a, b) for a, b in pairs if b is not None]
+        out[f"margin_{m}mm"] = {
+            "pairs": agg.count(len(decided)),
+            "inside_margin": agg.count(len(pairs) - len(decided)),
+            "agreement": agg.share(np.mean([a == b for a, b in decided])) if decided else None,
+        }
+    return out
+
+
+def run(limit: int | None = None, workers: int = 4, dread_file: str | None = None,
+        dread_provenance_ok: bool = False, quiet: bool = True) -> dict:
+    """dread_file: the label file's name in the dreaddevelopment dataset (Ablay reads it on the
+    dataset page). dread_provenance_ok: True only if Ablay recorded that those labels are LLM output
+    on report text with no gold, image-model or other-table input."""
+    s: dict = {}
+    cfg = {"limit": limit, "dread_file": bool(dread_file), "dread_provenance_ok": dread_provenance_ok}
+    with common.notebook("n0", cfg, quiet=quiet):
         root = paths.competition_root()
-        od = paths.out_dir("n0")
-        train = pd.read_csv(root / "train.csv")
+        od = paths.out_dir("private", "n0")
+        train = pd.read_csv(root / "train.csv", keep_default_na=True)
+        lab_cols = labels.find_label_columns(train.columns)
+        rep_col = _report_column(train.columns)
+        train = train.rename(columns={v: k for k, v in lab_cols.items()} | {rep_col: "Report"})
         if limit:
             keep = sorted(train[UID].unique())[:limit]
             train = train[train[UID].isin(keep)]
         train = train.drop_duplicates(UID).set_index(UID).sort_index()
         has_report = train["Report"].fillna("").astype(str).str.strip().str.len() > 0
         gold = train[FINDINGS].dropna(how="any")
+        vals = set(np.unique(gold.to_numpy()).tolist()) if len(gold) else set()
+        if not vals <= {0, 1, 0.0, 1.0}:
+            raise labels.SchemaError("gold labels are not 0/1")
+        gold = gold.astype(int)
         is_gold = train.index.isin(gold.index)
 
-        # 1. Images: series choice, header facts, laterality, fingerprint
+        # 1. Images: series choice, header facts, laterality, fingerprint, tags
         st, chosen, hdr_errors = study_table.build(root, "train", workers=workers, limit=limit)
         st = st.set_index(UID).reindex(train.index)
         ser = pd.read_csv(root / "train_series.csv")
         if limit:
             ser = ser[ser[UID].isin(train.index)]
-        fs_eq = (ser["Fluid_Sensitive"].astype(str) == ser["Fat_Suppression"].astype(str)).mean()
         planes = {}
-        for p in ("sagittal", "coronal", "axial"):
+        for p in PLANES:
             sub = chosen[chosen["plane"] == p]
             planes[p] = {
                 "studies_with_plane": agg.count(sub[UID].nunique()),
-                "series_in_csv": agg.count((ser["Anatomical_Plane"].astype(str).str.lower().str[:3] == p[:3]).sum()),
                 "chosen_tier": agg.counts(sub["tier"].map({2: "fluid+fatsat", 1: "fluid", 0: "any"}).value_counts()),
-                "slices_chosen": _q(sub["n_slices"]),
-                "iop_plane_matches_label": round(float((sub["plane_from_iop"] == p).mean()), 4) if len(sub) else None,
+                "slices_chosen": agg.quantiles(sub["n_slices"]),
+                "iop_plane_matches_label": agg.share((sub["plane_from_iop"] == p).mean()) if len(sub) else None,
             }
-        summary["images"] = {
+        s["images"] = {
             "studies": agg.count(len(train)),
-            "fluid_equals_fatsat_rows": round(float(fs_eq), 4),
+            "series_rows": agg.count(len(ser)),
+            "fluid_equals_fatsat_rows": agg.share((ser["Fluid_Sensitive"].astype(str) == ser["Fat_Suppression"].astype(str)).mean()),
             "planes": planes,
-            "transfer_syntax_chosen": agg.counts(chosen["transfer_syntax"].fillna("missing").value_counts()),
+            "transfer_syntax_chosen": agg.counts(chosen["transfer_syntax"].map(ts_name).value_counts()),
             "decode_test": _decode_tests(chosen, root / "train_series"),
             "header_read_errors": agg.counts(hdr_errors),
             "tag_coverage_chosen": {
-                "ImagePositionPatient": round(float(chosen["has_ipp"].mean()), 4),
-                "ImageOrientationPatient": round(float(chosen["has_iop"].mean()), 4),
-                "Laterality": round(float(chosen["laterality_tag"].notna().mean()), 4),
-                "Manufacturer": round(float(chosen["manufacturer"].notna().mean()), 4),
-                "ManufacturerModelName": round(float(chosen["model"].notna().mean()), 4),
-                "MagneticFieldStrength": round(float(chosen["field_strength"].notna().mean()), 4),
+                "ImagePositionPatient": agg.share(chosen["has_ipp"].mean()),
+                "ImageOrientationPatient": agg.share(chosen["has_iop"].mean()),
+                "Laterality": agg.share(chosen["laterality_tag"].notna().mean()),
+                "Manufacturer": agg.share(chosen["manufacturer"].notna().mean()),
+                "ManufacturerModelName": agg.share(chosen["model"].notna().mean()),
+                "MagneticFieldStrength": agg.share(chosen["field_strength"].notna().mean()),
+                **{t: agg.share(chosen[t].notna().mean()) for t in TAGS},
             },
         }
-        # Laterality sources and tag-vs-geometry agreement
-        geo = {}
-        for uid, sub in chosen.groupby(UID):
-            g = None
-            for p in ("coronal", "axial"):
-                cx = sub.loc[sub["plane"] == p, "center_x"]
-                if len(cx) and pd.notna(cx.iloc[0]):
-                    g = dicom_io.geometry_laterality(float(cx.iloc[0]), study_table.GEOMETRY_MARGIN_MM)
-                    if g:
-                        break
-            geo[uid] = g
-        tag = chosen.dropna(subset=["laterality_tag"]).groupby(UID)["laterality_tag"].agg(
-            lambda x: x.iloc[0] if x.nunique() == 1 else None)
-        both = [(tag[u], geo.get(u)) for u in tag.index if tag[u] and geo.get(u)]
-        summary["laterality"] = {
+        s["laterality"] = {
             "source": agg.counts(st["laterality_source"].value_counts()),
-            "tag_geometry_pairs": agg.count(len(both)),
-            "tag_geometry_agreement": round(float(np.mean([a == b for a, b in both])), 4) if both else None,
             "left_knees": agg.count((st["laterality"] == "L").sum()),
             "right_knees": agg.count((st["laterality"] == "R").sum()),
+            "tag_vs_geometry": _geometry_agreement(chosen),
+            "margin_mm": study_table.GEOMETRY_MARGIN_MM,
         }
 
         # 2. Reports: language and length
@@ -121,28 +156,16 @@ def run(limit: int | None = None, workers: int = 4, dread_provenance_ok: bool = 
         st = st.join(lang)
         st["has_report"] = has_report
         st["is_gold"] = is_gold
-        summary["reports"] = {
+        s["reports"] = {
             "with_report": agg.count(has_report.sum()),
-            "length_chars": _q(lang.loc[has_report, "report_len"]),
+            "length_chars": agg.quantiles(lang.loc[has_report, "report_len"]),
             "languages": agg.counts(lang.loc[has_report, "language"].fillna("none").value_counts()),
-            "confidence": _q(lang.loc[has_report, "lang_conf"]),
+            "confidence": agg.quantiles(lang.loc[has_report, "lang_conf"]),
             "below_0.80": agg.count(((lang["lang_conf"] < groups.MIN_CONF) & has_report).sum()),
             "under_20_chars": agg.count(((lang["report_len"] < groups.MIN_CHARS) & has_report).sum()),
         }
 
-        # 3. Site groups
-        gt, gsum = groups.build_groups(st)
-        gt.loc[gt["is_gold"], "in_training"] = False  # gold is never trained on
-        summary["groups"] = gsum
-        tr = gt[gt["in_training"]]
-        summary["groups"]["g_lang_sizes"] = agg.counts(tr["g_lang"].value_counts())
-        fp_per_group = tr.dropna(subset=["fingerprint"]).groupby("g_lang")["fingerprint"].nunique()
-        summary["groups"]["fingerprints_per_group"] = {k: int(v) for k, v in fp_per_group.items()}
-        top_fp = tr["fingerprint"].fillna("missing").value_counts()
-        summary["groups"]["top_fingerprints"] = agg.counts(top_fp[top_fp >= 5].head(15))
-        summary["groups"]["fingerprint_coverage_training"] = round(float(tr["fingerprint"].notna().mean()), 4) if len(tr) else None
-
-        # 4. Labels
+        # 3. Labels (before groups, so all-masked studies can be left unscored)
         non_gold = train.index[~is_gold & has_report]
         tables, tinfo = {}, {}
         for key in paths.LABEL_TABLES:
@@ -150,40 +173,59 @@ def run(limit: int | None = None, workers: int = 4, dread_provenance_ok: bool = 
             if p is None:
                 tinfo[key] = {"attached": False}
                 continue
-            raw = pd.read_csv(p)
+            raw = labels.read_table(p)
             try:
                 t = labels.convert(key, raw)
             except labels.SchemaError:
-                tinfo[key] = {"attached": True, "layout": "unrecognised", "columns": [str(c) for c in raw.columns][:60]}
+                tinfo[key] = {"attached": True, "layout": "unrecognised", **agg.safe_columns(raw.columns)}
                 continue
             cov = labels.coverage(t, non_gold)
-            tinfo[key] = {"attached": True, "layout": t.layout, "coverage_non_gold": round(cov, 4),
-                          "kept": cov >= labels.COVERAGE_MIN}
+            tinfo[key] = {"attached": True, "layout": t.layout, "cells": agg.counts(t.cells or {}),
+                          "coverage_non_gold": agg.share(cov), "kept": cov >= labels.COVERAGE_MIN}
             if cov >= labels.COVERAGE_MIN:
                 tables[key] = t
         core = [tables[k] for k in ("pilkwang", "steven_v2", "lixin") if k in tables]
         used = list(core)
-        dread_path = paths.find_file("dread_labels.csv")  # placeholder name; see run card
-        if dread_path is not None and dread_provenance_ok and len(core) >= 2:
-            try:
-                dt = labels.convert("dread", pd.read_csv(dread_path))
-                gate = labels.agreement_gate(core, dt, non_gold)
-                tinfo["dread"] = {"attached": True, "layout": dt.layout, "gate": gate}
-                if gate["passed"] and labels.coverage(dt, non_gold) >= labels.COVERAGE_MIN:
-                    used.append(dt)
-            except labels.SchemaError:
-                tinfo["dread"] = {"attached": True, "layout": "unrecognised"}
+        if dread_file:
+            dp = paths.find_file(dread_file)
+            entry = {"attached": dp is not None, "provenance_ok": bool(dread_provenance_ok), "used": False}
+            if dp is not None and len(core) >= 2:
+                try:
+                    dt = labels.convert("dread", labels.read_table(dp))
+                    cov = labels.coverage(dt, non_gold)
+                    gate = labels.agreement_gate(core, dt, non_gold)
+                    entry.update({"layout": dt.layout, "coverage_non_gold": agg.share(cov), "gate": gate})
+                    if dread_provenance_ok and gate["passed"] and cov >= labels.COVERAGE_MIN:
+                        used.append(dt)
+                        entry["used"] = True
+                except labels.SchemaError:
+                    entry["layout"] = "unrecognised"
+            tinfo["dread"] = entry
         else:
-            tinfo["dread"] = {"attached": dread_path is not None, "provenance_ok": bool(dread_provenance_ok), "used": False}
-        summary["labels"] = {"tables": tinfo, "used": [t.name for t in used], "flag_fewer_than_3": len(used) < 3}
+            tinfo["dread"] = {"attached": False, "reason": "no file named in cell 2"}
+        s["labels"] = {"tables": tinfo, "used": [t.name for t in used], "flag_fewer_than_3": len(used) < 3}
         if not used:
             raise RuntimeError("no label table attached")
         uids = train.index
         mean = labels.mean_label(used, uids)
-        pil = tables.get("pilkwang")
-        w = labels.weights(mean, pil)
+        w = labels.weights(mean, tables.get("pilkwang"))
         b = labels.binary(mean)
-        # Agreement between the used tables (Spearman over all cells, non-gold)
+        all_masked = mean.isna().all(axis=1)
+
+        # 4. Site groups
+        gt, gsum = groups.build_groups(st)
+        gt.loc[gt["is_gold"], "in_training"] = False  # gold is never trained on
+        masked = all_masked.reindex(gt.index).fillna(True).astype(bool)
+        gt.loc[masked.to_numpy(), "in_training"] = False
+        gt["scored"] = gt["scored"].astype(bool) & ~masked
+        s["groups"] = gsum
+        tr = gt[gt["in_training"]]
+        s["groups"]["g_lang_sizes"] = agg.counts(tr["g_lang"].value_counts())
+        top_fp = tr["fingerprint"].fillna("missing").value_counts()
+        s["groups"]["top_fingerprints"] = agg.counts(top_fp[top_fp >= 5].head(15))
+        s["groups"]["fingerprint_coverage_training"] = agg.share(tr["fingerprint"].notna().mean()) if len(tr) else None
+
+        # 5. Label summaries and the gold bug check (never chooses anything)
         from scipy.stats import spearmanr
 
         agree = {}
@@ -192,38 +234,46 @@ def run(limit: int | None = None, workers: int = 4, dread_provenance_ok: bool = 
                 a = used[i].prob.reindex(non_gold)[FINDINGS].to_numpy(float).ravel()
                 c = used[j].prob.reindex(non_gold)[FINDINGS].to_numpy(float).ravel()
                 ok = ~(np.isnan(a) | np.isnan(c))
-                agree[f"{used[i].name}~{used[j].name}"] = round(float(spearmanr(a[ok], c[ok]).statistic), 4) if ok.sum() > 10 else None
-        summary["labels"]["spearman_between_tables"] = agree
-        # Gold bug check (never chooses anything)
+                agree[f"{used[i].name}~{used[j].name}"] = round(float(spearmanr(a[ok], c[ok]).statistic), 3) if ok.sum() > 10 else None
+        s["labels"]["spearman_between_tables"] = agree
         elig = labels.eligible_findings(gold)
-        g_auc, g_per = labels.macro_auc(gold.astype(float), mean.loc[gold.index], elig)
-        summary["labels"]["gold"] = {
+        g_auc, _ = labels.macro_auc(gold.astype(float), mean.loc[gold.index], elig)
+        s["labels"]["gold"] = {
             "studies": agg.count(len(gold)),
+            "is_58": len(gold) == 58,
             "with_report": agg.count(has_report[gold.index].sum()),
             "positives": agg.counts({f: int((gold[f] == 1).sum()) for f in FINDINGS}),
             "negatives": agg.counts({f: int((gold[f] == 0).sum()) for f in FINDINGS}),
             "eligible_findings": elig,
-            "macro_auc_eligible": round(g_auc, 4) if np.isfinite(g_auc) else None,
-            "bug_check_passed": bool(np.isfinite(g_auc) and g_auc >= 0.80),
+            "macro_auc_eligible": round(g_auc, 3) if np.isfinite(g_auc) else None,
+            "bug_check_passed": bool(len(elig) > 0 and np.isfinite(g_auc) and g_auc >= 0.80),
         }
         tr_ids = gt.index[gt["in_training"]]
-        summary["labels"]["prevalence_training"] = {
-            f: round(float(b.loc[tr_ids, f].fillna(0).mean()), 4) for f in FINDINGS
-        }
-        summary["labels"]["uncertain_cells_training"] = agg.count(int(b.loc[tr_ids].isna().sum().sum()))
-        summary["labels"]["unk_weighted_cells_training"] = agg.count(int((w.loc[tr_ids] == labels.UNK_WEIGHT).sum().sum()))
-        summary["labels"]["masked_studies"] = agg.count(int(mean.isna().all(axis=1).sum()))
+        s["labels"]["prevalence_training"] = {f: agg.share(b.loc[tr_ids, f].fillna(0).mean()) for f in FINDINGS}
+        s["labels"]["uncertain_cells_training"] = agg.count(int(b.loc[tr_ids].isna().sum().sum()))
+        s["labels"]["unk_weighted_cells_training"] = agg.count(int((w.loc[tr_ids] == labels.UNK_WEIGHT).sum().sum()))
+        s["labels"]["all_masked_studies"] = agg.count(int(all_masked.sum()))
+        s["labels"]["pos_weight_cap_upper"] = labels.pos_weight_cap_upper(b.loc[tr_ids])
 
-        # 5. Save private outputs
+        # 6. Floor-A tags (private) and private outputs
+        tag_cols = [UID, "manufacturer", "fingerprint"] + [f"{p}_{t}" for p in PLANES for t in TAGS]
+        tags = st.reset_index()[[c for c in tag_cols if c in st.reset_index().columns]]
+        fs = chosen[chosen["plane"] == "sagittal"].set_index(UID)
+        tags["model"] = tags[UID].map(fs["model"])
+        tags["field_strength"] = tags[UID].map(fs["field_strength"])
+        tags.to_csv(od / "tags.csv", index=False)
         gt.reset_index().to_csv(od / "studies.csv", index=False)
         mean.reset_index().to_csv(od / "labels_soft.csv", index=False)
         w.reset_index().to_csv(od / "labels_weight.csv", index=False)
         b.reset_index().to_csv(od / "labels_binary.csv", index=False)
-        summary["outputs"] = sorted(p.name for p in od.iterdir())
-        summary["training_studies"] = agg.count(int(gt["in_training"].sum()))
-        summary["scored_studies"] = agg.count(int((gt["scored"] & gt["in_training"]).sum()))
-        agg.write("run", agg.run_info("n0", {"limit": limit, "dread_provenance_ok": dread_provenance_ok}))
-        agg.write("n0", summary)
-    print({"gold_bug_check": summary["labels"]["gold"], "groups": summary["groups"]["g_lang_groups"],
-           "tables_used": summary["labels"]["used"]})
-    return summary
+        s["training_studies"] = agg.count(int(gt["in_training"].sum()))
+        s["scored_training_studies"] = agg.count(int((gt["scored"] & gt["in_training"]).sum()))
+        agg.write("n0", s)
+    common.summary({
+        "gold_bug_check": s["labels"]["gold"]["bug_check_passed"],
+        "gold_macro_auc": s["labels"]["gold"]["macro_auc_eligible"],
+        "tables_used": s["labels"]["used"],
+        "g_lang_groups": s["groups"]["g_lang_groups"],
+        "training_studies": s["training_studies"],
+    })
+    return s

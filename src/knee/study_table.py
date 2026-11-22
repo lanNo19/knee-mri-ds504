@@ -59,6 +59,10 @@ def build(root: Path, split: str = "train", workers: int = 4, limit: int | None 
             "has_iop": getattr(info, "has_iop", False),
             "center_x": getattr(info, "center_x", None),
             "plane_from_iop": getattr(info, "plane_from_iop", None),
+            "repetition_time": getattr(info, "repetition_time", None),
+            "echo_time": getattr(info, "echo_time", None),
+            "slice_thickness": getattr(info, "slice_thickness", None),
+            "pixel_spacing": getattr(info, "pixel_spacing", None),
         })
     ch = pd.DataFrame(rows)
     studies = sorted(ser[UID].unique())
@@ -68,6 +72,8 @@ def build(root: Path, split: str = "train", workers: int = 4, limit: int | None 
         out[f"{p}_series"] = out[UID].map(sub["SeriesInstanceUID"])
         out[f"{p}_slices"] = out[UID].map(sub["n_slices"])
         out[f"{p}_tier"] = out[UID].map(sub["tier"])
+        for tag in ("repetition_time", "echo_time", "slice_thickness", "pixel_spacing"):
+            out[f"{p}_{tag}"] = out[UID].map(sub[tag])
     lat, src = [], []
     for st in studies:
         sub = ch[ch[UID] == st]

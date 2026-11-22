@@ -53,6 +53,7 @@ class Table:
     prob: pd.DataFrame  # index UID, columns FINDINGS, float in [0, 1] or NaN
     unk: pd.DataFrame | None  # bool, True where the table says the report is silent
     layout: str
+    cells: dict | None = None  # counts of yes / no / unk / unmapped / numeric / empty cells
 
 
 def _match_columns(cols) -> dict[str, dict[str, str]]:
@@ -76,51 +77,85 @@ def _match_columns(cols) -> dict[str, dict[str, str]]:
     return found
 
 
-def _as_verdict(series: pd.Series) -> pd.Series:
-    """Map strings to 1 (yes), 0 (no), -1 (unknown/silent); NaN stays NaN."""
+def _as_verdict(series: pd.Series) -> tuple[pd.Series, dict]:
+    """Map strings to 1 (yes), 0 (no), -1 (unknown or silent); other strings to NaN.
+
+    Returns the mapped series and cell counts (yes, no, unk, unmapped, empty).
+    """
+    n = {"yes": 0, "no": 0, "unk": 0, "unmapped": 0, "empty": 0}
+
     def m(v):
         if v is None or (isinstance(v, float) and np.isnan(v)):
+            n["empty"] += 1
             return np.nan
         s = str(v).strip().lower()
         if s in YES:
+            n["yes"] += 1
             return 1.0
         if s in NO:
+            n["no"] += 1
             return 0.0
         if s in UNK:
+            n["unk"] += 1
             return -1.0
+        n["unmapped"] += 1
         return np.nan
-    return series.map(m)
+    out = series.map(m)
+    return out, n
+
+
+def read_table(path) -> pd.DataFrame:
+    """Read a label table keeping strings such as "NA" or "None" (they can mean UNK)."""
+    return pd.read_csv(path, keep_default_na=False, na_values=[""], low_memory=False)
 
 
 def convert(name: str, df: pd.DataFrame) -> Table:
-    """Turn one raw table into P(present) per finding."""
+    """Turn one raw table into P(present) per finding.
+
+    Refuses (SchemaError) rather than guesses: numeric values outside [0, 1],
+    a numeric value column that also has a confidence column, or more than
+    0.5% of verdict cells that map to nothing.
+    """
     if UID not in df.columns:
-        raise SchemaError(f"{name}: no {UID} column; columns = {list(df.columns)[:40]}")
+        raise SchemaError(f"{name}: no {UID} column")
     df = df.drop_duplicates(UID).set_index(UID)
     cols = _match_columns(df.columns)
     missing = [f for f in FINDINGS if not cols[f]]
     if missing:
-        raise SchemaError(f"{name}: findings not found: {missing}; columns = {list(df.columns)[:40]}")
+        raise SchemaError(f"{name}: findings not found: {missing}")
     prob = pd.DataFrame(index=df.index, columns=FINDINGS, dtype=float)
     unk = pd.DataFrame(False, index=df.index, columns=FINDINGS)
     layouts = set()
+    cells = {"yes": 0, "no": 0, "unk": 0, "unmapped": 0, "numeric": 0, "empty": 0}
     for f in FINDINGS:
         c = cols[f]
         val = df[c["value"]] if "value" in c else None
         if val is not None and pd.api.types.is_numeric_dtype(val):
+            if "conf" in c:
+                raise SchemaError(f"{name}: numeric {f} with a confidence column")
             v = val.astype(float)
-            if "verdict" in c:  # numeric value plus an explicit verdict column
-                ver = _as_verdict(df[c["verdict"]])
+            if ((v < 0) | (v > 1)).any():
+                raise SchemaError(f"{name}: numeric {f} outside [0, 1]")
+            if "verdict" in c:
+                ver, n = _as_verdict(df[c["verdict"]])
                 unk[f] = ver == -1
-            prob[f] = v.clip(0, 1)
+                for k in cells:
+                    cells[k] += n.get(k, 0)
+            prob[f] = v
+            cells["numeric"] += int(v.notna().sum())
+            cells["empty"] += int(v.isna().sum())
             layouts.add("numeric")
             continue
         verdict_col = c.get("verdict") or c.get("value")
         if verdict_col is None:
             raise SchemaError(f"{name}: no value or verdict column for {f}")
-        ver = _as_verdict(df[verdict_col])
+        ver, n = _as_verdict(df[verdict_col])
+        for k in cells:
+            cells[k] += n.get(k, 0)
         if "conf" in c:
-            conf = pd.to_numeric(df[c["conf"]], errors="coerce").clip(0, 1)
+            conf = pd.to_numeric(df[c["conf"]], errors="coerce")
+            if ((conf < 0) | (conf > 1)).any():
+                raise SchemaError(f"{name}: confidence for {f} outside [0, 1]")
             p = np.where(ver == 1, conf, np.where(ver == 0, 1 - conf, np.where(ver == -1, 0.0, np.nan)))
             layouts.add("verdict+confidence")
         else:
@@ -128,8 +163,11 @@ def convert(name: str, df: pd.DataFrame) -> Table:
             layouts.add("verdict")
         prob[f] = p
         unk[f] = ver == -1
+    total = max(1, sum(cells.values()) - cells["empty"])
+    if cells["unmapped"] > 0.005 * total:
+        raise SchemaError(f"{name}: too many unmapped verdict cells")
     layout = "+".join(sorted(layouts))
-    return Table(name=name, prob=prob, unk=unk if unk.values.any() else None, layout=layout)
+    return Table(name=name, prob=prob, unk=unk if unk.values.any() else None, layout=layout, cells=cells)
 
 
 def coverage(table: Table, uids) -> float:
@@ -180,7 +218,7 @@ def auc(y: np.ndarray, s: np.ndarray) -> float:
 
 
 def macro_auc(y: pd.DataFrame, s: pd.DataFrame, findings=None) -> tuple[float, dict]:
-    findings = list(findings or FINDINGS)
+    findings = list(FINDINGS if findings is None else findings)
     per = {f: auc(y[f].to_numpy(dtype=float), s[f].to_numpy(dtype=float)) for f in findings}
     vals = [v for v in per.values() if np.isfinite(v)]
     return (float(np.mean(vals)) if vals else float("nan")), per
@@ -222,9 +260,11 @@ def agreement_gate(core: list[Table], extra: Table, uids) -> dict:
     lowest = min(core_vals.values()) if core_vals else float("nan")
     passed = bool(
         np.isfinite(ex_val)
+        and np.isfinite(lowest)
         and ex_val >= lowest - 0.02
-        and all((not np.isfinite(v)) or v >= 0.5 for v in ex_per.values())
-        and all((not np.isfinite(r)) or r <= 0.9 for r in rhos.values())
+        and all(np.isfinite(v) and v >= 0.5 for v in ex_per.values())
+        and len(rhos) > 0
+        and all(np.isfinite(r) and r <= 0.9 for r in rhos.values())
     )
     return {
         "core_macro_auc": {k: round(v, 4) for k, v in core_vals.items()},
@@ -233,3 +273,25 @@ def agreement_gate(core: list[Table], extra: Table, uids) -> dict:
         "max_spearman": round(max(r for r in rhos.values() if np.isfinite(r)), 4) if any(np.isfinite(r) for r in rhos.values()) else None,
         "passed": passed,
     }
+
+
+def find_label_columns(columns) -> dict[str, str]:
+    """Map each finding to its column in train.csv (robust to spelling such as "Bakers")."""
+    cols = _match_columns(columns)
+    out = {f: c["value"] for f, c in cols.items() if "value" in c}
+    missing = [f for f in FINDINGS if f not in out]
+    if missing:
+        raise SchemaError(f"train.csv: label columns not found for {missing}")
+    return out
+
+
+def pos_weight_cap_upper(binary_train: pd.DataFrame) -> float:
+    """U = the larger of 20 and the rarest finding's negatives/positives (plan, L2 table)."""
+    ratios = []
+    for f in FINDINGS:
+        v = binary_train[f].fillna(0)
+        pos = float((v == 1).sum())
+        neg = float((v == 0).sum())
+        if pos > 0:
+            ratios.append(neg / pos)
+    return round(max([20.0] + ratios), 1)

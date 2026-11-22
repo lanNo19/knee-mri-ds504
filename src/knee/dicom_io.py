@@ -70,6 +70,10 @@ class SeriesInfo:
     has_iop: bool = False
     center_x: float | None = None
     plane_from_iop: str | None = None
+    repetition_time: float | None = None
+    echo_time: float | None = None
+    slice_thickness: float | None = None
+    pixel_spacing: float | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -144,7 +148,15 @@ def series_info(series_dir: Path) -> SeriesInfo:
     except Exception:  # noqa: BLE001
         info.field_strength = None
     info.laterality_tag = norm_laterality(getattr(ds, "Laterality", None))
+    for attr, tag in (("repetition_time", "RepetitionTime"), ("echo_time", "EchoTime"),
+                      ("slice_thickness", "SliceThickness")):
+        try:
+            v = getattr(ds, tag, None)
+            setattr(info, attr, round(float(v), 2) if v not in (None, "") else None)
+        except Exception:  # noqa: BLE001
+            setattr(info, attr, None)
     h = slice_header(files[0])
+    info.pixel_spacing = round(float(h.spacing[0]), 3) if h.spacing else None
     info.has_ipp = h.ipp is not None
     info.has_iop = h.iop is not None
     info.center_x = center_x(h)
@@ -196,7 +208,7 @@ def decode(path: Path) -> tuple[np.ndarray, str]:
     try:
         import dicomsdl  # type: ignore
 
-        arr = dicomsdl.open(str(path)).pixelData()
+        arr = dicomsdl.open(str(path)).pixelData(storedvalue=True)  # stored values; we rescale once
         return _rescale(ds, np.asarray(arr)), "dicomsdl"
     except Exception as e:  # noqa: BLE001
         errors.append(type(e).__name__)
@@ -217,11 +229,18 @@ class DecodeError(RuntimeError):
 
 
 def _rescale(ds, arr) -> np.ndarray:
+    """Stored values -> float image: MONOCHROME1 inverted on the stored range, then slope and intercept."""
     a = np.asarray(arr, dtype=np.float32)
     if a.ndim == 3 and a.shape[-1] in (3, 4) and str(getattr(ds, "PhotometricInterpretation", "")).startswith("RGB"):
         a = a[..., :3].mean(-1)
     if a.ndim == 3 and a.shape[0] == 1:
         a = a[0]
+    if str(getattr(ds, "PhotometricInterpretation", "")).upper() == "MONOCHROME1":
+        if int(getattr(ds, "PixelRepresentation", 0) or 0) == 1:
+            a = -a
+        else:
+            bits = int(getattr(ds, "BitsStored", 16) or 16)
+            a = float(2 ** bits - 1) - a
     slope = getattr(ds, "RescaleSlope", None)
     inter = getattr(ds, "RescaleIntercept", None)
     try:
@@ -231,24 +250,32 @@ def _rescale(ds, arr) -> np.ndarray:
             a = a + float(inter)
     except Exception:  # noqa: BLE001
         pass
-    if str(getattr(ds, "PhotometricInterpretation", "")).upper() == "MONOCHROME1":
-        a = a.max() - a
     return a
 
 
 # ---------------------------------------------------------------- ordering and frame
 
-def order_slices(headers: list[SliceHeader], plane: str) -> tuple[list[SliceHeader], str]:
-    """Sort by position along the plane's fixed stack axis; else InstanceNumber; else file order."""
+def order_slices(headers: list[SliceHeader], plane: str) -> tuple[list[SliceHeader], str, int]:
+    """Sort slices along the slice normal, signed to point along the plane's stack axis.
+
+    Falls back to InstanceNumber, then file order. Returns the ordered headers,
+    the order source and the number of duplicate positions (multi-echo series).
+    """
     axis = np.array(TARGET[plane]["stack"], dtype=float)
-    if all(h.ipp is not None for h in headers):
-        pos = [float(np.dot(h.ipp, axis)) for h in headers]
-        idx = sorted(range(len(headers)), key=lambda i: (pos[i], i))
-        return [headers[i] for i in idx], "position"
+    first_iop = next((h.iop for h in headers if h.iop is not None), None)
+    if all(h.ipp is not None for h in headers) and first_iop is not None:
+        normal = np.cross(np.array(first_iop[:3]), np.array(first_iop[3:]))
+        if np.dot(normal, axis) < 0:
+            normal = -normal
+        pos = [float(np.dot(h.ipp, normal)) for h in headers]
+        dup = len(pos) - len(set(np.round(pos, 2)))
+        if len(set(np.round(pos, 2))) > 1:
+            idx = sorted(range(len(headers)), key=lambda i: (pos[i], i))
+            return [headers[i] for i in idx], "position", dup
     if all(h.instance is not None for h in headers):
         idx = sorted(range(len(headers)), key=lambda i: (headers[i].instance, i))
-        return [headers[i] for i in idx], "instance"
-    return list(headers), "file"
+        return [headers[i] for i in idx], "instance", 0
+    return list(headers), "file", 0
 
 
 def nearest_index(n: int, k: int = N_SLICES) -> np.ndarray:
@@ -318,6 +345,8 @@ class VolumeResult:
     blank: bool
     n_files: int
     mixed_iop: bool
+    duplicate_positions: int = 0
+    iop_plane_mismatch: bool = False
 
 
 def prepare_volume(series_dir: Path, plane: str, laterality: str | None) -> VolumeResult:
@@ -326,7 +355,7 @@ def prepare_volume(series_dir: Path, plane: str, laterality: str | None) -> Volu
     if not files:
         raise FileNotFoundError("no dcm files")
     headers = [slice_header(p) for p in files]
-    ordered, source = order_slices(headers, plane)
+    ordered, source, dup = order_slices(headers, plane)
     pick = nearest_index(len(ordered))
     iops = [h.iop for h in ordered if h.iop is not None]
     mixed = len({tuple(np.round(i, 3)) for i in iops}) > 1
@@ -359,4 +388,6 @@ def prepare_volume(series_dir: Path, plane: str, laterality: str | None) -> Volu
         blank=bool(st["blank"]),
         n_files=len(files),
         mixed_iop=mixed,
+        duplicate_positions=int(dup),
+        iop_plane_mismatch=bool(iops and plane_of(iops[0]) != plane),
     )

@@ -89,10 +89,12 @@ def inner_folds(groups: pd.Series, train_mask: pd.Series, max_k: int = 4) -> pd.
 
 
 def fold_summary(fold: pd.Series, groups: pd.Series) -> list[dict]:
+    from . import agg
+
     rows = []
     for j in sorted(fold.unique()):
         if j < 0:
             continue
         m = fold == j
-        rows.append({"fold": int(j), "studies": int(m.sum()), "groups": int(groups[m].nunique())})
+        rows.append({"fold": int(j), "studies": agg.count(int(m.sum())), "n_groups": int(groups[m].nunique())})
     return rows

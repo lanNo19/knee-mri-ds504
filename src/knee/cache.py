@@ -1,23 +1,21 @@
 """Image caches: one uint8 memmap [studies, 32, 224, 224] per plane (plan, Storage).
 
-Rows follow the study order of N0's study table. Alongside the memmap:
-a manifest (sha256 of the memmap, shape, dtype, plane, commit), a per-study
-hash table (sha256 of each study's block), per-study image statistics, and
-agg_n4<plane>.json with the automatic checks (shape, blank volumes, slice-order
-source, orientation tags) as counts only.
+Rows follow the study order of the study table (sorted UIDs). Alongside the
+memmap, in the private output folder: a manifest (sha256 of the memmap,
+shape, dtype, plane), a per-study table (row, outcome, per-study sha256),
+and the summary returned to N4 (counts and shares only).
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import dicom_io, safe_log
+from . import agg, dicom_io, safe_log
 
 SHAPE_TAIL = (dicom_io.N_SLICES, dicom_io.SIZE, dicom_io.SIZE)
 
@@ -38,7 +36,8 @@ def _work(row: int, series_dir: str, plane: str, laterality: str | None) -> dict
         return {
             "row": row, "ok": True, "order": res.order_source, "frame_ok": res.frame_ok,
             "decoders": ",".join(res.decoders), "blank": res.blank, "n_files": res.n_files,
-            "mixed_iop": res.mixed_iop, "err": None,
+            "mixed_iop": res.mixed_iop, "dup": res.duplicate_positions,
+            "plane_mismatch": res.iop_plane_mismatch, "err": None,
             "mean": float(res.volume.mean()), "std": float(res.volume.std()),
             "sha256": hashlib.sha256(res.volume.tobytes()).hexdigest(),
         }
@@ -76,7 +75,9 @@ def build(study_table: pd.DataFrame, images_root: Path, plane: str, out: Path,
         se = r.get(f"{plane}_series")
         if se is None or (isinstance(se, float) and np.isnan(se)):
             continue
-        jobs.append((int(i), str(images_root / str(r["StudyInstanceUID"]) / str(se)), plane, r.get("laterality")))
+        lat = r.get("laterality")
+        lat = lat if lat in ("L", "R") else None
+        jobs.append((int(i), str(images_root / str(r["StudyInstanceUID"]) / str(se)), plane, lat))
     results = []
     stopped_early = 0
     window = max(2 * workers, 4)
@@ -85,8 +86,7 @@ def build(study_table: pd.DataFrame, images_root: Path, plane: str, out: Path,
         it = iter(jobs)
         exhausted = False
         while pending or not exhausted:
-            # Keep a small window of jobs in flight, and stop taking new ones
-            # at 0.75 x the time budget so the notebook ends normally.
+            # Keep a small window in flight; stop taking new jobs at 0.75 x the budget.
             while not exhausted and len(pending) < window:
                 j = next(it, None)
                 if j is None:
@@ -101,43 +101,42 @@ def build(study_table: pd.DataFrame, images_root: Path, plane: str, out: Path,
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
             for d in done:
                 results.append(d.result())
-    res = pd.DataFrame(results).sort_values("row") if results else pd.DataFrame(columns=["row", "ok"])
-    # Per-study files (private outputs; UIDs never printed)
+    res = pd.DataFrame(results).sort_values("row") if results else pd.DataFrame(columns=["row", "ok", "err"])
     per = tab[["StudyInstanceUID"]].copy()
     per["row"] = np.arange(n)
     per = per.merge(res, on="row", how="left")
     per.to_csv(out / f"cache_{plane}_studies.csv", index=False)
-    manifest = {
-        "plane": plane, "shape": [n, *SHAPE_TAIL], "dtype": "uint8",
-        "sha256": sha256_file(mm_path), "file": mm_path.name,
-    }
+    manifest = {"plane": plane, "shape": [n, *SHAPE_TAIL], "dtype": "uint8",
+                "sha256": sha256_file(mm_path), "file": mm_path.name}
     (out / f"cache_{plane}_manifest.json").write_text(json.dumps(manifest, indent=1))
     ok = res["ok"].fillna(False).astype(bool) if len(res) else pd.Series([], dtype=bool)
+    good = res[ok] if len(res) else res
+    written = int(ok.sum())
+    failed = int((~ok).sum())
+    missing = n - len(jobs)
     summary = {
         "plane": plane,
-        "studies": n,
-        "jobs": len(jobs),
-        "written": int(ok.sum()),
-        "failed": int((~ok).sum()),
-        "missing_series": int(n - len(jobs)),
-        "not_started_budget": int(stopped_early),
-        "error_types": res.loc[~ok, "err"].value_counts().to_dict() if len(res) else {},
-        "blank_volumes": int(res.loc[ok, "blank"].sum()) if len(res) else 0,
-        "order_source": res.loc[ok, "order"].value_counts().to_dict() if len(res) else {},
-        "missing_orientation": int((~res.loc[ok, "frame_ok"].astype(bool)).sum()) if len(res) else 0,
-        "mixed_orientation_series": int(res.loc[ok, "mixed_iop"].astype(bool).sum()) if len(res) else 0,
-        "decoders": res.loc[ok, "decoders"].value_counts().to_dict() if len(res) else {},
-        "files_per_series": _quantiles(res.loc[ok, "n_files"]) if len(res) else {},
-        "mean_intensity": _quantiles(res.loc[ok, "mean"]) if len(res) else {},
+        "studies": agg.count(n),
+        "failed": agg.count(failed),
+        "missing_series": agg.count(missing),
+        "not_started_budget": agg.count(stopped_early),
+        "error_types": agg.counts(res.loc[~ok, "err"].value_counts()) if len(res) else {},
+        "blank_volumes": agg.count(int(good["blank"].sum())) if len(good) else 0,
+        "order_source": agg.counts(good["order"].value_counts()) if len(good) else {},
+        "missing_orientation": agg.count(int((~good["frame_ok"].astype(bool)).sum())) if len(good) else 0,
+        "mixed_orientation_series": agg.count(int(good["mixed_iop"].astype(bool).sum())) if len(good) else 0,
+        "series_with_duplicate_positions": agg.count(int((good["dup"] > 0).sum())) if len(good) else 0,
+        "iop_plane_mismatch": agg.count(int(good["plane_mismatch"].astype(bool).sum())) if len(good) else 0,
+        "decoders": agg.counts(good["decoders"].value_counts()) if len(good) else {},
+        "files_per_series": agg.quantiles(good["n_files"]) if len(good) else {},
+        "mean_intensity": agg.quantiles(good["mean"]) if len(good) else {},
         "manifest_sha256": manifest["sha256"][:16],
         "seconds": round(time.time() - t0, 1),
+        "checks": {
+            "shape_ok": written + failed + missing + stopped_early == n,
+            "failures_under_1pct": failed + stopped_early <= 0.01 * max(n, 1),
+            "blank_under_1pct": (int(good["blank"].sum()) if len(good) else 0) <= 0.01 * max(n, 1),
+            "position_order_share": agg.share((good["order"] == "position").mean()) if len(good) else None,
+        },
     }
     return summary
-
-
-def _quantiles(s: pd.Series) -> dict:
-    s = pd.to_numeric(s, errors="coerce").dropna()
-    if s.empty:
-        return {}
-    q = s.quantile([0.0, 0.05, 0.5, 0.95, 1.0])
-    return {k: round(float(v), 2) for k, v in zip(["min", "p5", "median", "p95", "max"], q)}

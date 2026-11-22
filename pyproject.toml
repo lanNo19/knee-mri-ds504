@@ -15,6 +15,7 @@ dependencies = [
     "pydicom>=2.4",
     "scikit-learn",
     "scipy",
+    "pillow",
 ]
 
 [project.optional-dependencies]
@@ -24,8 +25,9 @@ decode = [
     "pylibjpeg==2.1.0",
     "pylibjpeg-libjpeg==2.5.0",
     "pylibjpeg-openjpeg==2.6.0",
+    "dicomsdl==0.109.4",
 ]
-test = ["pytest", "lingua-language-detector==2.2.0"]
+test = ["pytest", "lingua-language-detector==2.2.0", "papermill", "ipykernel", "nbformat"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,7 +1,8 @@
 """Report language and site groups (plan, "Splits").
 
 G-lang: report language; two languages are merged when they share a scanner
-fingerprint seen in at most two languages (union-find over languages).
+fingerprint seen in at most two languages, with at least MIN_SUPPORT sure
+studies in each of the two (union-find over languages).
 Why: a hospital writes in one language, and the merge catches a bilingual
 hospital that uses an uncommon scanner. A fingerprint seen in three or more
 languages is a common model, so it says nothing about the hospital.
@@ -23,6 +24,9 @@ import pandas as pd
 
 MIN_CONF = 0.80
 MIN_CHARS = 20
+# A shared scanner merges two languages only if each language has at least this many
+# sure studies on it, so one misread report cannot merge two groups (decision of 22 Nov).
+MIN_SUPPORT = 2
 
 
 def detect_languages(reports: pd.Series) -> pd.DataFrame:
@@ -67,23 +71,28 @@ class _UF:
             self.p[rb] = ra
 
 
-def build_groups(studies: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def build_groups(studies: pd.DataFrame, min_support: int = MIN_SUPPORT) -> tuple[pd.DataFrame, dict]:
     """studies: index UID; columns language, lang_conf, report_len, fingerprint, manufacturer, has_report.
 
-    Returns the table with g_lang, g_vendor, sure, scored and in_training,
-    plus a summary dict (no per-study values).
+    Returns the table with g_lang, g_vendor, sure, scored and in_training, plus a
+    summary (counts pass through agg.count; no per-study values).
     """
+    from . import agg
+
     s = studies.copy()
     s["sure"] = s["has_report"] & s["language"].notna() & (s["lang_conf"] >= MIN_CONF) & (s["report_len"] >= MIN_CHARS)
     sure = s[s["sure"]]
     langs = sorted(sure["language"].unique())
     uf = _UF(langs)
-    merges = 0
-    fp_langs = sure.dropna(subset=["fingerprint"]).groupby("fingerprint")["language"].agg(lambda x: sorted(set(x)))
-    for fp, ls in fp_langs.items():
-        if len(ls) == 2 and uf.find(ls[0]) != uf.find(ls[1]):
-            uf.union(ls[0], ls[1])
-            merges += 1
+    merges = []
+    by_fp = sure.dropna(subset=["fingerprint"]).groupby("fingerprint")["language"]
+    for fp, ser in by_fp:
+        vc = ser.value_counts()
+        if len(vc) == 2 and vc.min() >= min_support:
+            a, b = sorted(vc.index)
+            if uf.find(a) != uf.find(b):
+                uf.union(a, b)
+                merges.append({"languages": f"{a}+{b}", "support_each": agg.count(int(vc.min()))})
     group_of_lang = {lg: uf.find(lg) for lg in langs}
     s["g_lang"] = s["language"].map(group_of_lang).where(s["sure"])
 
@@ -100,15 +109,21 @@ def build_groups(studies: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     man = s["manufacturer"].fillna("UNKNOWN").astype(str)
     s["g_vendor"] = np.where(s["g_lang"].notna(), s["g_lang"].astype(str) + "|" + man, None)
     sizes = s.loc[s["in_training"], "g_lang"].value_counts()
+    unsure_by_lang = s.loc[unsure, "language"].fillna("none").value_counts()
+    fp_by_lang = sure.dropna(subset=["fingerprint"]).groupby("language")["fingerprint"].nunique()
     summary = {
         "languages": int(len(langs)),
-        "language_merges": int(merges),
+        "language_merges": int(len(merges)),
+        "merges": merges,
+        "min_support_per_language": min_support,
         "g_lang_groups": int(sizes.shape[0]),
         "g_vendor_groups": int(s.loc[s["in_training"], "g_vendor"].nunique()),
-        "largest_group_share": round(float(sizes.max() / sizes.sum()), 4) if len(sizes) else None,
-        "unsure_studies": int(unsure.sum()),
-        "unsure_assigned": int(guess.notna().sum()),
-        "unsure_left_out": int(guess.isna().sum()),
-        "no_report": int((~s["has_report"]).sum()),
+        "largest_group_share": agg.share(sizes.max() / sizes.sum()) if len(sizes) else None,
+        "unsure_studies": agg.count(int(unsure.sum())),
+        "unsure_assigned": agg.count(int(guess.notna().sum())),
+        "unsure_left_out": agg.count(int(guess.isna().sum())),
+        "unsure_by_language": agg.counts(unsure_by_lang),
+        "fingerprints_by_language": agg.counts(fp_by_lang),
+        "no_report": agg.count(int((~s["has_report"]).sum())),
     }
     return s, summary

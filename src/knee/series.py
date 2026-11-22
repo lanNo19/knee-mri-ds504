@@ -32,11 +32,13 @@ def truthy(v) -> bool:
 
 
 def norm_plane(v) -> str | None:
+    """Plane name from labels such as "Sagittal", "SAG", "Coronal", "COR", "Axial", "AX", "Transverse"."""
     s = str(v).strip().lower()
-    for p in PLANES:
-        if s.startswith(p[:3]):
-            return p
-    if s.startswith("tra"):
+    if s.startswith("sag"):
+        return "sagittal"
+    if s.startswith("cor"):
+        return "coronal"
+    if s.startswith("ax") or s.startswith("tra"):
         return "axial"
     return None
 
