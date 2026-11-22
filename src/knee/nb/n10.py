@@ -117,6 +117,11 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
         s["bundle_commit"] = (man.get("commit") or "")[:12] or None  # the installed wheel's commit
         prev = _prevalence(rootp)
         units = {} if canary else _units(encoder, rootp)
+        if not canary:  # a wrong bundle fails in seconds, before hours of decoding
+            ckpt = bdir / "checkpoints" / f"{encoder}.pth"
+            want = man.get("files_sha256", {}).get(ckpt.name)
+            if want is None or not ckpt.exists() or _sha256(ckpt) != want:
+                raise ValueError("checkpoint does not match the bundle manifest")
         s["folds"] = sorted(units)
         s["heads_sha16"] = {f"fold_{k}": u["head_sha16"] for k, u in sorted(units.items())}
         work = Path(tempfile.mkdtemp(prefix="knee_n10_"))  # caches are large and never saved
@@ -147,11 +152,7 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
 
         P = np.tile(prev, (n, 1))  # per-study fallback: the training prevalence
         if not canary:
-            # 3. Embeddings with the bundled checkpoint (no download), checked against the manifest
-            ckpt = bdir / "checkpoints" / f"{encoder}.pth"
-            want = man.get("files_sha256", {}).get(ckpt.name)
-            if want is None or _sha256(ckpt) != want:
-                raise ValueError("checkpoint does not match the bundle manifest")
+            # 3. Embeddings with the bundled checkpoint (no download; checked above)
             devs = n5._devices(None)
             encs_by_dev = {}
             for dv in devs:

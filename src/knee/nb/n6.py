@@ -476,7 +476,8 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
                             else:
                                 units[r["task"]] = {"ok": False, "skipped": bool(r.get("skipped")), "error": r.get("error")}
                                 fails[r["task"]] = r.get("error")
-                    pending = [t for t in crashed if t["id"] != "demo"]
+                    crashed_ids = {t["id"] for t in crashed}
+                    pending = [t for t in tasks if t["id"] in crashed_ids]  # original (fold-major) order
                     if not crashed:
                         break
                 for t in pending:  # crashed twice
