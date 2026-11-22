@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knee"
+version = "0.1.0"
+description = "DS 504 knee MRI project: frozen image encoders on report-derived labels"
+requires-python = ">=3.11"
+# Kaggle's image already has numpy, pandas, pydicom, scikit-learn and scipy;
+# they are listed without upper pins so pip never replaces Kaggle's builds.
+dependencies = [
+    "numpy",
+    "pandas",
+    "pydicom>=2.4",
+    "scikit-learn",
+    "scipy",
+]
+
+[project.optional-dependencies]
+n0 = ["lingua-language-detector==2.2.0"]
+decode = [
+    "python-gdcm==3.2.6",
+    "pylibjpeg==2.1.0",
+    "pylibjpeg-libjpeg==2.5.0",
+    "pylibjpeg-openjpeg==2.6.0",
+]
+test = ["pytest", "lingua-language-detector==2.2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
