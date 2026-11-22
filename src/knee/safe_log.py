@@ -97,6 +97,7 @@ def _strip_loggers() -> None:
     for h in list(root.handlers):
         root.removeHandler(h)
     handler = logging.StreamHandler(sys.__stderr__)
+    handler.setLevel(logging.WARNING)  # child loggers set to DEBUG (the kernel's) still propagate here
     handler.setFormatter(_NoMessageFormatter())
     root.addHandler(handler)
     root.setLevel(logging.WARNING)

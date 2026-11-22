@@ -49,9 +49,8 @@ def _load_units(base: Path, n: int, row_of: dict) -> dict:
     seen: dict = {}
     for p in sorted(base.glob("**/units/*_f*/predictions.csv")):
         enc, fold = p.parent.name.rsplit("_f", 1)
-        rerun = any(x.endswith("-r") or x.endswith("_r") for x in p.parts)
         key = (enc, int(fold))
-        if key in seen and not rerun:
+        if key in seen and not common.is_rerun(p.parent):
             continue
         seen[key] = p
     for (enc, _), p in sorted(seen.items()):
@@ -90,6 +89,29 @@ def _interval(stat, groups, n_boot, seed) -> dict:
             "n_groups": di["n_groups"], "approximate": di["approximate"]}
 
 
+def _controls(root) -> dict:
+    """The pilot's controls and every notebook's leakage flag, copied into the freeze file."""
+    out = {}
+    p = paths.find_file("agg_pilot.json", root)
+    if p is not None:
+        pj = json.loads(p.read_text())
+        pc, oc = pj.get("positive_control") or {}, pj.get("overlap_control") or {}
+        out["pilot"] = {"positive_control_all_passed": pc.get("all_passed"),
+                        "overlap_control_passed": oc.get("passed"), "known_answer_detected": oc.get("known_answer_detected"),
+                        "leakage_assertion_passed": pj.get("leakage_assertion_passed"),
+                        "half_width_delta1": (pj.get("half_width_delta1") or {}).get("union")}
+    for name in ("n6a", "n6b", "n8"):
+        p = paths.find_file(f"agg_{name}.json", root)
+        if p is not None:
+            j = json.loads(p.read_text())
+            out[name] = {"leakage_assertion_passed": j.get("leakage_assertion_passed"),
+                         **({"all_units_ok": j.get("all_units_ok"), "all_nested": j.get("all_nested")}
+                            if name != "n8" else {"usable_from_n5": j.get("usable_from_n5")})}
+    flags = [v.get("leakage_assertion_passed") is True for v in out.values() if isinstance(v, dict)]
+    out["all_leakage_assertions_passed"] = all(flags) if flags else None
+    return out
+
+
 def _h2_category(lo, hi) -> str:
     c = intervals.decide(lo, hi)
     return {"B better": "supported", "A better": "opposite"}.get(c, c)
@@ -112,7 +134,7 @@ def _ece(p, y, bins: int = 10) -> float | None:
 def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneemri_json: str | None = None,
         n_boot: int = intervals.N_BOOT, seed: int = 0, budget_h: float = 2.0, quiet: bool = True) -> dict:
     """hidden: {"dinov2_vits14": score, "convnext_tiny": score} from the Kaggle late submissions (S4).
-    kneemri_json: path of agg_kneemri.json (S5), if KneeMRI ran."""
+    kneemri_json: path or https URL (the repo's raw file) of agg_kneemri.json (S5), if KneeMRI ran."""
     s: dict = {"frozen_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     cfg = {"n_boot": n_boot, "seed": seed, "hidden": bool(hidden), "kneemri": bool(kneemri_json)}
     with common.notebook("n9", cfg, quiet=quiet, budget_h=budget_h):
@@ -290,17 +312,34 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
             per_lang = {}
             for lg in sorted(set(map(str, d.g_lang[ev]))):
                 rows = ev[d.g_lang[ev].astype(str) == lg]
+                small = len(rows) < 5  # suppressed, like any count below 5
                 per_lang[lg] = {"studies": agg.count(len(rows)),
-                                **{e: _r(metrics.macro_available(P[rows], Y[rows], elig), 3) for e, P in units.items()}}
+                                **{e: (None if small else _r(metrics.macro_available(P[rows], Y[rows], elig), 3))
+                                   for e, P in units.items()}}
             s["per_language"] = per_lang
 
             # S5 KneeMRI (from the laptop)
-            if kneemri_json and Path(kneemri_json).exists():
+            km = None
+            if kneemri_json and str(kneemri_json).startswith("https://"):
+                import urllib.request
+
+                with urllib.request.urlopen(str(kneemri_json), timeout=60) as r:  # the repo's committed summary
+                    km = json.loads(r.read().decode())
+            elif kneemri_json and Path(kneemri_json).exists():
                 km = json.loads(Path(kneemri_json).read_text())
+            if km is not None:
                 agg._check(km)
                 s["s5_kneemri"] = km
             else:
                 s["s5_kneemri"] = {"status": "not run"}
+
+            # Per-finding Delta1 (exploratory: the same intervals, unadjusted; they decide nothing)
+            s["h1"]["per_finding_exploratory"] = {
+                FINDINGS[j]: _interval(lambda w, j=j: m(A, ev, f2, [j], w) - m(B, ev, f2, [j], w), g, n_boot, seed)
+                for j in elig}
+
+            # Controls and leakage flags from the other notebooks
+            s["controls"] = _controls(Path(root) if root else None)
 
             # Targets vs achieved (the better encoder on S2)
             better = DINO if (h1_lang["estimate"] or 0) >= 0 else CONV
@@ -319,6 +358,7 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                               "H4": "not run (cut 22 Nov)"}
             agg.write("results", s)
     common.summary({"decisions": s.get("decisions"), "main_complete": s.get("main_complete"),
+                    "controls_ok": (s.get("controls") or {}).get("all_leakage_assertions_passed"),
                     "findings_match_pilot": s.get("findings", {}).get("matches_pilot"),
                     "status": s.get("status")})
     return s

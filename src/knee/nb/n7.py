@@ -38,8 +38,7 @@ def unit_configs(root: Path | None = None) -> dict:
     for p in sorted(base.glob("**/units/*_f*/config.json")):
         u = json.loads(p.read_text())
         prev = found.setdefault(u["encoder"], {}).get(int(u["fold"]))
-        rerun = "-r" in str(p.parent.parent.parent.parent) or "_r" in p.parent.parent.parent.name
-        if prev is None or rerun:
+        if prev is None or common.is_rerun(p.parent):
             found[u["encoder"]][int(u["fold"])] = u
     return found
 
@@ -63,6 +62,7 @@ def consensus(units: dict) -> dict:
         won.setdefault(f"{u['l1_winner']['pooling']}|{u['l1_winner']['planes']}", []).append(int(u["fold"]))
     # fold numbers sit under "folds"/"fold" keys (structure, not counts of studies)
     return {"config": med["config"], "E": int(med["E"]), "fold": int(med["fold"]),
+            "refit_steps": med.get("refit_steps"),
             "l1_winner_folds": {k: {"folds": sorted(v)} for k, v in won.items()},
             "folds": sorted(int(f) for f in units)}
 

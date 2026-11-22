@@ -35,12 +35,14 @@ NOTEBOOKS = {
     "smoke-all-2": (True, True, True, [], 5400),
     "n5": (True, False, False, ["n4-sagittal", "n4-coronal", "n4-axial"], 14400),
     "n6p": (True, False, False, ["n0", "n3", "n5"], 14400),
-    "n8": (False, False, False, ["n0", "n3"], 10800),
+    "n8": (False, False, False, ["n0", "n3", "n5"], 10800),
     "n6a-smoke": (True, False, False, ["n0", "n3", "n5"], 7200),
     "n6a": (True, False, False, ["n0", "n3", "n5"], 32400),
     "n6b": (True, False, False, ["n0", "n3", "n5"], 32400),
     "n7": (True, False, False, ["n0", "n3", "n5", "n6a", "n6b"], 14400),
     "n9": (False, False, False, ["n0", "n3", "n5", "n6p", "n6a", "n6b", "n7", "n8"], 7200),
+    "bundle": (False, False, False, [], 3600),
+    "n10": (True, True, False, ["n6a"], 32400),  # internet OFF; the bundle dataset is attached by hand
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
 }
 
@@ -78,10 +80,25 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> s
         return f'from knee.nb import n4; n4.run("{name[3:]}", budget_h=8)'
     if name == "montage":
         return "from knee.nb import montage; montage.run()"
+    if name == "bundle":
+        return "from knee.nb import bundle; bundle.run()"
+    if name == "n10":
+        return 'from knee.nb import n10; n10.run("dinov2_vits14")'
     raise KeyError(name)
 
 
-def cell1(commit: str) -> str:
+CELL1_OFFLINE = (
+    "import glob, subprocess, sys\n"
+    'W = (glob.glob("/kaggle/input/*/private/bundle/wheels") + glob.glob("/kaggle/input/datasets/*/*/private/bundle/wheels"))[0]\n'
+    'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-index", "--find-links", W, "knee", "timm==1.0.31",'
+    ' "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)\n'
+    "import knee.safe_log as sl; sl.install()"
+)
+
+
+def cell1(commit: str, offline: bool = False) -> str:
+    if offline:  # N10: internet off, everything from the bundle (its wheel is the pinned commit)
+        return CELL1_OFFLINE
     return (
         f'COMMIT = "{commit}"\n'
         '!pip install -q "knee[n0,decode,models] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"\n'
@@ -89,12 +106,12 @@ def cell1(commit: str) -> str:
     )
 
 
-def notebook_json(commit: str, code: str) -> dict:
+def notebook_json(commit: str, code: str, offline: bool = False) -> dict:
     def cell(src):
         return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
                 "source": src.splitlines(keepends=True)}
 
-    return {"cells": [cell(cell1(commit)), cell(code)],
+    return {"cells": [cell(cell1(commit, offline)), cell(code)],
             "metadata": {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"}},
             "nbformat": 4, "nbformat_minor": 5}
 
@@ -107,7 +124,7 @@ def metadata(user: str, name: str, dread_file: str | None = None) -> dict:
     meta = {
         "id": f"{user}/knee-{name}", "title": f"knee-{name}", "code_file": "notebook.ipynb",
         "language": "python", "kernel_type": "notebook", "is_private": True,
-        "enable_gpu": gpu, "enable_internet": True,
+        "enable_gpu": gpu, "enable_internet": name != "n10",
         "competition_sources": [COMPETITION] if comp else [],
         "dataset_sources": datasets,
         "kernel_sources": [f"{user}/knee-{u}" for u in up],
@@ -130,7 +147,7 @@ def main(argv=None):
         d = Path(a.out) / name
         d.mkdir(parents=True, exist_ok=True)
         code = cell2(name, a.dread_file, a.dread_provenance_ok)
-        (d / "notebook.ipynb").write_text(json.dumps(notebook_json(a.commit, code), indent=1))
+        (d / "notebook.ipynb").write_text(json.dumps(notebook_json(a.commit, code, offline=name == "n10"), indent=1))
         (d / "kernel-metadata.json").write_text(json.dumps(metadata(a.user, name, a.dread_file), indent=1))
         (d / "timeout_s").write_text(f"{NOTEBOOKS[name][4]}\n")
     print(f"wrote {len(NOTEBOOKS)} notebooks under {a.out}/")

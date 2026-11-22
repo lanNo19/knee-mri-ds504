@@ -238,7 +238,7 @@ def _projection(d, fdf: pd.DataFrame, K: int) -> dict:
 
     N6a runs 4 worker processes on 2 GPUs: the wall time lies between one process's
     total / 4 (CPU-bound) and / 2 (GPU-bound); the upper end is compared with the plan's
-    8-hour trigger.
+    pilot gate (projected N6a above 6 h: simplified Stage A).
     """
     ks = [int(d.inner(k)[d.inner(k) >= 0].max() + 1) for k in range(K) if (d.inner(k) >= 0).any()]
     k_in = int(np.median(ks)) if ks else 4
@@ -254,7 +254,7 @@ def _projection(d, fdf: pd.DataFrame, K: int) -> dict:
     if main:
         one = K * sum(main)
         out["n6a_wall_hours"] = {"low": round(one / 4, 2), "high": round(one / 2, 2)}
-        out["n6a_over_8h_trigger"] = one / 2 > 8
+        out["n6a_over_6h_gate"] = one / 2 > 6
     if "vit_s16" in unit:
         dm = fdf.loc[fdf["encoder"] == encoders.MAIN[0], "per_epoch_s"]
         demo = 3 * 900 * float(dm.median()) / 3600 if len(dm) else 0.0

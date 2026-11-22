@@ -60,6 +60,13 @@ def upstream(file_name: str, explicit: Path | None = None) -> tuple[Path, dict]:
     return p, {"commit": commit, "sha16": sha16(p)}
 
 
+def is_rerun(path) -> bool:
+    """A rerun notebook's output (slug ending in -r or -r2..., e.g. knee-n6a-r, or a step named n6a_r)."""
+    import re
+
+    return any(re.search(r"[-_]r\d*$", part) for part in Path(path).parts)
+
+
 def expect(info: dict, sha16_prefix: str | None) -> None:
     """Fail loudly if the attached upstream file is not the expected version."""
     if sha16_prefix and not info["sha16"].startswith(sha16_prefix):

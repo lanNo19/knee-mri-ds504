@@ -251,3 +251,24 @@ def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
     assert s9["s3_gold"]["consistent"] and s9["s4_hidden"]["consistent"]
     assert s9["anti_claim_1"]["d_pre"]["estimate"] > 0
     assert s9["decisions"]["H4"].startswith("not run")
+
+
+
+def test_n6_backstop_switches_both_encoders_of_a_fold_together(stage_env, monkeypatch):
+    pytest.importorskip("optuna")
+    from knee.nb import n6
+
+    root, _ = stage_env
+    monkeypatch.setattr(paths, "WORKING", root / "working_n6b")
+    # a backstop already past: every fold is projected late, so each runs simplified for both encoders
+    s = n6.run("n6a", encoders=("dinov2_vits14", "convnext_tiny"), folds=(0, 1), root=root / "input", workers=2,
+               backstop_utc="2000-01-01T00:00:00Z", unit_hours_est=1.0, n_trials=2,
+               l1_grid=[("mean", "sag"), ("gated", "all")], quiet=True)
+    assert s["all_units_ok"], s["units"]
+    assert s["fold_modes"] == {"fold_0": "simplified", "fold_1": "simplified"}
+    assert not s["all_nested"]
+    for k in (0, 1):
+        tunings = {s["units"][f"{e}_f{k}"]["tuning"] for e in ("dinov2_vits14", "convnext_tiny")}
+        assert tunings == {"simplified (not nested)"}
+    cfg1 = json.loads((paths.WORKING / "private" / "n6a" / "units" / "dinov2_vits14_f1" / "config.json").read_text())
+    assert cfg1["l2_from"] == "fold 0"  # BO ran on fold 0 only; fold 1 reuses its L2 settings

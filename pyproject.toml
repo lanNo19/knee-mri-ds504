@@ -29,6 +29,8 @@ decode = [
 ]
 # Kaggle's image has torch and torchvision; timm and Optuna are pinned (plan); LightGBM is Kaggle's.
 models = ["timm==1.0.31", "optuna==5.0.0", "lightgbm"]
+# KneeMRI on the laptop (Apple GPU) or the lab cluster
+laptop = ["torch", "timm==1.0.31", "py7zr"]
 test = ["pytest", "lingua-language-detector==2.2.0", "papermill", "ipykernel", "nbformat"]
 
 [tool.setuptools.packages.find]

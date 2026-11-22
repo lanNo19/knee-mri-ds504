@@ -35,8 +35,10 @@ PATIENCE = 5
 WARMUP_EPOCHS = 1
 N_OUT = 12
 
+import threading
+
 guard_checks = 0  # fits whose index sets passed the leakage assertion
-_INIT_LOCK = None  # serialises seeded weight initialisation across threads (N6p runs two GPUs)
+_INIT_LOCK = threading.Lock()  # serialises seeded weight initialisation across threads (N6p runs two GPUs)
 
 
 def scoring_labels(binary) -> np.ndarray:
@@ -124,13 +126,14 @@ class Bank:
         import torch
 
         idx_t = torch.as_tensor(np.asarray(idx), device=self.device)
+        dt = torch.float32 if self.device.type == "mps" else torch.float64  # MPS has no float64
         out = {}
         for p, x in self.x.items():
-            s1 = torch.zeros(x.shape[-1], device=self.device, dtype=torch.float64)
+            s1 = torch.zeros(x.shape[-1], device=self.device, dtype=dt)
             s2 = torch.zeros_like(s1)
             cnt = 0
             for i in range(0, len(idx_t), 256):
-                xb = x[idx_t[i:i + 256]].double().reshape(-1, x.shape[-1])
+                xb = x[idx_t[i:i + 256]].to(dt).reshape(-1, x.shape[-1])
                 s1 += xb.sum(0)
                 s2 += (xb * xb).sum(0)
                 cnt += xb.shape[0]
@@ -238,11 +241,6 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
 
     _check_guard(train_idx, val_idx, forbidden)
     t0 = time.time()
-    global _INIT_LOCK
-    if _INIT_LOCK is None:
-        import threading
-
-        _INIT_LOCK = threading.Lock()
     gen = torch.Generator().manual_seed(seed)
     planes = PLANE_SETS[cfg.planes]
     stats = stats or bank.stats(train_idx)

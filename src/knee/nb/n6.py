@@ -41,6 +41,8 @@ from . import common
 
 N_TRIALS = 30
 N_STARTUP = 10  # trial 0 (the defaults) + 9 random
+# Simplified Stage A (plan: pilot projection above 6 h, or the backstop): this grid, BO on fold 0 only
+SIMPLE_GRID = [("max", "sag"), ("max", "all"), ("gated", "sag"), ("gated", "all")]
 DEMO_EPOCHS_PER_ARM = 900
 _W: dict = {}  # worker state: device, data, banks
 
@@ -68,8 +70,9 @@ def suggest(trial, U: float, gated: bool) -> dict:
 
 # ---------------------------------------------------------------- workers
 
-def _init(counter, n_gpus: int, root, expect):
+def _init(counter, n_gpus: int, root, expect, shared=None):
     safe_log.worker_init()
+    _W["shared"] = shared
     with counter.get_lock():
         wid = counter.value
         counter.value += 1
@@ -132,13 +135,53 @@ def _demo_task(task: dict) -> dict:
 
 # ---------------------------------------------------------------- one unit
 
+def _fold_mode(task: dict) -> str:
+    """The tuning mode of a fold, decided once and shared by both encoders' units of that fold.
+
+    "simplified" when the run is simplified (pilot decision) or when the unit is projected to
+    finish after the backstop deadline; "skipped" past the soft stop (0.75 x budget); else "nested".
+    """
+    shared = _W.get("shared")
+    k = task["fold"]
+    if shared is None:  # tests without a manager
+        return task.get("mode", "nested")
+    with shared["lock"]:
+        modes = shared["modes"]
+        if k not in modes:
+            now = time.time()
+            done = list(shared["durations"])
+            est = float(np.median(done)) if done else (task.get("unit_s_est") or None)
+            if task.get("mode") == "simplified":
+                modes[k] = "simplified"
+            elif now > task["soft_stop"]:
+                modes[k] = "skipped"
+            elif task.get("backstop") and est is not None and now + est > task["backstop"]:
+                modes[k] = "simplified"
+            else:
+                modes[k] = "nested"
+        return modes[k]
+
+
+def _fold0_l2(task: dict, enc: str, wait_s: float = 1800.0) -> tuple[dict | None, str]:
+    """L2 settings found on fold 0 for this encoder (simplified tuning reuses them for every fold)."""
+    p = Path(task["dir"]).parent / f"{enc}_f0" / "config.json"
+    t0 = time.time()
+    while not p.exists() and time.time() - t0 < wait_s and task["fold"] != 0:
+        time.sleep(30)
+    if not p.exists():
+        return None, "defaults"
+    c = json.loads(p.read_text())["config"]
+    return {k: c[k] for k in ("lr", "weight_decay", "dropout", "attn_hidden", "pos_cap", "batch_size")}, "fold 0"
+
+
 def _unit(task: dict, od: Path) -> dict:
     import optuna
     import torch
 
     t0 = time.time()
-    if time.time() > task["deadline"]:
-        return {"task": task["id"], "ok": False, "skipped": True}
+    mode = _fold_mode(task)
+    if mode == "skipped":
+        return {"task": task["id"], "ok": False, "skipped": True, "mode": mode}
     enc, k, seed, elig = task["encoder"], task["fold"], task["seed"], task["eligible"]
     d, bank = _data(), _bank(enc)
     od.mkdir(parents=True, exist_ok=True)
@@ -164,10 +207,11 @@ def _unit(task: dict, od: Path) -> dict:
         sc = [x for x in sc if np.isfinite(x)]
         return (float(np.mean(sc)) if sc else float("nan")), eps
 
-    # L1 grid at the L2 defaults
+    # L1 grid at the L2 defaults (the simplified grid: max or gated, sagittal or all three planes)
     base = heads.default_config(U)
+    grid = task.get("l1_grid") or (SIMPLE_GRID if mode == "simplified" else heads.L1_GRID)
     l1 = []
-    for pooling, planes in task.get("l1_grid") or heads.L1_GRID:
+    for pooling, planes in grid:
         m, eps = score(heads.with_l1(base, pooling, planes))
         l1.append({"pooling": pooling, "planes": planes, "inner_score": m, "median_best_epoch": float(np.median(eps))})
     l1df = pd.DataFrame(l1)
@@ -176,26 +220,40 @@ def _unit(task: dict, od: Path) -> dict:
     win_cfg = heads.with_l1(base, str(win["pooling"]), str(win["planes"]))
     gated = win_cfg.pooling == "gated"
 
-    # L2 Bayesian optimisation for the L1 winner
-    sampler = optuna.samplers.GPSampler(seed=seed + 1000 * k, n_startup_trials=N_STARTUP)
-    study = optuna.create_study(direction="maximize", sampler=sampler)
-    study.enqueue_trial(space_defaults(U, gated))
+    l2_from = "bayesian optimisation on this fold"
+    study = None
+    if mode == "simplified" and k != 0:
+        # simplified: Bayesian optimisation ran on fold 0 only; its L2 settings are reused
+        l2, l2_from = _fold0_l2(task, enc)
+        cfg_best = replace(win_cfg, **l2) if l2 else win_cfg
+        best_score, eps = score(cfg_best)
+        E = max(1, int(np.median(eps)))
+        pd.DataFrame([{"number": 0, "state": "REUSED", "value": best_score, **(l2 or {}),
+                       "best_epochs": json.dumps([int(e) for e in eps])}]).to_csv(od / "trials.csv", index=False)
+        default_score = None
+    else:
+        # L2 Bayesian optimisation for the L1 winner
+        sampler = optuna.samplers.GPSampler(seed=seed + 1000 * k, n_startup_trials=N_STARTUP)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study.enqueue_trial(space_defaults(U, gated))
 
-    def objective(trial):
-        cfg = replace(win_cfg, **suggest(trial, U, gated))
-        m, eps = score(cfg)
-        trial.set_user_attr("best_epochs", [int(e) for e in eps])
-        return m
+        def objective(trial):
+            cfg = replace(win_cfg, **suggest(trial, U, gated))
+            m, eps = score(cfg)
+            trial.set_user_attr("best_epochs", [int(e) for e in eps])
+            return m
 
-    study.optimize(objective, n_trials=int(task.get("n_trials") or N_TRIALS), catch=(ValueError,))
-    rows = []
-    for t in study.trials:
-        rows.append({"number": t.number, "state": t.state.name, "value": t.value, **t.params,
-                     "best_epochs": json.dumps(t.user_attrs.get("best_epochs", []))})
-    pd.DataFrame(rows).to_csv(od / "trials.csv", index=False)
-    best = study.best_trial
-    cfg_best = replace(win_cfg, **best.params)
-    E = max(1, int(np.median(best.user_attrs["best_epochs"])))
+        study.optimize(objective, n_trials=int(task.get("n_trials") or N_TRIALS), catch=(ValueError,))
+        rows = []
+        for t in study.trials:
+            rows.append({"number": t.number, "state": t.state.name, "value": t.value, **t.params,
+                         "best_epochs": json.dumps(t.user_attrs.get("best_epochs", []))})
+        pd.DataFrame(rows).to_csv(od / "trials.csv", index=False)
+        best = study.best_trial
+        cfg_best = replace(win_cfg, **best.params)
+        best_score = float(best.value)
+        E = max(1, int(np.median(best.user_attrs["best_epochs"])))
+        default_score = round(float(study.trials[0].value), 4) if study.trials[0].value is not None else None
 
     # Refit on the outer training set, then the test fold and its gold studies
     r = heads.fit(bank, cfg_best, tr, epochs=E, stats=stats, forbidden=forbid, seed=0)
@@ -208,15 +266,22 @@ def _unit(task: dict, od: Path) -> dict:
     pred.to_csv(od / "predictions.csv", index=False)
     torch.save(r.model.state_dict(), od / "head.pt")
     torch.save({p: (mu.cpu(), sd.cpu()) for p, (mu, sd) in stats.items()}, od / "stats.pt")
-    summary = {"encoder": enc, "fold": k, "l1_winner": {"pooling": win_cfg.pooling, "planes": win_cfg.planes},
+    summary = {"encoder": enc, "fold": k, "tuning": "nested" if mode == "nested" else "simplified (not nested)",
+               "l2_from": l2_from,
+               "l1_winner": {"pooling": win_cfg.pooling, "planes": win_cfg.planes},
                "l1_scores": {f"{a}|{b}": (round(v, 4) if np.isfinite(v) else None)
                              for a, b, v in zip(l1df["pooling"], l1df["planes"], l1df["inner_score"])},
-               "config": cfg_best.to_dict(), "best_inner_score": round(float(best.value), 4), "E": E,
-               "default_trial_score": round(float(study.trials[0].value), 4) if study.trials[0].value is not None else None,
+               "config": cfg_best.to_dict(), "best_inner_score": round(best_score, 4), "E": E,
+               # optimiser steps of the refit (KneeMRI S5 uses the same number of steps)
+               "refit_steps": int(E * int(np.ceil(len(tr) / max(1, int(cfg_best.batch_size))))),
+               "default_trial_score": default_score,
                "inner_k": len(folds_in), "seconds": round(time.time() - t0, 1),
                "predictions_sha16": common.sha16(od / "predictions.csv")}
     (od / "config.json").write_text(json.dumps(summary, indent=1))
-    return {"task": task["id"], "ok": True, "summary": summary, "fits": n_fits}
+    shared = _W.get("shared")
+    if shared is not None and mode == "nested":
+        shared["durations"].append(time.time() - t0)
+    return {"task": task["id"], "ok": True, "summary": summary, "fits": n_fits, "mode": mode}
 
 
 # ---------------------------------------------------------------- the HPO demo
@@ -276,6 +341,7 @@ def _demo(task: dict, od: Path) -> dict:
         marks = [100, 300, 600, 900]
         curves[arm] = {f"best_at_{m}_epochs": (round(float(bsf[min(m, len(bsf)) - 1]), 4) if len(bsf) else None)
                        for m in marks}
+        curves[arm]["best_so_far_every_30_epochs"] = [round(float(x), 4) if np.isfinite(x) else None for x in bsf[29::30]]  # for the slide
         curves[arm]["epochs_spent"] = agg.count(len(g))
         curves[arm]["trials"] = agg.count(len(arms[arm].trials))
     imp = {}
@@ -302,15 +368,30 @@ def _report(trial, epoch: int, score, prune: bool) -> bool:
 
 # ---------------------------------------------------------------- the notebook
 
+def _deadline_epoch(deadline_utc: str | None) -> float | None:
+    if not deadline_utc:
+        return None
+    from datetime import datetime, timezone
+
+    return datetime.strptime(deadline_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
 def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convnext_tiny"),
         folds: tuple[int, ...] | None = None, demo: bool = False, root=None, expect: dict | None = None,
         workers: int = 4, seed: int = 0, budget_h: float = 8.0, quiet: bool = True,
+        mode: str = "nested", backstop_utc: str | None = None, unit_hours_est: float | None = None,
         n_trials: int | None = None, l1_grid: list | None = None, demo_epochs: int | None = None) -> dict:
     """name: n6a (DINOv2 and ConvNeXt-T) or n6b (ViT-S/16 and the demo); folds=(0,) for the one-unit smoke.
+    mode: "nested" (the plan) or "simplified" (the pilot projected N6a above 6 h; labelled "not nested").
+    backstop_utc: the backstop as UTC, e.g. "2026-11-24T03:00:00Z" (Tue 08:00 Almaty): a fold whose units
+    are projected to finish after it runs simplified, for both encoders together. unit_hours_est: the
+    pilot's unit projection, used until a unit has finished. Units are queued fold by fold, and a fold
+    not started by 0.75 x budget_h is skipped for every encoder (never one encoder alone).
     n_trials, l1_grid and demo_epochs exist for tests only (the plan fixes 30, the 9-config grid and 900)."""
     s: dict = {}
     cfg = {"name": name, "encoders": list(encoders), "folds": list(folds) if folds else None, "demo": demo,
-           "workers": workers, "seed": seed, "budget_h": budget_h, "test_overrides": bool(n_trials or l1_grid or demo_epochs)}
+           "workers": workers, "seed": seed, "budget_h": budget_h, "mode": mode, "backstop_utc": backstop_utc,
+           "unit_hours_est": unit_hours_est, "test_overrides": bool(n_trials or l1_grid or demo_epochs)}
     with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
         import torch
 
@@ -325,44 +406,57 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
             s["status"] = "not_testable"
         else:
             od = paths.out_dir("private", name)
-            deadline = t0 + 0.75 * budget_h * 3600
-            tasks = [{"id": f"{e}_f{k}", "encoder": e, "fold": k, "seed": seed, "eligible": elig,
-                      "deadline": deadline, "dir": str(od / "units" / f"{e}_f{k}"),
-                      "n_trials": n_trials, "l1_grid": l1_grid}
-                     for e in encoders for k in (folds if folds is not None else range(K))]
+            fold_list = list(folds) if folds is not None else list(range(K))
+            base_task = {"seed": seed, "eligible": elig, "soft_stop": t0 + 0.75 * budget_h * 3600,
+                         "backstop": _deadline_epoch(backstop_utc), "mode": mode,
+                         "unit_s_est": unit_hours_est * 3600 if unit_hours_est else None,
+                         "n_trials": n_trials, "l1_grid": l1_grid}
+            # fold by fold, so both encoders of a fold start (and are switched or skipped) together
+            tasks = [{**base_task, "id": f"{e}_f{k}", "encoder": e, "fold": k, "dir": str(od / "units" / f"{e}_f{k}")}
+                     for k in fold_list for e in encoders]
             n_gpus = torch.cuda.device_count()
             ctx = mp.get_context("spawn")
             counter = ctx.Value("i", 0)
-            results = []
-            with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=ctx, initializer=_init,
-                                     initargs=(counter, n_gpus, str(root) if root else None, expect)) as ex:
-                futs = [ex.submit(_unit_task, t) for t in tasks]
-                if demo:
-                    futs.append(ex.submit(_demo_task, {"id": "demo", "encoder": "dinov2_vits14", "seed": seed,
-                                                       "eligible": elig, "dir": str(od / "demo"),
-                                                       "demo_epochs": demo_epochs}))
-                for f in as_completed(futs):
-                    results.append(f.result())
-            units = {}
-            for r in results:
-                if r["task"] == "demo":
-                    s["demo"] = r.get("summary") or {"ok": False, "error": r.get("error")}
-                    continue
-                if r.get("ok"):
-                    u = r["summary"]
-                    agg.write(f"{name}_{r['task']}", u)
-                    units[r["task"]] = {"ok": True, "l1_winner": u["l1_winner"], "E": u["E"],
-                                        "best_inner_score": u["best_inner_score"], "seconds": u["seconds"]}
-                else:
-                    units[r["task"]] = {"ok": False, "skipped": bool(r.get("skipped")), "error": r.get("error")}
+            mgr = ctx.Manager()
+            shared = {"lock": mgr.Lock(), "modes": mgr.dict(), "durations": mgr.list()}
+            units, fails = {}, {}
+            try:
+                with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=ctx, initializer=_init,
+                                         initargs=(counter, n_gpus, str(root) if root else None, expect, shared)) as ex:
+                    futs = {ex.submit(_unit_task, t): t["id"] for t in tasks}
+                    if demo:
+                        futs[ex.submit(_demo_task, {"id": "demo", "encoder": "dinov2_vits14", "seed": seed,
+                                                    "eligible": elig, "dir": str(od / "demo"),
+                                                    "demo_epochs": demo_epochs})] = "demo"
+                    for f in as_completed(futs):
+                        try:
+                            r = f.result()
+                        except BaseException as e:  # noqa: BLE001 - a worker crash loses only its task
+                            r = {"task": futs[f], "ok": False, "error": safe_log.describe(type(e), e.__traceback__)}
+                        if r["task"] == "demo":
+                            s["demo"] = r.get("summary") or {"ok": False, "error": r.get("error")}
+                            continue
+                        if r.get("ok"):
+                            u = r["summary"]
+                            agg.write(f"{name}_{r['task']}", u)  # written as each unit completes
+                            units[r["task"]] = {"ok": True, "tuning": u["tuning"], "l1_winner": u["l1_winner"],
+                                                "E": u["E"], "best_inner_score": u["best_inner_score"],
+                                                "seconds": u["seconds"]}
+                        else:
+                            units[r["task"]] = {"ok": False, "skipped": bool(r.get("skipped")), "error": r.get("error")}
+                            fails[r["task"]] = r.get("error")
+                s["fold_modes"] = {f"fold_{k}": v for k, v in dict(shared["modes"]).items()}
+            finally:
+                mgr.shutdown()
             s["units"] = units
             s["units_ok"] = agg.count(sum(1 for v in units.values() if v["ok"]))
-            s["all_units_ok"] = all(v["ok"] for v in units.values())
-            s["leakage_assertion_passed"] = not any("LeakageError" in str(v.get("error")) for v in units.values())
+            s["all_units_ok"] = len(units) == len(tasks) and all(v["ok"] for v in units.values())
+            s["all_nested"] = all(v.get("tuning") == "nested" for v in units.values() if v["ok"])
+            s["leakage_assertion_passed"] = not any("LeakageError" in str(v) for v in fails.values())
         s["seconds"] = round(time.time() - t0, 1)
         agg.write(name, s)
-    common.summary({k: s.get(k) for k in ("all_units_ok", "units", "demo", "leakage_assertion_passed", "status")
-                    if s.get(k) is not None})
+    common.summary({k: s.get(k) for k in ("all_units_ok", "all_nested", "fold_modes", "units", "demo",
+                                          "leakage_assertion_passed", "status") if s.get(k) is not None})
     return s
 
 
