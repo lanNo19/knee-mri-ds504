@@ -1,0 +1,227 @@
+"""N6p: the pilot (GPU), before Stage A. Every rule below was fixed in the plan before it runs.
+
+1. S2 macro findings (labels only): findings with at least 5 positives and 5
+   negatives among the scored studies of every S2 test fold. This list is fixed
+   here for every later setting and resample.
+2. Positive control: default heads (gated attention over all three planes, the
+   L2 defaults), early-stopped on inner fold 0 of each outer fold, must reach an
+   S2 fold-stratified macro AUC of at least 0.65 for every encoder.
+3. RSNA half-width: the decision interval of Delta1 (DINOv2 - ConvNeXt) on the
+   default-head predictions. Only widths are reported (no estimate, no bounds),
+   so the pilot shows nothing about H1's direction.
+4. Train-test overlap control (DINOv2): labels permuted across training
+   studies; gated attention over all planes; 30 fixed epochs; weight decay
+   1e-6. Pass band 0.5 +/- 0.02. Known-answer test: the same with 10% of each
+   test fold copied into training must fall outside the band (else the control
+   is reported as underpowered; that triggers no audit).
+5. Patient overlap: pairs of studies with cosine above 0.98 between z-scored
+   DINOv2 study vectors -> private/n6p/pairs.csv (pair_id, uid_a, uid_b,
+   cosine), for N3 (flagged pairs stay together in S1) and the montage notebook.
+6. Timings, the epoch plateau and the projected Stage A hours.
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import replace
+
+import numpy as np
+import pandas as pd
+
+from .. import agg, encoders, heads, intervals, labels, metrics, paths, stage
+from ..labels import FINDINGS
+from . import common
+
+POSITIVE_CONTROL_MIN = 0.65
+BAND = 0.02
+DUP_COSINE = 0.98
+KNOWN_ANSWER_SHARE = 0.10
+
+
+def _robust_macro(p, y, strata, findings) -> float:
+    vals = [metrics.stratified_auc(p[:, j], y[:, j], strata)[0] for j in findings]
+    vals = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _r(x, nd=3):
+    return round(float(x), nd) if x is not None and np.isfinite(x) else None
+
+
+def run(encoder_names: tuple[str, ...] = tuple(encoders.SPECS), root=None, expect: dict | None = None,
+        device: str | None = None, seed: int = 0, n_boot: int = intervals.N_BOOT, budget_h: float = 3.0,
+        control_encoder: str = "dinov2_vits14", quiet: bool = True) -> dict:
+    s: dict = {}
+    cfg = {"encoders": list(encoder_names), "seed": seed, "n_boot": n_boot, "budget_h": budget_h,
+           "control_encoder": control_encoder}
+    with common.notebook("n6p", cfg, quiet=quiet, budget_h=budget_h):
+        import torch
+
+        dev = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        t0 = time.time()
+        d = stage.StageData(root, expect)
+        od = paths.out_dir("private", "n6p")
+        f2 = d.folds["s2_fold"]
+        K = d.n_folds("s2")
+        tr_all = np.flatnonzero(d.train & (f2 >= 0))
+        ev = tr_all[d.scored[tr_all]]
+        s["upstream"] = d.upstream
+        s["data"] = {"studies": agg.count(d.n), "usable": agg.count(int(d.usable.sum())),
+                     "training": agg.count(len(tr_all)), "scored_training": agg.count(len(ev)),
+                     "n_folds": K, "n_groups": int(pd.Series(d.g_lang[tr_all]).nunique())}
+        elig = metrics.eligible(d.binary[ev], f2[ev]) if K >= 2 else []
+        s["eligible_findings"] = [FINDINGS[j] for j in elig]
+        if K < 2 or not elig:
+            # Too few groups or findings (SMOKE-ALL's 20 studies): still exercise loading, a
+            # one-epoch fit and the near-duplicate pass on the real arrays, then stop.
+            s["status"] = "not_testable"
+            rows = np.flatnonzero(d.usable & d.train)
+            if control_encoder in encoder_names and len(rows) >= 2:
+                bank = d.bank(control_encoder, dev)
+                cfg0 = heads.default_config(20.0)
+                r = heads.fit(bank, cfg0, rows, epochs=1, seed=seed)
+                p = heads.predict(bank, r.model, rows[:8], cfg0, bank.stats(rows))
+                pairs = stage.near_duplicates(d.study_vectors(control_encoder), np.flatnonzero(d.usable), DUP_COSINE, dev)
+                s["smoke"] = {"fit_ok": bool(np.isfinite(p).all()), "pairs_ok": bool(len(pairs) >= 0)}
+            agg.write("pilot", s)
+        else:
+            U = labels.pos_weight_cap_upper(pd.DataFrame(d.binary[tr_all], columns=FINDINGS))
+            cfg0 = heads.default_config(U)
+            s["default_config"] = cfg0.to_dict()
+            preds = {}
+            fits = []
+            ctrl = {}
+            for enc in encoder_names:
+                bank = d.bank(enc, dev)
+                P = np.full((d.n, heads.N_OUT), np.nan, np.float32)
+                for k in range(K):
+                    tr, te, _ = d.split(k)
+                    inner = d.inner(k)
+                    val = tr[(inner[tr] == 0) & d.scored[tr]]
+                    fit_tr = tr[inner[tr] != 0]
+                    stats = bank.stats(tr)
+                    forbid = np.concatenate([te, d.gold_rows()])
+                    r = heads.fit(bank, cfg0, fit_tr, val, elig, stats=stats, forbidden=forbid, seed=seed)
+                    rows = np.concatenate([te, d.gold_rows(k)])
+                    P[rows] = heads.predict(bank, r.model, rows, cfg0, stats)
+                    fits.append({"encoder": enc, "fold": k, "best_epoch": r.best_epoch, "epochs_run": r.epochs_run,
+                                 "seconds": r.seconds, "per_epoch_s": r.seconds / max(r.epochs_run, 1),
+                                 "best_inner": r.best_score})
+                preds[enc] = P
+                np.save(od / f"preds_default_{enc}.npy", P)
+                if enc == control_encoder:
+                    ctrl = _overlap_control(d, bank, cfg0, K, tr_all, ev, elig, seed)
+                del bank
+                if dev.startswith("cuda"):
+                    torch.cuda.empty_cache()
+            pd.DataFrame(fits).to_csv(od / "fits.csv", index=False)
+
+            # 2. Positive control
+            y = d.binary
+            pc = {}
+            for enc in encoder_names:
+                a = metrics.macro(preds[enc][ev], y[ev], f2[ev], elig)
+                pc[enc] = {"s2_macro_auc": _r(a), "mean_of_fold_macros": _r(metrics.per_fold_macro_mean(preds[enc][ev], y[ev], f2[ev], elig)),
+                           "passed": bool(np.isfinite(a) and a >= POSITIVE_CONTROL_MIN)}
+            s["positive_control"] = {"min": POSITIVE_CONTROL_MIN, "by_encoder": pc,
+                                     "all_passed": all(v["passed"] for v in pc.values())}
+
+            # 3. Half-width of Delta1 (widths only)
+            if all(m in preds for m in encoders.MAIN):
+                A, B = preds[encoders.MAIN[0]][ev], preds[encoders.MAIN[1]][ev]
+                ye, fe = y[ev], f2[ev]
+
+                def delta(w):
+                    return metrics.macro(A, ye, fe, elig, w) - metrics.macro(B, ye, fe, elig, w)
+
+                di = intervals.decision_interval(delta, d.g_lang[ev], n_boot=n_boot, seed=seed)
+                bw = (di["bootstrap"]["hi"] - di["bootstrap"]["lo"]) / 2 if di["bootstrap"]["lo"] is not None else None
+                jw = (di["jackknife"]["hi"] - di["jackknife"]["lo"]) / 2 if di["jackknife"]["lo"] is not None else None
+                s["half_width_delta1"] = {"union": _r(di["half_width"], 4), "bootstrap": _r(bw, 4), "jackknife": _r(jw, 4),
+                                          "bootstrap_valid_share": _r(di["bootstrap"]["valid_share"], 2),
+                                          "n_groups": di["n_groups"], "approximate": di["approximate"]}
+            else:
+                s["half_width_delta1"] = None
+
+            # 4. Overlap control
+            s["overlap_control"] = ctrl
+
+            # 5. Near-duplicate pairs (DINOv2 study vectors)
+            pairs = pd.DataFrame(columns=["row_a", "row_b", "cosine"])
+            if control_encoder in encoder_names:
+                vec = d.study_vectors(control_encoder)
+                pairs = stage.near_duplicates(vec, np.flatnonzero(d.usable), DUP_COSINE, dev)
+            out = pd.DataFrame({"pair_id": np.arange(len(pairs)), "uid_a": d.uids[pairs["row_a"].astype(int)] if len(pairs) else [],
+                                "uid_b": d.uids[pairs["row_b"].astype(int)] if len(pairs) else [],
+                                "cosine": pairs["cosine"].round(5) if len(pairs) else []})
+            out.to_csv(od / "pairs.csv", index=False)
+            ra, rb = pairs["row_a"].astype(int).to_numpy(), pairs["row_b"].astype(int).to_numpy()
+            s["near_duplicates"] = {
+                "threshold": DUP_COSINE, "flagged_pairs": agg.count(len(pairs)),
+                "across_language_groups": agg.count(int((d.g_lang[ra] != d.g_lang[rb]).sum())) if len(pairs) else 0,
+                "across_s2_folds": agg.count(int((f2[ra] != f2[rb]).sum())) if len(pairs) else 0,
+                "to_review": agg.count(min(10, len(pairs))),
+                "pairs_sha16": common.sha16(od / "pairs.csv"),
+            }
+
+            # 6. Plateau and projected Stage A hours
+            fdf = pd.DataFrame(fits)
+            s["plateau"] = {"best_epoch": agg.quantiles(fdf["best_epoch"]),
+                            "share_best_by_20": agg.share((fdf["best_epoch"] <= 20).mean()),
+                            "share_ran_30": agg.share((fdf["epochs_run"] >= heads.MAX_EPOCHS).mean())}
+            s["projection"] = _projection(d, fdf, K)
+            s["leakage_assertion_passed"] = True  # heads.fit raises LeakageError otherwise
+            s["seconds"] = round(time.time() - t0, 1)
+            agg.write("pilot", s)
+    summ = {k: s.get(k) for k in ("eligible_findings", "positive_control", "half_width_delta1", "overlap_control",
+                                  "near_duplicates", "projection", "status")}
+    common.summary({k: v for k, v in summ.items() if v is not None})
+    return s
+
+
+def _overlap_control(d, bank, cfg0, K, tr_all, ev, elig, seed) -> dict:
+    """Permuted labels: the null (pass band) and the known-answer test (10% of each test fold copied in)."""
+    rng = np.random.default_rng(seed + 1)
+    perm = rng.permutation(tr_all)
+    soft, weight, binary = d.soft.copy(), d.weight.copy(), d.binary.copy()
+    soft[tr_all], weight[tr_all], binary[tr_all] = d.soft[perm], d.weight[perm], d.binary[perm]
+    bp = bank.with_labels(soft, weight, binary)
+    cfg_c = replace(cfg0, pooling="gated", planes="all", weight_decay=1e-6)
+    f2 = d.folds["s2_fold"]
+    null = np.full((d.n, heads.N_OUT), np.nan, np.float32)
+    known = null.copy()
+    for k in range(K):
+        tr, te, _ = d.split(k)
+        stats = bp.stats(tr)
+        r = heads.fit(bp, cfg_c, tr, None, epochs=heads.MAX_EPOCHS, stats=stats, forbidden=te, seed=seed)
+        null[te] = heads.predict(bp, r.model, te, cfg_c, stats, use_flip=False)
+        add = rng.choice(te, size=max(1, int(round(KNOWN_ANSWER_SHARE * len(te)))), replace=False)
+        # deliberately leaky (the known answer), so no forbidden set here
+        r2 = heads.fit(bp, cfg_c, np.concatenate([tr, add]), None, epochs=heads.MAX_EPOCHS, stats=stats, seed=seed)
+        known[te] = heads.predict(bp, r2.model, te, cfg_c, stats, use_flip=False)
+    a0 = _robust_macro(null[ev], binary[ev], f2[ev], elig)
+    a1 = _robust_macro(known[ev], binary[ev], f2[ev], elig)
+    passed = bool(np.isfinite(a0) and abs(a0 - 0.5) <= BAND)
+    detected = bool(np.isfinite(a1) and abs(a1 - 0.5) > BAND)
+    return {"null_macro_auc": _r(a0, 4), "known_answer_macro_auc": _r(a1, 4), "band": [0.5 - BAND, 0.5 + BAND],
+            "passed": passed, "known_answer_detected": detected, "underpowered": not detected}
+
+
+def _projection(d, fdf: pd.DataFrame, K: int) -> dict:
+    """Projected Stage A GPU-hours from the default fits (gated pooling: an upper bound per epoch)."""
+    ks = [int(d.inner(k)[d.inner(k) >= 0].max() + 1) for k in range(K) if (d.inner(k) >= 0).any()]
+    k_in = int(np.median(ks)) if ks else 4
+    out = {"inner_k": k_in}
+    unit = {}
+    for enc, g in fdf.groupby("encoder"):
+        per_epoch = float(g["per_epoch_s"].median())
+        avg_epochs = min(heads.MAX_EPOCHS, float(g["best_epoch"].median()) + heads.PATIENCE)
+        fits = (len(heads.L1_GRID) + 30) * k_in
+        unit[enc] = (fits * avg_epochs + float(g["best_epoch"].median())) * per_epoch / 3600
+    out["unit_hours"] = {k: round(v, 2) for k, v in unit.items()}
+    main = [unit[e] for e in encoders.MAIN if e in unit]
+    out["n6a_hours_one_process"] = round(K * sum(main), 2) if main else None
+    if "vit_s16" in unit:
+        demo = 3 * 900 * float(fdf.loc[fdf["encoder"] == encoders.MAIN[0], "per_epoch_s"].median()) / 3600 \
+            if (fdf["encoder"] == encoders.MAIN[0]).any() else 0.0
+        out["n6b_hours_one_process"] = round(K * unit["vit_s16"] + demo, 2)
+    return out

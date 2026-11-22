@@ -145,6 +145,22 @@ def test_smoke_all(env, capfd):
     assert all(v == "OK" for v in res.values()), res
 
 
+def test_smoke_all_run_2_with_n5_n6p_n8(env, capfd):
+    pytest.importorskip("torch")
+    pytest.importorskip("timm")
+    pytest.importorskip("lightgbm")
+    from knee.nb import smoke_all
+
+    small = {"dinov2_vits14": {"depth": 1}, "convnext_tiny": {"depths": (1, 1, 1, 1)}, "vit_s16": {"depth": 1}}
+    res = smoke_all.run(limit=12, workers=2, stages=("n0", "n3", "n4", "n5", "n6p", "n8"),
+                        n5_kwargs={"pretrained": False, "model_overrides": small, "devices": ["cpu"]})
+    printed = capfd.readouterr()
+    assert not _leaks(printed.out + printed.err, env)
+    for f in (env["work"] / "private" / "smoke_all").glob("*.json"):
+        assert not _leaks(f.read_text(), env)
+    assert all(v == "OK" for v in res.values()), res
+
+
 def _canon(h=64, w=96):
     a = np.full((h, w), 100, np.uint16)
     a[: h // 4, : w // 4] = 3000  # marker in the top-left quadrant

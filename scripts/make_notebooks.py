@@ -32,7 +32,11 @@ NOTEBOOKS = {
     "n4-sagittal": (False, True, False, [], 32400),
     "n4-coronal": (False, True, False, [], 32400),
     "n4-axial": (False, True, False, [], 32400),
-    "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial"], 3600),
+    "smoke-all-2": (True, True, True, [], 5400),
+    "n5": (True, False, False, ["n4-sagittal", "n4-coronal", "n4-axial"], 14400),
+    "n6p": (True, False, False, ["n0", "n3", "n5"], 14400),
+    "n8": (False, False, False, ["n0", "n3"], 10800),
+    "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
 }
 
 
@@ -42,6 +46,14 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> s
         return f"from knee.nb import smoke; smoke.run({arg})"
     if name == "smoke-all":
         return "from knee.nb import smoke_all; smoke_all.run(limit=20)"
+    if name == "smoke-all-2":
+        return 'from knee.nb import smoke_all; smoke_all.run(limit=20, stages=("n0", "n3", "n4", "n5", "n6p", "n8"))'
+    if name == "n5":
+        return "from knee.nb import n5; n5.run()"
+    if name == "n6p":
+        return "from knee.nb import n6p; n6p.run()"
+    if name == "n8":
+        return "from knee.nb import n8; n8.run()"
     if name == "n0":
         arg = f"dread_file={dread_file!r}, dread_provenance_ok={bool(dread_ok)}" if dread_file else ""
         return f"from knee.nb import n0; n0.run({arg})"
@@ -57,7 +69,7 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> s
 def cell1(commit: str) -> str:
     return (
         f'COMMIT = "{commit}"\n'
-        '!pip install -q "knee[n0,decode] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"\n'
+        '!pip install -q "knee[n0,decode,models] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"\n'
         "import knee.safe_log as sl; sl.install()"
     )
 

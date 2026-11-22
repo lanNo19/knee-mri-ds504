@@ -4,6 +4,7 @@ Writes to /kaggle/working:
   private/n0/studies.csv        one row per study: chosen series, laterality, fingerprint,
                                 language, groups, flags
   private/n0/labels_soft.csv, labels_weight.csv, labels_binary.csv
+  private/n0/labels_gold.csv    expert labels of the gold studies (S3 in N9; never trained on)
   private/n0/tags.csv           acquisition tags for floor A
   agg_n0.json, run.json         summaries only (agg checks enforced)
 """
@@ -291,12 +292,13 @@ def run(limit: int | None = None, workers: int = 4, dread_file: str | None = Non
         mean.reset_index().to_csv(od / "labels_soft.csv", index=False)
         w.reset_index().to_csv(od / "labels_weight.csv", index=False)
         b.reset_index().to_csv(od / "labels_binary.csv", index=False)
+        gold.reset_index().to_csv(od / "labels_gold.csv", index=False)  # expert labels, for S3 in N9
         s["training_studies"] = agg.count(int(gt["in_training"].sum()))
         s["scored_training_studies"] = agg.count(int((gt["scored"] & gt["in_training"]).sum()))
         # Hashes of the private files, so later steps can assert they read this version
         # (N3's expect_n0 takes the first characters of studies_sha16).
         s["files_sha16"] = {f"{n}_sha16": common.sha16(od / f"{n}.csv")
-                            for n in ("studies", "labels_soft", "labels_weight", "labels_binary", "tags")}
+                            for n in ("studies", "labels_soft", "labels_weight", "labels_binary", "labels_gold", "tags")}
         agg.write("n0", s)
     common.summary({
         "gold_bug_check": s["labels"]["gold"]["bug_check_passed"],

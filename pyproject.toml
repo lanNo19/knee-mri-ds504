@@ -27,6 +27,8 @@ decode = [
     "pylibjpeg-openjpeg==2.6.0",
     "dicomsdl==0.109.4",
 ]
+# Kaggle's image has torch and torchvision; timm and Optuna are pinned (plan); LightGBM is Kaggle's.
+models = ["timm==1.0.31", "optuna==5.0.0", "lightgbm"]
 test = ["pytest", "lingua-language-detector==2.2.0", "papermill", "ipykernel", "nbformat"]
 
 [tool.setuptools.packages.find]

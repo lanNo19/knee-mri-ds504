@@ -168,7 +168,7 @@ def test_notebook_cells_match_runbook():
     spec.loader.exec_module(mk)
     runbook = (root / "notebooks" / "RUNBOOK.md").read_text()
     for name in mk.NOTEBOOKS:
-        if name not in ("n3", "n4-coronal", "n4-axial"):  # n3: the card adds expect_n0; n4: "likewise"
+        if name not in ("n3", "n6p", "n4-coronal", "n4-axial"):  # n3, n6p: the card adds expect; n4: "likewise"
             assert mk.cell2(name) in runbook, name
     assert mk.DREAD not in mk.metadata("u", "n0")["dataset_sources"]
     for name in ("smoke", "n0"):

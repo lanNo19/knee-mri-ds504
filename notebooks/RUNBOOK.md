@@ -16,7 +16,7 @@ browser, never in the Claude app's pane.
 
 ```python
 COMMIT = "<commit sha>"
-!pip install -q "knee[n0,decode] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"
+!pip install -q "knee[n0,decode,models] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"
 import knee.safe_log as sl; sl.install()
 ```
 
@@ -29,7 +29,11 @@ import knee.safe_log as sl; sl.install()
 | knee-n0 | None (CPU) | On | Competition; the three label-table datasets (plus dreaddevelopment/knee-raptor-corpus if Ablay recorded its file name) |
 | knee-n3 | None (CPU) | On | Output of knee-n0 (after the pilot: also the pilot output with pairs.csv) |
 | knee-n4-sagittal, knee-n4-coronal, knee-n4-axial | None (CPU) | On | Competition |
-| knee-montage | None (CPU) | On | Outputs of the three N4 notebooks (Claude starts it, never opens it) |
+| knee-smoke-all-2 | GPU T4 x2 | On | Competition; the three label-table datasets |
+| knee-n5 | GPU T4 x2 | On | Outputs of the three N4 notebooks |
+| knee-n6p | GPU T4 x2 | On | Outputs of knee-n0, knee-n3 and knee-n5 |
+| knee-n8 | None (CPU) | On | Outputs of knee-n0 and knee-n3 |
+| knee-montage | None (CPU) | On | Outputs of the three N4 notebooks; after the pilot also knee-n6p (Claude starts it, never opens it) |
 
 Keep the editor on accelerator None while editing; switch to GPU T4 x2 only for the
 version run; stop the interactive session after every edit.
@@ -46,7 +50,11 @@ lixin73/rsna-knee-llm-report-labels-sol56. Ablay records each one's version and 
 | knee-n0 | `from knee.nb import n0; n0.run()` (with dreaddevelopment: `n0.run(dread_file="<file>.csv", dread_provenance_ok=<True or False>)`) | 30-60 min | labels.gold.bug_check_passed true (macro AUC at least 0.80, expected about 0.89) and gold.is_58 true; at least 3 tables used, each kept with coverage_non_gold at least 0.98; groups.g_lang_groups at least 6; images.header_read_errors empty; every decode_test entry all_decoded; the summary block shows studies_sha16 (N3 checks it) |
 | knee-n3 | `from knee.nb import n3; n3.run(expect_n0="<first 8 characters of studies_sha16 from N0's summary block>")` (after the pilot: add `confirmed_pair_ids=[...]`, pair numbers only) | 2 min | s2.scheme group_5fold (else follow the plan's fold rules); gold_unassigned 0; s1.sizes_match_s2 true |
 | knee-n4-* | `from knee.nb import n4; n4.run("sagittal", budget_h=8)` (coronal, axial likewise) | 15-90 min each | checks: shape_ok, failures_under_1pct and blank_under_1pct true; position_order_share at least 0.99 |
-| knee-montage | `from knee.nb import montage; montage.run()` | 2 min | (Ablay looks at private/montage/*.png in his own browser) |
+| knee-smoke-all-2 | `from knee.nb import smoke_all; smoke_all.run(limit=20, stages=("n0", "n3", "n4", "n5", "n6p", "n8"))` | 20-30 min | every stage "OK" (with 20 studies n6p and n8 report not_testable after a one-epoch or one-model smoke fit) |
+| knee-n5 | `from knee.nb import n5; n5.run()` | 20-45 min | checks: study_tables_match, all_finite, missing_rows_zero, features_vary, gpu_agreement and normalisation_as_planned all true; usable_share at least 0.98; the summary block shows index_sha16 |
+| knee-n6p | `from knee.nb import n6p; n6p.run(expect={"n0_studies": "<8 chars>", "n3_folds": "<8 chars>", "n5_index": "<8 chars>"})` | 20-40 min | positive_control.all_passed true (else the alignment audit before Stage A); overlap_control.passed true (known_answer_detected false = underpowered, reported, no audit); leakage_assertion_passed true; write half_width_delta1.union into Phase 1 before Stage A; near_duplicates.to_review pairs go to the montage |
+| knee-n8 | `from knee.nb import n8; n8.run()` | 20-60 min | leakage_assertion_passed true; n_folds as in N3; s2_macro_auc recorded (H3 is decided in N9) |
+| knee-montage | `from knee.nb import montage; montage.run()` | 2 min | (Ablay looks at private/montage/*.png, including pairs.png after the pilot, in his own browser, and passes confirmed pair_ids to N3) |
 
 Counts in every summary: 1-4 show as "<5" and larger counts are rounded to the nearest 5, so a
 small count cannot be worked out by subtraction. Pass bands therefore use shares, flags and
