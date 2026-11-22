@@ -201,11 +201,14 @@ def run(limit: int | None = None, workers: int = 4, dread_file: str | None = Non
             raw = labels.read_table(p)
             try:
                 t = labels.convert(key, raw)
-            except labels.SchemaError:
-                tinfo[key] = {"attached": True, "layout": "unrecognised", **agg.safe_columns(raw.columns)}
+            except labels.SchemaError as e:
+                tinfo[key] = {"attached": True, "layout": "unrecognised", "reason": str(e),
+                              "checks": {k: agg.share(v) for k, v in (getattr(e, "checks", None) or {}).items()},
+                              **agg.safe_columns(raw.columns)}
                 continue
             cov = labels.coverage(t, non_gold)
             tinfo[key] = {"attached": True, "layout": t.layout, "cells": agg.counts(t.cells or {}),
+                          "checks": {k: agg.share(v) for k, v in (t.checks or {}).items()},
                           "coverage_non_gold": agg.share(cov), "kept": cov >= labels.COVERAGE_MIN}
             if cov >= labels.COVERAGE_MIN:
                 tables[key] = t

@@ -275,6 +275,26 @@ def test_label_conversion_and_mean():
     assert b["ACL"].tolist()[0] == 1.0 and np.isnan(b["ACL"].tolist()[1]) and b["ACL"].tolist()[2] == 0.0
 
 
+def test_pilkwang_real_layout_uses_verdict_and_confidence():
+    # the real table: <finding> (derived number), <finding>__conf, <finding>__verdict
+    uids = ["u1", "u2", "u3", "u4"]
+    df = pd.DataFrame({"StudyInstanceUID": uids})
+    for f in labels.FINDINGS:
+        df[f] = [1, 0, 0, 1]
+        df[f + "__conf"] = [0.9, 0.8, 0.05, 0.7]
+        df[f + "__verdict"] = ["YES", "NO", "UNK", "YES"]
+    t = labels.convert("pilkwang", df)
+    assert t.layout == "verdict+confidence" and t.unk is not None and t.cells["unk"] == 12
+    assert np.allclose(t.prob["ACL"].values, [0.9, 0.2, 0.0, 0.7])
+    assert t.checks["value_verdict_agree"] == 1.0 and np.isclose(t.checks["conf_mean_no"], 0.8)
+    # a confidence that is P(present) (low for NO) would be inverted by rule 2: refused, with the checks
+    for f in labels.FINDINGS:
+        df[f + "__conf"] = [0.9, 0.1, 0.05, 0.8]
+    with pytest.raises(labels.SchemaError) as e:
+        labels.convert("pilkwang", df)
+    assert e.value.checks["conf_mean_no"] < 0.5
+
+
 def test_label_conversion_refuses_bad_tables(tmp_path):
     uids = ["u1", "u2"]
     out_of_range = pd.DataFrame({"StudyInstanceUID": uids, **{f: [1.5, -1.0] for f in labels.FINDINGS}})

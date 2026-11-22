@@ -54,6 +54,7 @@ class Table:
     unk: pd.DataFrame | None  # bool, True where the table says the report is silent
     layout: str
     cells: dict | None = None  # counts of yes / no / unk / unmapped / numeric / empty cells
+    checks: dict | None = None  # aggregate shares that show how the columns behave (no cell values)
 
 
 def _match_columns(cols) -> dict[str, dict[str, str]]:
@@ -113,8 +114,14 @@ def convert(name: str, df: pd.DataFrame) -> Table:
     """Turn one raw table into P(present) per finding.
 
     Refuses (SchemaError) rather than guesses: numeric values outside [0, 1],
-    a numeric value column that also has a confidence column, or more than
-    0.5% of verdict cells that map to nothing.
+    a numeric value column with a confidence column but no verdict column, more
+    than 0.5% of verdict cells that map to nothing, or a confidence that behaves
+    like P(present) instead of the confidence in the verdict (rule 2 would invert it).
+
+    A numeric value column next to a verdict and a confidence column (pilkwang's
+    real layout: <finding>, <finding>__conf, <finding>__verdict) is a derived
+    column: rule 2 uses the verdict and the confidence, and the value column is
+    only checked (its range, and its agreement with the verdict in `checks`).
     """
     if UID not in df.columns:
         raise SchemaError(f"{name}: no {UID} column")
@@ -127,10 +134,13 @@ def convert(name: str, df: pd.DataFrame) -> Table:
     unk = pd.DataFrame(False, index=df.index, columns=FINDINGS)
     layouts = set()
     cells = {"yes": 0, "no": 0, "unk": 0, "unmapped": 0, "numeric": 0, "empty": 0}
+    sums = {k: [0.0, 0] for k in ("conf_yes", "conf_no", "value_yes", "value_no", "agree")}
     for f in FINDINGS:
         c = cols[f]
         val = df[c["value"]] if "value" in c else None
-        if val is not None and pd.api.types.is_numeric_dtype(val):
+        numeric_val = val is not None and pd.api.types.is_numeric_dtype(val)
+        derived = numeric_val and "verdict" in c and "conf" in c
+        if numeric_val and not derived:
             if "conf" in c:
                 raise SchemaError(f"{name}: numeric {f} with a confidence column")
             v = val.astype(float)
@@ -156,18 +166,43 @@ def convert(name: str, df: pd.DataFrame) -> Table:
             conf = pd.to_numeric(df[c["conf"]], errors="coerce")
             if ((conf < 0) | (conf > 1)).any():
                 raise SchemaError(f"{name}: confidence for {f} outside [0, 1]")
+            if conf.notna().sum() < 0.99 * (ver.isin([0.0, 1.0])).sum():
+                raise SchemaError(f"{name}: confidence for {f} is not numeric")
+            for k, m in (("conf_yes", ver == 1), ("conf_no", ver == 0)):
+                sums[k][0] += float(conf[m].sum())
+                sums[k][1] += int(conf[m].notna().sum())
             p = np.where(ver == 1, conf, np.where(ver == 0, 1 - conf, np.where(ver == -1, 0.0, np.nan)))
             layouts.add("verdict+confidence")
         else:
             p = np.where(ver == 1, 1.0, np.where(ver == 0, 0.0, np.where(ver == -1, 0.0, np.nan)))
             layouts.add("verdict")
+        if derived:  # checked only, never used: rule 2 takes the verdict and the confidence
+            v = val.astype(float)
+            if ((v < 0) | (v > 1)).any():
+                raise SchemaError(f"{name}: numeric {f} outside [0, 1]")
+            for k, m in (("value_yes", ver == 1), ("value_no", ver == 0)):
+                sums[k][0] += float(v[m].sum())
+                sums[k][1] += int(v[m].notna().sum())
+            known = ver.isin([0.0, 1.0]) & v.notna()
+            sums["agree"][0] += float(((v[known] >= 0.5) == (ver[known] == 1)).sum())
+            sums["agree"][1] += int(known.sum())
         prob[f] = p
         unk[f] = ver == -1
     total = max(1, sum(cells.values()) - cells["empty"])
     if cells["unmapped"] > 0.005 * total:
         raise SchemaError(f"{name}: too many unmapped verdict cells")
+    checks = {k: s / d for k, (s, d) in {"conf_mean_yes": sums["conf_yes"], "conf_mean_no": sums["conf_no"],
+                                         "value_mean_yes": sums["value_yes"], "value_mean_no": sums["value_no"],
+                                         "value_verdict_agree": sums["agree"]}.items() if d}
+    # Rule 2 reads the confidence as the confidence in the verdict, so it is high for NO verdicts too.
+    # A confidence that is low for NO and high for YES is P(present): rule 2 would invert it, so refuse.
+    if checks.get("conf_mean_no", 1.0) < 0.5 <= checks.get("conf_mean_yes", 0.0):
+        err = SchemaError(f"{name}: the confidence behaves like P(present), not the confidence in the verdict")
+        err.checks = checks  # aggregate shares, for the summary
+        raise err
     layout = "+".join(sorted(layouts))
-    return Table(name=name, prob=prob, unk=unk if unk.values.any() else None, layout=layout, cells=cells)
+    return Table(name=name, prob=prob, unk=unk if unk.values.any() else None, layout=layout, cells=cells,
+                 checks=checks or None)
 
 
 def coverage(table: Table, uids) -> float:

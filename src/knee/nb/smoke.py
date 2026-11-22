@@ -53,13 +53,19 @@ def _categories(series: pd.Series) -> dict:
 def _table_info(key: str, path) -> dict:
     raw = labels.read_table(path)
     entry = {"attached": True, **agg.safe_columns(raw.columns), "rows": agg.count(len(raw))}
+    vcols = [c for c in raw.columns if re.sub(r"[^a-z]", "", str(c).lower()).endswith("verdict")]
+    if vcols:  # the verdict vocabulary (short category words only, rounded counts)
+        entry["verdict_values"] = _categories(pd.concat([raw[c] for c in vcols], ignore_index=True))
     try:
         t = labels.convert(key, raw)
         entry["layout"] = t.layout
         entry["cells"] = agg.counts(t.cells or {})
         entry["has_unk"] = t.unk is not None
-    except labels.SchemaError:
+        entry["checks"] = {k: agg.share(v) for k, v in (t.checks or {}).items()}
+    except labels.SchemaError as e:
         entry["layout"] = "unrecognised"
+        entry["reason"] = str(e)  # table and finding names only
+        entry["checks"] = {k: agg.share(v) for k, v in (getattr(e, "checks", None) or {}).items()}
     return entry
 
 

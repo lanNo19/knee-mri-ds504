@@ -121,8 +121,10 @@ def make_competition(root: Path, n_per_lang: int = 6, n_slices: int = 12, size: 
         verdict = np.where(truth[:, j], "YES", "NO").astype(object)
         silent = rng.random(len(train)) < 0.2
         verdict[silent] = "UNK"
-        pil[f + "_verdict"] = verdict
-        pil[f + "_confidence"] = np.where(silent, 0.05, 0.9)
+        # the real table's layout: a derived number, then __conf and __verdict
+        pil[f] = np.where(silent, 0, truth[:, j]).astype(int)
+        pil[f + "__conf"] = np.where(silent, 0.05, 0.9)
+        pil[f + "__verdict"] = verdict
     pd.DataFrame(pil).to_csv(tdir / "report_labels_v2.csv", index=False)
     for name in ("llm_labels_v2.csv", "labels_llm_gpt56sol.csv"):
         noisy = np.clip(truth + rng.normal(0, 0.25, truth.shape), 0, 1)
