@@ -34,7 +34,7 @@ def competition_root() -> Path:
     raise FileNotFoundError("competition data not attached")
 
 
-def find_file(name: str, root: Path | None = None, max_depth: int = 4) -> Path | None:
+def find_file(name: str, root: Path | None = None, max_depth: int = 6) -> Path | None:
     """First file called `name` under root (default /kaggle/input), or None.
 
     The competition folder is skipped, so the search never walks the DICOM tree.

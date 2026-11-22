@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .. import agg, dicom_io, groups, labels, paths, study_table
+from .. import agg, dicom_io, groups, labels, paths, series, study_table
 from ..labels import FINDINGS, UID
 from . import common
 
@@ -51,6 +51,29 @@ def _decode_tests(chosen: pd.DataFrame, images, max_per_ts: int = 3) -> dict:
         prev = out.get(key, {"series": 0, "all_decoded": True, "decoders": []})
         out[key] = {"series": agg.count(len(sub)), "all_decoded": bool(ok and tried > 0 and prev["all_decoded"]),
                     "decoders": sorted(set(prev["decoders"]) | decs)}
+    return out
+
+
+def _series_types(ser: pd.DataFrame) -> dict:
+    """Series rows by plane and type, over every row of train_series.csv (not only chosen series)."""
+    plane = ser["Anatomical_Plane"].map(series.norm_plane).fillna("unrecognised")
+    fs = ser["Fluid_Sensitive"].map(series.truthy).astype(bool)
+    fat = ser["Fat_Suppression"].map(series.truthy).astype(bool)
+    kind = pd.Series(np.select([fs & fat, fs & ~fat, ~fs & fat], ["fluid+fatsat", "fluid", "fatsat_only"],
+                               "neither"), index=ser.index)
+    tab = pd.crosstab(plane, kind)
+    return {str(p): agg.counts(tab.loc[p]) for p in tab.index}
+
+
+def _top_fingerprints_by_language(tr: pd.DataFrame, top: int = 5) -> dict:
+    """Most common scanner fingerprints per report language (sure studies; only counts of 5 or more)."""
+    out = {}
+    sure = tr[tr["sure"].astype(bool)].dropna(subset=["fingerprint", "language"])
+    for lg, sub in sure.groupby("language"):
+        vc = sub["fingerprint"].value_counts()
+        vc = vc[vc >= 5].head(top)
+        if len(vc):
+            out[str(lg)] = agg.counts(vc)
     return out
 
 
@@ -129,6 +152,7 @@ def run(limit: int | None = None, workers: int = 4, dread_file: str | None = Non
             "studies": agg.count(len(train)),
             "series_rows": agg.count(len(ser)),
             "fluid_equals_fatsat_rows": agg.share((ser["Fluid_Sensitive"].astype(str) == ser["Fat_Suppression"].astype(str)).mean()),
+            "series_types_all_rows": _series_types(ser),
             "planes": planes,
             "transfer_syntax_chosen": agg.counts(chosen["transfer_syntax"].map(ts_name).value_counts()),
             "decode_test": _decode_tests(chosen, root / "train_series"),
@@ -223,6 +247,7 @@ def run(limit: int | None = None, workers: int = 4, dread_file: str | None = Non
         s["groups"]["g_lang_sizes"] = agg.counts(tr["g_lang"].value_counts())
         top_fp = tr["fingerprint"].fillna("missing").value_counts()
         s["groups"]["top_fingerprints"] = agg.counts(top_fp[top_fp >= 5].head(15))
+        s["groups"]["top_fingerprints_by_language"] = _top_fingerprints_by_language(tr)
         s["groups"]["fingerprint_coverage_training"] = agg.share(tr["fingerprint"].notna().mean()) if len(tr) else None
 
         # 5. Label summaries and the gold bug check (never chooses anything)
@@ -268,6 +293,10 @@ def run(limit: int | None = None, workers: int = 4, dread_file: str | None = Non
         b.reset_index().to_csv(od / "labels_binary.csv", index=False)
         s["training_studies"] = agg.count(int(gt["in_training"].sum()))
         s["scored_training_studies"] = agg.count(int((gt["scored"] & gt["in_training"]).sum()))
+        # Hashes of the private files, so later steps can assert they read this version
+        # (N3's expect_n0 takes the first characters of studies_sha16).
+        s["files_sha16"] = {f"{n}_sha16": common.sha16(od / f"{n}.csv")
+                            for n in ("studies", "labels_soft", "labels_weight", "labels_binary", "tags")}
         agg.write("n0", s)
     common.summary({
         "gold_bug_check": s["labels"]["gold"]["bug_check_passed"],
@@ -275,5 +304,6 @@ def run(limit: int | None = None, workers: int = 4, dread_file: str | None = Non
         "tables_used": s["labels"]["used"],
         "g_lang_groups": s["groups"]["g_lang_groups"],
         "training_studies": s["training_studies"],
+        "studies_sha16": s["files_sha16"]["studies_sha16"],
     })
     return s

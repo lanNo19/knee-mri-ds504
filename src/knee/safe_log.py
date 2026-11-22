@@ -13,7 +13,11 @@ The competition's data terms keep those values inside Kaggle.
    file and the full traceback to a private error log (for Ablay only), keeps
    the exception for show_last(), and raises StepFailed, whose message is only
    the safe description, so the notebook runner's error report carries no data.
-   A watchdog interrupts the step after watchdog_s seconds.
+   A watchdog interrupts the step after watchdog_s seconds: it sends a real
+   SIGINT to the main thread (which also breaks a blocking wait on a worker),
+   and if the step has not ended WATCHDOG_GRACE_S later, it terminates this
+   process's worker processes, because a pool cannot shut down while a worker
+   hangs.
 3. block() prints text between fixed markers; Claude reads only these blocks.
 """
 from __future__ import annotations
@@ -22,6 +26,7 @@ import _thread
 import contextlib
 import logging
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -33,6 +38,7 @@ _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 _HERE = os.path.abspath(__file__)
 BEGIN = "=== KNEE SUMMARY BEGIN ==="
 END = "=== KNEE SUMMARY END ==="
+WATCHDOG_GRACE_S = 5.0
 
 _last: tuple | None = None  # (type, value, traceback) of the last failed step
 
@@ -156,6 +162,33 @@ def _redirect_all(path: str):
         f.close()
 
 
+def _interrupt_main() -> None:
+    """Raise KeyboardInterrupt in the main thread, also when it is blocked in a wait.
+
+    _thread.interrupt_main() alone acts only between bytecodes, so a main thread
+    waiting on a hung worker's result never sees it; a real SIGINT breaks the wait.
+    """
+    try:
+        if callable(signal.getsignal(signal.SIGINT)):
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            return
+    except Exception:  # noqa: BLE001 - fall back to the simulated interrupt
+        pass
+    _thread.interrupt_main()
+
+
+def _stop_workers() -> None:
+    """Terminate this process's multiprocessing children (pool workers)."""
+    try:
+        import multiprocessing
+
+        for child in multiprocessing.active_children():
+            with contextlib.suppress(Exception):
+                child.terminate()
+    except Exception:  # noqa: BLE001 - best effort
+        pass
+
+
 @contextlib.contextmanager
 def step(name: str, quiet: bool = True, error_log: Path | None = None, watchdog_s: float | None = None):
     """Run one step safely (see the module docstring)."""
@@ -165,10 +198,15 @@ def step(name: str, quiet: bool = True, error_log: Path | None = None, watchdog_
     with contextlib.suppress(FileNotFoundError):
         os.remove(log_path)
     fired = threading.Event()
+    ended = threading.Event()  # set as soon as the step body has ended, either way
 
     def _fire():
+        if ended.is_set():
+            return
         fired.set()
-        _thread.interrupt_main()
+        _interrupt_main()
+        if not ended.wait(WATCHDOG_GRACE_S):
+            _stop_workers()
 
     timer = None
     if watchdog_s:
@@ -184,6 +222,8 @@ def step(name: str, quiet: bool = True, error_log: Path | None = None, watchdog_
             except BaseException as e:  # noqa: BLE001 - we re-raise a safe one
                 failure = ("watchdog: " if fired.is_set() else "") + describe(type(e), e.__traceback__)
                 _last = (type(e), e, e.__traceback__)
+            finally:
+                ended.set()
     finally:
         if timer is not None:
             timer.cancel()

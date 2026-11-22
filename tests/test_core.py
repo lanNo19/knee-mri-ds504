@@ -101,9 +101,81 @@ def test_safe_columns_rejects_headerless_tables():
 
 def test_count_and_share():
     assert agg.count(0) == 0 and agg.count(3) == "<5" and agg.count(5) == 5
+    # counts of 5 or more are rounded to the nearest 5, so a total minus the other
+    # categories cannot give a small count back exactly
+    assert [agg.count(n) for n in (6, 7, 8, 12, 13, 58, 1002, 1003)] == [5, 5, 10, 10, 15, 60, 1000, 1005]
     assert agg.share(0.99981) == 1.0
     q = agg.quantiles(range(100))
     assert "min" not in q and "max" not in q and "p1" in q
+
+
+def test_structural_keys_exempt_only_their_own_ints(tmp_path):
+    # direct structural values pass
+    agg.write("t", {"folds": 3, "languages": 2, "inner_k": [4, 4, 3], "n_groups": 4}, tmp_path)
+    # counts nested under a structural key are still checked
+    for bad in ({"languages": {"ENGLISH": 3}}, {"planes": {"sagittal": {"studies": 2}}},
+                {"folds": [{"studies": 3}]}, {"languages": {"x": FAKE_UID}}):
+        with pytest.raises(agg.UnsafeSummary):
+            agg.write("t", bad, tmp_path)
+
+
+def test_run_json_accepts_small_config_values(tmp_path):
+    # cell-2 parameters are not counts of studies (N3 after the pilot, montage n=4)
+    agg.write("run", agg.run_info("n3", {"confirmed_pairs": 2}), tmp_path)
+    agg.write("run", agg.run_info("montage", {"n": 4, "seed": 0}), tmp_path)
+    with pytest.raises(agg.UnsafeSummary):  # strings under config are still checked
+        agg.write("run", agg.run_info("x", {"file": FAKE_UID}), tmp_path)
+    with pytest.raises(agg.UnsafeSummary):  # and nothing outside config is exempt
+        agg.write("run", {**agg.run_info("x", {}), "failed": 2}, tmp_path)
+
+
+def test_find_file_reaches_notebook_output_mounts(tmp_path):
+    from knee import paths
+
+    # newer images mount notebook outputs at /kaggle/input/notebooks/<owner>/<slug>/
+    f = tmp_path / "notebooks" / "owner" / "knee-n0" / "private" / "n0" / "studies.csv"
+    f.parent.mkdir(parents=True)
+    f.write_text("x\n")
+    (tmp_path / paths.COMPETITION / "a" / "b").mkdir(parents=True)
+    (tmp_path / paths.COMPETITION / "a" / "b" / "studies.csv").write_text("never\n")
+    assert paths.find_file("studies.csv", tmp_path) == f
+
+
+def _sleep_long(_):
+    time.sleep(600)
+
+
+def test_watchdog_ends_step_with_hung_worker(capfd):
+    from concurrent.futures import ProcessPoolExecutor
+
+    t0 = time.time()
+    with pytest.raises(safe_log.StepFailed) as ei:
+        with safe_log.step("hang", quiet=True, watchdog_s=1.0):
+            with ProcessPoolExecutor(2) as ex:
+                list(ex.map(_sleep_long, range(2)))
+    assert str(ei.value).startswith("watchdog:")
+    assert time.time() - t0 < 1.0 + safe_log.WATCHDOG_GRACE_S + 10
+    assert "STEP hang: FAILED - watchdog:" in capfd.readouterr().out
+
+
+def test_notebook_cells_match_runbook():
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("make_notebooks", root / "scripts" / "make_notebooks.py")
+    mk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mk)
+    runbook = (root / "notebooks" / "RUNBOOK.md").read_text()
+    for name in mk.NOTEBOOKS:
+        if name not in ("n3", "n4-coronal", "n4-axial"):  # n3: the card adds expect_n0; n4: "likewise"
+            assert mk.cell2(name) in runbook, name
+    assert mk.DREAD not in mk.metadata("u", "n0")["dataset_sources"]
+    for name in ("smoke", "n0"):
+        assert mk.DREAD in mk.metadata("u", name, "labels.csv")["dataset_sources"]
+        assert "dread_file='labels.csv'" in mk.cell2(name, "labels.csv", True)
+    assert "dread_provenance_ok=True" in mk.cell2("n0", "labels.csv", True)
+    assert mk.DREAD not in mk.metadata("u", "n3", "labels.csv")["dataset_sources"]
 
 
 # ---------------------------------------------------------------- series and frame

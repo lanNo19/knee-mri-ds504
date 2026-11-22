@@ -3,10 +3,13 @@
 agg_<name>.json holds counts, shares, scores and pass/fail flags only.
 Rules, enforced by write() before anything is saved:
 1. Counts of studies go through count(): 1-4 appear as "<5" (zero stays 0,
-   because it identifies nobody).
-2. No other integer from 1 to 4 may appear, except under structural keys
-   (fold numbers, number of groups, seeds and the like), so a raw small count
-   cannot slip through.
+   because it identifies nobody), and larger counts are rounded to the
+   nearest 5, so a small count cannot be worked back out from a total minus
+   the other categories.
+2. No other integer from 1 to 4 may appear, except as the direct value of a
+   structural key (fold numbers, number of groups, seeds and the like) or
+   anywhere under "config" (cell-2 parameters), so a raw small count cannot
+   slip through.
 3. No string may look like a DICOM UID (digits with four or more dots) or be
    longer than 200 characters (report text).
 Shares are rounded to 2 decimals and distributions are reported as p1-p99,
@@ -44,7 +47,11 @@ class UnsafeSummary(ValueError):
 
 def count(n) -> int | str:
     n = int(n)
-    return n if (n == 0 or n >= 5) else "<5"
+    if n == 0:
+        return 0
+    if n < 5:
+        return "<5"
+    return int(5 * round(n / 5))
 
 
 def counts(mapping) -> dict:
@@ -85,22 +92,27 @@ def safe_columns(cols, uid: str = "StudyInstanceUID") -> dict:
     return {"header_ok": True, "columns": names[:60]} if ok else {"header_ok": False, "n_columns": len(names)}
 
 
-def _check(o, path: str = "") -> None:
+def _check(o, path: str = "", ints: bool = True) -> None:
+    """Refuse small ints (unless exempt) and data-like strings anywhere in the payload.
+
+    A structural key exempts only its own int (or list of ints) value; dicts
+    under it are still checked. Strings are always checked.
+    """
     if isinstance(o, dict):
         for k, v in o.items():
             key = str(k)
             if UID_RE.search(key) or len(key) > MAX_STR:
                 raise UnsafeSummary(f"unsafe key under {path or '/'}")
-            if key in STRUCTURAL:
-                continue
-            _check(v, f"{path}/{key}")
+            exempt = key in STRUCTURAL and (
+                isinstance(v, int) or (isinstance(v, list) and all(isinstance(x, int) for x in v)))
+            _check(v, f"{path}/{key}", ints=ints and not exempt and key != "config")
     elif isinstance(o, (list, tuple)):
         for i, v in enumerate(o):
-            _check(v, f"{path}[{i}]")
+            _check(v, f"{path}[{i}]", ints=ints)
     elif isinstance(o, bool) or o is None:
         return
     elif isinstance(o, int):
-        if 1 <= o <= 4:
+        if ints and 1 <= o <= 4:
             raise UnsafeSummary(f"small count at {path}")
     elif isinstance(o, float):
         return

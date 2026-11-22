@@ -52,6 +52,14 @@ with safe_log.step("probe", quiet=True):
     with ProcessPoolExecutor(2, initializer=safe_log.worker_init) as ex:
         list(ex.map(worker, range(3)))
 ''',
+    "watchdog_hung_worker": WORKER + '''
+import time
+def hang(i):
+    time.sleep(600)
+with safe_log.step("probe", quiet=True, watchdog_s=2):
+    with ProcessPoolExecutor(2, initializer=safe_log.worker_init) as ex:
+        list(ex.map(hang, range(2)))
+''',
     "fail_in_step": f'''
 from knee import safe_log
 with safe_log.step("probe", quiet=True):

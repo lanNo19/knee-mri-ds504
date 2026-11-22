@@ -75,15 +75,26 @@ def test_n0(env, capfd):
     assert not no_rep["in_training"].any() and not no_rep["scored"].any()
     assert (env["work"] / "private" / "n0" / "tags.csv").exists()
     assert s["labels"]["pos_weight_cap_upper"] >= 20.0
+    # N3's expect_n0 has a source: the studies.csv hash is in the printed summary block
+    sha = s["files_sha16"]["studies_sha16"]
+    assert len(sha) == 16 and f'"studies_sha16": "{sha}"' in printed.out
+    assert set(s["images"]["series_types_all_rows"]) == {"sagittal", "coronal", "axial"}
+    assert isinstance(s["groups"]["top_fingerprints_by_language"], dict)
 
 
 def test_n3(env, capfd):
     from knee.nb import n3
 
-    # On Kaggle, N3 attaches N0's output under /kaggle/input/<n0 notebook>/
-    shutil.copytree(env["work"] / "private", env["inp"] / "knee-n0" / "private", dirs_exist_ok=True)
-    shutil.copy(env["work"] / "run.json", env["inp"] / "knee-n0" / "run.json")
-    s = n3.run(quiet=True)
+    # On Kaggle, N3 attaches N0's output; newer images mount it at
+    # /kaggle/input/notebooks/<owner>/<slug>/, so studies.csv sits five levels down
+    up = env["inp"] / "notebooks" / "owner" / "knee-n0"
+    shutil.copytree(env["work"] / "private", up / "private", dirs_exist_ok=True)
+    shutil.copy(env["work"] / "run.json", up / "run.json")
+    sha = json.loads((env["work"] / "agg_n0.json").read_text())["files_sha16"]["studies_sha16"]
+    with pytest.raises(Exception):  # a stale or wrong attached version fails loudly
+        n3.run(quiet=True, expect_n0="ffffffff" if not sha.startswith("ffffffff") else "00000000")
+    capfd.readouterr()
+    s = n3.run(quiet=True, expect_n0=sha[:8])
     printed = capfd.readouterr()
     assert not _leaks(printed.out + printed.err, env)
     assert not _leaks((env["work"] / "agg_n3.json").read_text(), env)
