@@ -338,8 +338,12 @@ def stage_a_check(base0, stage_a_units) -> dict:
     """Descriptive reproducibility check (plan r3), never used in the rule: base0's trial-0 inner score
     minus Stage A's logged trial 0, per unit, at 4 decimals. stage_a_units: knee-n6a's ten per-unit
     summaries (agg_n6a_<encoder>_f<k>.json, as dicts). Each must be nested with the L1 winner gated|all
-    (trial 0 is then the same configuration), with one unit per main encoder and fold."""
-    b = _complete("base0", merged(base0))
+    (trial 0 is then the same configuration), with one unit per main encoder and fold. base0 must be
+    the base0 arm's summaries, with its settings."""
+    m = merged(base0)
+    if m["arm"] != "base0" or m["settings"] != settings(arm_spec("base0")):
+        raise ValueError("stage_a_check: the first input must be the base0 arm's summaries, with base0's settings")
+    b = _complete("base0", m)
     a: dict = {e: {} for e in MAIN}
     for u in stage_a_units:
         e, k = u["encoder"], int(u["fold"])
@@ -357,6 +361,8 @@ def stage_a_check(base0, stage_a_units) -> dict:
     diff = {f"{e}_f{k}": round(b[e][k] - a[e][k], DECIMALS) for e in MAIN for k in range(N_OUTER)}
     return {"descriptive": True, "used_in_rule": False,
             "what": "base0 minus Stage A's logged trial 0 (same configuration and seeds; other session and image)",
+            "caveat": ("Stage A read knee-n3 and base0 reads knee-n3-r: their S2 and inner folds are the same by "
+                       "design, asserted but not hash-checked, so a difference can also come from there"),
             "per_unit": diff, "max_abs_difference": max(abs(v) for v in diff.values()),
             "all_equal_at_4_decimals": all(v == 0 for v in diff.values())}
 
@@ -392,13 +398,21 @@ def _fold(k) -> int:
 # ---------------------------------------------------------------- A1's S2 development numbers (CPU notebook)
 
 def _decision(decision) -> dict:
-    """The written decision: decide()'s output as a dict, its JSON text, or the path of its JSON file."""
+    """The written decision: decide()'s output as a dict, its JSON text, or the path of its JSON file.
+    Only status "decided" is accepted: an "env_mismatch" record means there is no A1 decision, so no
+    S2 number of A1 may be computed from it (R5)."""
     if decision is None:
         raise ValueError("dev needs the written A1 decision (decide()'s output, its JSON text or its file): R5")
     if isinstance(decision, (str, Path)):
         text = str(decision)
         decision = json.loads(text) if text.lstrip().startswith("{") else json.loads(Path(text).read_text())
-    ok = isinstance(decision, dict) and decision.get("status") in ("decided", "env_mismatch")
+    status = decision.get("status") if isinstance(decision, dict) else None
+    if status == "env_mismatch":
+        raise ValueError("dev: the record says env_mismatch, so there is no A1 decision on these arms; "
+                         "no S2 number of A1 is computed (R5)")
+    if status != "decided":
+        raise ValueError('dev needs an A1 decision written by n13.decide, with status "decided" (R5)')
+    ok = True
     for e in MAIN:
         ok = ok and isinstance(((decision.get("encoders") or {}).get(e) or {}).get("keep"), bool)
     for arm in ("a1", "base0"):
@@ -432,6 +446,28 @@ def _decided_units(base: Path | None, decision: dict, arm: str) -> dict:
     return out
 
 
+def _check_numbers(decision: dict, dirs: dict) -> None:
+    """The decision's numbers follow from the attached a1 and base0 units (their config.json
+    default_trial_score, as the summaries carried it) and from its own s and min_gain, by decide()'s
+    rule: per fold round(a1 - base0, 4), the gain, folds_up, the threshold and keep. Else ValueError."""
+    thr = decision.get("threshold")
+    s, mg = decision.get("s"), decision.get("min_gain", MIN_GAIN)
+    if thr is None or s is None or round(max(float(mg), 2 * float(s) / math.sqrt(N_OUTER)), DECIMALS) != thr:
+        raise ValueError("dev: the decision's threshold does not follow from its s and min_gain")
+    for e in MAIN:
+        rec = decision["encoders"][e]
+        sc = {arm: [json.loads((dirs[arm][(e, k)] / "config.json").read_text())["default_trial_score"]
+                    for k in range(N_OUTER)] for arm in ("a1", "base0")}
+        diffs = [a - b for a, b in zip(sc["a1"], sc["base0"])]
+        per_fold = {_fold(k): v for k, v in (rec.get("per_fold") or {}).items()}
+        gain = round(float(np.mean(diffs)), DECIMALS)
+        up = sum(1 for x in diffs if round(x, DECIMALS) > 0)
+        if ([per_fold.get(k) for k in range(N_OUTER)] != [round(x, DECIMALS) for x in diffs]
+                or rec.get("gain") != gain or rec.get("folds_up") != up or rec.get("threshold") != thr
+                or rec.get("keep") is not bool(gain > thr and up >= MIN_FOLDS_UP)):
+            raise ValueError(f"dev: the decision's numbers for {e} do not follow from the attached units")
+
+
 def _predictions(dirs: dict, n: int, row_of: dict) -> dict:
     """{encoder: [n, 12] S2 predictions} from one arm's unit folders."""
     out = {e: np.full((n, len(FINDINGS)), np.nan) for e in MAIN}
@@ -446,7 +482,9 @@ def _predictions(dirs: dict, n: int, row_of: dict) -> dict:
 def dev(decision, root=None, expect: dict | None = None, quiet: bool = True, budget_h: float = 1.0) -> dict:
     """A1's S2 development numbers (plan R5 and R6), a CPU notebook run only after the decision is written.
 
-    decision: decide()'s output (a dict, its JSON text or the path of its JSON file); refused without it.
+    decision: decide()'s output (a dict, its JSON text or the path of its JSON file) with status
+    "decided". Refused without it, on any other status (an env_mismatch record holds no decision), and
+    when its numbers do not follow from the attached units (_check_numbers).
     Inputs attached: knee-n0, knee-n3-r, knee-n5 and the a1 and base0 outputs (with their reruns). The
     units are those the decision was written on (their head hashes). With N9's evaluation set (usable,
     scored training studies with an S2 fold, predicted by every model here) and scoring rule (uncertain =
@@ -464,6 +502,7 @@ def dev(decision, root=None, expect: dict | None = None, quiet: bool = True, bud
         row_of = {u: i for i, u in enumerate(d.uids)}
         s["upstream"] = d.upstream
         dirs = {arm: _decided_units(base, dec, arm) for arm in ("a1", "base0")}
+        _check_numbers(dec, dirs)  # an edited record (e.g. a keep flag) is refused
         s["chain"] = {arm: unit_files.check_units(d, dirs[arm]) for arm in dirs}
         if not all(c["s2_folds_match_units"] for c in s["chain"].values()):
             s["status"] = "chain mismatch"

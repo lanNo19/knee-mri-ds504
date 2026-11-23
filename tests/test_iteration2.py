@@ -609,6 +609,12 @@ def test_n13_stage_a_check_is_descriptive():
     r = n13.stage_a_check(_summary("base0", moved), stage_a)
     assert r["per_unit"]["dinov2_vits14_f1"] == 0.0003 and r["per_unit"]["convnext_tiny_f4"] == -0.0012
     assert r["all_equal_at_4_decimals"] is False and r["max_abs_difference"] == 0.0012
+    assert "knee-n3-r" in same["caveat"]  # the inputs differ by the N3 output (review r2, C7)
+    # the first input must be the base0 arm with base0's settings (review r2, C7)
+    for not_base0 in (_summary("null", BASE), _summary("a1", BASE),
+                      _summary("base0", BASE, sett={**n13.settings(n13.arm_spec("base0")), "seed": 100})):
+        with pytest.raises(ValueError, match="base0"):
+            n13.stage_a_check(not_base0, stage_a)
     for bad in ([{**u, "l1_winner": {"pooling": "max", "planes": "all"}} if i == 3 else u for i, u in enumerate(stage_a)],
                 [{**u, "tuning": "simplified (not nested)"} if i == 0 else u for i, u in enumerate(stage_a)],
                 stage_a[:-1], stage_a + stage_a[:1],
@@ -670,6 +676,7 @@ def dev_env(tmp_path_factory):
     null = {e: {k: round(v + 0.001 * (-1) ** k, 4) for k, v in m.items()}
             for e, m in {e: {int(k): v for k, v in sc.items()} for e, sc in summ["base0"]["trial0_inner_scores"].items()}.items()}
     summ["null"] = _summary("null", null)
+    summ["null_scores"] = null
     return root, facts, summ
 
 
@@ -729,14 +736,38 @@ def test_n13_dev_recomputes_the_development_numbers(dev_env, tmp_path, monkeypat
     decision = n13.decide(summ["a1"], summ["base0"], summ["null"])
     assert decision["status"] == "decided"
     monkeypatch.setattr(paths, "WORKING", tmp_path / "work")
-    # refused without the written decision, or with one written on other units
-    for bad in (None, {}, {"status": "decided"}, json.dumps({"status": "maybe"})):
+    # only a written A1 decision (status "decided") is accepted, before anything runs (review r2, C1)
+    mismatch = n13.decide(summ["a1"], summ["base0"], _summary("null", summ["null_scores"], env=dict(ENV, torch="2.7.0")))
+    assert mismatch["status"] == "env_mismatch" and "arms" in mismatch
+    with pytest.raises(ValueError, match="env_mismatch"):  # no A1 decision on these arms: no S2 number of A1
+        n13.dev(mismatch, root=root)
+    with pytest.raises(ValueError, match="env_mismatch"):
+        n13.dev(json.dumps(mismatch), root=root)  # also as JSON text
+    for status in ("maybe", "", None, "DECIDED", "decided "):
+        with pytest.raises(ValueError, match='status "decided"'):
+            n13.dev({**json.loads(json.dumps(decision)), "status": status}, root=root)
+    no_status = {k: v for k, v in json.loads(json.dumps(decision)).items() if k != "status"}
+    for bad in (None, {}, [], no_status, json.dumps({"status": "maybe"})):
         with pytest.raises(ValueError):
             n13.dev(bad, root=root)
-    other = json.loads(json.dumps(decision))
-    other["arms"]["a1"]["heads_sha16"]["convnext_tiny"]["fold_3"] = "0" * 16
-    with pytest.raises(safe_log.StepFailed):  # the attached units are not those the decision was written on
-        n13.dev(other, root=root)
+    with pytest.raises(ValueError, match="not a decision"):  # status decided, but not decide()'s record
+        n13.dev({"status": "decided"}, root=root)
+    assert not paths.WORKING.exists()  # nothing was written for any refused record
+    # a record whose units or numbers are not the attached ones fails the step before any S2 number
+    def edited(change):
+        rec = json.loads(json.dumps(decision))
+        change(rec)
+        return rec
+
+    for change in (lambda r: r["arms"]["a1"]["heads_sha16"]["convnext_tiny"].update(fold_3="0" * 16),  # other units
+                   lambda r: r["encoders"]["dinov2_vits14"].update(keep=not r["encoders"]["dinov2_vits14"]["keep"]),
+                   lambda r: r["encoders"]["convnext_tiny"].update(gain=r["encoders"]["convnext_tiny"]["gain"] + 0.001),
+                   lambda r: r["encoders"]["convnext_tiny"]["per_fold"].update({"2": 0.0123}),
+                   lambda r: r["encoders"]["dinov2_vits14"].update(folds_up=5),
+                   lambda r: r.update(threshold=0.004),  # does not follow from its s
+                   lambda r: r.update(s=0.02)):
+        with pytest.raises(safe_log.StepFailed):
+            n13.dev(edited(change), root=root)
     assert not (paths.WORKING / "agg_n13_dev.json").exists()
     # from the dict, from its JSON text and from its file: the same numbers
     dec_file = tmp_path / "a1_decision.json"

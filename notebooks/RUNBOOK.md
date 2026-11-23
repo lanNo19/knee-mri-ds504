@@ -289,6 +289,9 @@ Rules for every N13 notebook:
 5. One arm per notebook, each with its own output. Never save one arm over another arm's notebook.
 6. The arms a1, base0 and null run on one device type, one Kaggle image and one commit. First choice:
    GPU T4 x2. Two GPU sessions run at a time: a1 and null first, then base0.
+   To keep one image, create the arm notebooks as forks of one notebook and keep "Pin to original
+   environment": a fork keeps the environment pin (issue_log.md:382). knee-n13-a1, -null and -base0
+   are forks of knee-n6b-g v2. Create every rerun as a fork of its arm's notebook.
 7. If no GPU session is free: run all three on None (CPU). Never mix: decide() gives no decision when
    the arms' environments differ in any field.
 8. Never attach an N13 output to N7 or N9 (R9). Its units look like Stage A's, and N7 and N9 take every unit they find.
@@ -303,7 +306,7 @@ Expect hashes for every card: `{"n0_studies": "371cbe04", "n3_folds": "670ddcc8"
 | knee-n13-a1 | GPU T4 x2 (None (CPU) under rule 7) | `from knee.nb import n13; n13.run("a1", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | T4: about 20 min (setup included); CPU: 1-2.5 h | STEP n13_a1: OK and STEP n13_a1_inner: OK; all_units_ok, all_nested and leakage_assertion_passed true; units holds 10 entries (dinov2_vits14 and convnext_tiny, folds 0-4), each ok with schedule_epochs 8, patience 3, seed 0 and E from 1 to 8; device_names holds one name (Tesla T4, or cpu); trial0_inner_scores and heads_sha16 have 5 folds per encoder; environment present; run.json config: test_overrides true, test_overrides_reason "iteration 2, plan r3: defaults only, see the iteration plan, section 9", schedule_epochs 8, patience 3, arm "a1", environment |
 | knee-n13-base0 | the same as knee-n13-a1 | `from knee.nb import n13; n13.run("base0", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | T4: 20-30 min; CPU: 1.5-3 h | as knee-n13-a1, but schedule_epochs 30, patience 5, seed 0 and E from 1 to 30; run.json config has no schedule_epochs or patience (the registered values) and arm "base0" |
 | knee-n13-null | the same as knee-n13-a1 | `from knee.nb import n13; n13.run("null", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | T4: 20-30 min; CPU: 1.5-3 h | as knee-n13-base0, but seed 100 and arm "null" |
-| knee-n13-a7 | GPU T4 x2 | `from knee.nb import n13; n13.run("a7", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule_epochs=<S>, patience=<P>)`, with S and P written in the plan before the run: 8 and 3 if A1 was kept for ConvNeXt-T, else 30 and 5 | T4: 30-90 min (5 units) | STEP n13_a7: OK and STEP n13_a7_inner: OK; descriptive true; keep_decision "none (plan r3): A7 is descriptive only; no keep decision and no submission"; encoders ["convnext_tiny"]; units holds 5 entries (folds 0-4), each ok with schedule_epochs S and patience P; settings.n_trials 30 and settings.space_overrides {"batch_size": [8, 128], "weight_decay": [1e-06, 1.0]}; best_inner_scores (a maximum over 30 trials) and boundary_widened_ranges present. Runs only if the A1 decision is written by Tue 09:00 and a GPU slot is free |
+| knee-n13-a7 | GPU T4 x2 | `from knee.nb import n13; n13.run("a7", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule_epochs=<S>, patience=<P>)`, with S and P written in the plan before the run: 8 and 3 if A1 was kept for ConvNeXt-T, else 30 and 5 | T4: 30-90 min (5 units) | STEP n13_a7: OK and STEP n13_a7_inner: OK; descriptive true; keep_decision "none (plan r3): A7 is descriptive only; no keep decision and no submission"; encoders ["convnext_tiny"]; units holds 5 entries (folds 0-4), each ok with schedule_epochs S and patience P; settings.n_trials 30 and settings.space_overrides {"batch_size": [8, 128], "weight_decay": [1e-06, 1.0]}; best_inner_scores (a maximum over 30 trials) and boundary_widened_ranges present. Report best_minus_trial0 beside Stage A's selection-only gain for ConvNeXt-T (best of 30 minus trial 0: 0.0048, n9_r3_numbers.md:50-51): a gain of that size is what selection alone gives. Runs only if the A1 decision is written by Tue 09:00 and a GPU slot is free |
 
 Reruns (failed units only):
 1. A unit that failed shows ok false in units. Rerun only the failed units, in a new notebook
@@ -329,16 +332,19 @@ The A1 decision (Claude, outside Kaggle, from inner scores only, before any S2 n
    Report it; there is no A1 decision on these arms.
 5. Otherwise the status is "decided", with per encoder gain, threshold, folds_up, keep and s, and also
    s_divisor, n_null, null_mean and null_mean_se. Every comparison is made at 4 decimals; a tie is not kept.
-6. Save the output as a1_decision.json. Write its numbers and the decision into the plan document with the time.
-7. Descriptive only, never in the rule: `n13.stage_a_check(base0, [knee-n6a's ten agg_n6a_<encoder>_f<k>.json dicts])`
+6. same_knee_commit must be true. If it is false, report it, and use the decision only if
+   `git diff --stat <commit> <commit> -- src/knee/heads.py src/knee/nb/n6.py src/knee/stage.py src/knee/metrics.py`
+   between the summaries' knee_commit values shows no change.
+7. Save the output as a1_decision.json. Write its numbers and the decision into the plan document with the time.
+8. Descriptive only, never in the rule: `n13.stage_a_check(base0, [knee-n6a's ten agg_n6a_<encoder>_f<k>.json dicts])`
    gives base0 minus Stage A's logged trial 0 per unit. Report it beside the decision.
-8. Only then run knee-n13-dev.
+9. Only then run knee-n13-dev, and only with a "decided" record.
 
 A1's S2 development numbers (only after the decision is written; R5, R6):
 
 | Notebook | Accelerator | Internet | Inputs | Cell 2 | Expected time | Pass |
 |---|---|---|---|---|---|---|
-| knee-n13-dev | None (CPU) | On | knee-n0, knee-n3-r, knee-n5, knee-n13-a1 and knee-n13-base0 (with their reruns, if any). Nothing else | `from knee.nb import n13; n13.dev("""<the JSON text of a1_decision.json>""", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | 5-10 min | STEP n13_dev: OK; status ok; chain.a1 and chain.base0 s2_folds_match_units true; label "development: these studies were test studies in iteration 1; likely optimistic"; descriptive and added_after_results true; s2.<encoder>.a1, .base0 and .a1_minus_base0 each hold fold_stratified_macro_auc and mean_of_fold_macros. dev refuses without the decision, and when the attached units are not the ones the decision was written on (head hashes) |
+| knee-n13-dev | None (CPU) | On | knee-n0, knee-n3-r, knee-n5, knee-n13-a1 and knee-n13-base0 (with their reruns, if any). Nothing else | `from knee.nb import n13; n13.dev("""<the JSON text of a1_decision.json>""", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | 5-10 min | STEP n13_dev: OK; status ok; chain.a1 and chain.base0 s2_folds_match_units true; label "development: these studies were test studies in iteration 1; likely optimistic"; descriptive and added_after_results true; s2.<encoder>.a1, .base0 and .a1_minus_base0 each hold fold_stratified_macro_auc and mean_of_fold_macros. dev refuses, before anything runs, without a decision record and on any status other than "decided" (an env_mismatch record holds no A1 decision). The step fails when the attached units are not the ones the record was written on (head hashes), or when the record's numbers do not follow from them (per-fold differences, gain, folds_up, threshold, keep) |
 
 These numbers never go in a slide title and are never shown as a gain over iteration 1 (R6).
 
@@ -346,7 +352,7 @@ N10 with N13's heads (only if A1 is kept for ConvNeXt-T; Ablay presses Submit):
 
 | Notebook | Accelerator | Internet | Inputs | Cell 2 | Expected time | Pass |
 |---|---|---|---|---|---|---|
-| knee-n10-n13 | GPU T4 x2 | **Off** | Competition; the bundle dataset; knee-n0; knee-n13-a1 (and knee-n13-a1-r if a unit was rerun). Never knee-n6a | offline cell 1, then `from knee.nb import n10; n10.run("convnext_tiny")` | 2-5 h on the hidden test | as knee-n10-convnext; then the heads check below. Only then ask Ablay to submit |
+| knee-n10-n13 | GPU T4 x2 | **Off** | Competition; the bundle dataset; knee-n0; knee-n13-a1 and every rerun output of the a1 arm (knee-n13-a1-r, -r2). Never knee-n6a | offline cell 1, then `from knee.nb import n10; n10.run("convnext_tiny")` | 2-5 h on the hidden test | as knee-n10-convnext; then the heads check below. Only then ask Ablay to submit |
 
 The heads check (Claude, outside Kaggle, before asking Ablay to submit):
 1. N10 runs the bundle's wheel (commit 47fdcbf), which has no N13 code. So the check runs outside
