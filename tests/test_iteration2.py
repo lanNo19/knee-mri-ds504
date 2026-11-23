@@ -180,6 +180,9 @@ def test_fit_runs_its_own_schedule_and_patience():
     assert heads.fit(bank, flat, tr, va, FIND, forbidden=te, patience=20, schedule_epochs=8).epochs_run == 8
     with pytest.raises(ValueError):
         heads.fit(bank, cfg, tr, epochs=1, forbidden=te, schedule_epochs=0)
+    with pytest.raises(ValueError):  # a refit past its schedule would train at learning rate 0
+        heads.fit(bank, cfg, tr, epochs=9, forbidden=te, schedule_epochs=8)
+    assert heads.fit(bank, cfg, tr, epochs=9, forbidden=te).epochs_run == 9  # no schedule given: as registered
 
 
 # ---------------------------------------------------------------- N6: search ranges
@@ -321,8 +324,8 @@ def test_n6_unit_passes_schedule_patience_and_ranges_to_every_fit(stage_env, tmp
     monkeypatch.setattr(heads, "fit", fit)
     monkeypatch.setattr(n6, "suggest", suggest)
     monkeypatch.setattr(n6, "_W", {"root": str(root / "input"), "expect": None, "device": "cpu", "shared": None})
-    # (batch sizes from 64 up keep this CPU test fast; the A7 range itself is checked in the test above)
-    ovr = n6.check_space_overrides({"batch_size": [64, 128], "weight_decay": [1e-6, 1.0]})
+    # (batch sizes from 32 up keep this CPU test fast and hold trial 0's 48; the A7 range is checked above)
+    ovr = n6.check_space_overrides({"batch_size": [32, 128], "weight_decay": [1e-6, 1.0]})
     od = tmp_path / "dinov2_vits14_f0"
     task = {"id": "dinov2_vits14_f0", "encoder": "dinov2_vits14", "fold": 0, "seed": 100, "eligible": FIND,
             "soft_stop": time.time() + 3600, "backstop": None, "mode": "nested", "unit_s_est": None,
@@ -339,46 +342,94 @@ def test_n6_unit_passes_schedule_patience_and_ranges_to_every_fit(stage_env, tmp
     assert drawn == [ovr, ovr]  # every trial drew from the widened ranges
     u = json.loads((od / "config.json").read_text())
     assert (u["schedule_epochs"], u["patience"], u["seed"], u["device"], u["device_name"]) == (8, 3, 100, "cpu", "cpu")
-    assert u["space_overrides"] == {"batch_size": [64, 128], "weight_decay": [1e-06, 1.0]}
+    assert u["space_overrides"] == {"batch_size": [32, 128], "weight_decay": [1e-06, 1.0]}
     t1 = pd.read_csv(od / "trials.csv").iloc[1]  # the one drawn trial lies in the widened ranges
-    assert 64 <= t1["batch_size"] <= 128 and 1e-6 <= t1["weight_decay"] <= 1.0
+    assert 32 <= t1["batch_size"] <= 128 and 1e-6 <= t1["weight_decay"] <= 1.0
     assert 1 <= u["E"] <= 8 and refit[0]["epochs"] == u["E"]
     assert all(1 <= e <= 8 for b in pd.read_csv(od / "trials.csv")["best_epochs"] for e in json.loads(b))
     agg._check(r["summary"])  # patience 3 is a setting, not a count: the per-unit agg file accepts it
     monkeypatch.setattr(paths, "WORKING", tmp_path / "work")
     for bad in ({"schedule_epochs": 0}, {"patience": 2.5}, {"overrides_reason": "two\nlines"},
-                {"space_overrides": {"batch_size": [1, 64]}}):
+                {"space_overrides": {"batch_size": [1, 64]}}, {"extra_config": {"seed": 1}}):
         with pytest.raises(ValueError):  # refused before run.json or any fit
             n6.run("n6x", root=root / "input", **bad)
     assert not (tmp_path / "work").exists()
+    from knee import safe_log
+
+    with pytest.raises(safe_log.StepFailed):  # a range without the registered default (trial 0): no unit starts
+        n6.run("n6x", root=root / "input", space_overrides={"batch_size": [64, 128]}, n_trials=1,
+               l1_grid=[("gated", "all")], quiet=True)
+    assert not (tmp_path / "work" / "private" / "n6x" / "units").exists()
 
 
 # ---------------------------------------------------------------- N13
 
-def test_n13_arms_are_the_plan_r2_settings():
+MAIN = ("dinov2_vits14", "convnext_tiny")
+ENV = {"kaggle_image_git_commit": "0f1e2d3c", "kaggle_image_build_date": "20251101-000000", "python": "3.11.13",
+       "torch": "2.6.0+cu124", "cuda": "12.4", "cudnn": 90100, "device_name": "Tesla T4"}
+
+
+def _summary(arm, scores, env=ENV, failed=(), step=None, sett=None):
+    """An N13 summary shaped as inner_summary writes it, from {encoder: {fold: score}} (hand-made)."""
+    from knee.nb import n13
+
+    units, heads_sha = {}, {}
+    spec = n13.arm_spec(arm, *((8, 3) if arm == "a7" else ()))
+    step = step or spec["name"]
+    for e, m in scores.items():
+        for k, v in m.items():
+            uid = f"{e}_f{k}"
+            if (e, k) in failed:
+                units[uid] = {"ok": False, "skipped": False, "error": "RuntimeError at n6.py:1 in _unit()"}
+                continue
+            sha = hashlib.sha256(f"{step}/{uid}".encode()).hexdigest()[:16]
+            units[uid] = {"ok": True, "trial0_inner_score": v, "head_sha16": sha}
+            heads_sha.setdefault(e, {})[f"fold_{k}"] = sha
+    return {"arm": arm, "step": step, "settings": sett or n13.settings(spec), "environment": env,
+            "knee_commit": "c0ffee", "heads_sha16": heads_sha, "units": units}
+
+
+def _scores(base: dict, diffs: dict) -> dict:
+    """4-decimal scores (as stored): base + diffs, per encoder and fold."""
+    return {e: {k: round(base[e][k] + d, 4) for k, d in enumerate(diffs[e])} for e in base}
+
+
+BASE = {"dinov2_vits14": {0: 0.70, 1: 0.72, 2: 0.74, 3: 0.71, 4: 0.73},
+        "convnext_tiny": {0: 0.75, 1: 0.76, 2: 0.74, 3: 0.77, 4: 0.75}}
+NULL_D = {"dinov2_vits14": [0.002, -0.002, 0.001, -0.001, 0.0], "convnext_tiny": [0.003, -0.003, 0.0, 0.001, -0.001]}
+
+
+def test_n13_arms_are_the_plan_r3_settings():
     from knee.nb import common, n13
 
-    a1, null, cpu0 = n13.arm_spec("a1"), n13.arm_spec("null"), n13.arm_spec("cpu0")
+    a1, base0, null = (n13.arm_spec(a) for a in ("a1", "base0", "null"))
     assert (a1["seed"], a1["n_trials"], a1["schedule_epochs"], a1["patience"]) == (0, 1, 8, 3)
+    assert (base0["seed"], base0["n_trials"], base0["schedule_epochs"], base0["patience"]) == (0, 1, None, None)
     assert (null["seed"], null["n_trials"], null["schedule_epochs"], null["patience"]) == (100, 1, None, None)
-    assert (cpu0["seed"], cpu0["n_trials"], cpu0["schedule_epochs"], cpu0["patience"]) == (0, 1, None, None)
-    assert a1["space_overrides"] is None and null["space_overrides"] is None
+    assert a1["encoders"] == base0["encoders"] == null["encoders"] == MAIN
+    assert a1["space_overrides"] is base0["space_overrides"] is null["space_overrides"] is None
+    assert n13.settings(base0) == {"l1": "gated|all", "n_trials": 1, "schedule_epochs": 30, "patience": 5, "seed": 0,
+                                   "space_overrides": None}
+    assert n13.settings(a1)["schedule_epochs"] == 8 and n13.settings(null)["seed"] == 100
     a7 = n13.arm_spec("a7", schedule_epochs=8, patience=3)
     assert (a7["seed"], a7["n_trials"], a7["schedule_epochs"], a7["patience"]) == (0, None, 8, 3)
+    assert a7["encoders"] == ("convnext_tiny",) and n13.settings(a7)["n_trials"] == 30
     assert a7["space_overrides"] == {"batch_size": [8, 128], "weight_decay": [1e-6, 1.0]}
-    assert a1["reason"] == "iteration 2, plan r2: defaults only, see iteration_plan_r2.md"
+    assert a1["reason"] == "iteration 2, plan r3: defaults only, see the iteration plan, section 9"
     names = {n13.arm_spec(a, *((8, 3) if a == "a7" else ()))["name"] for a in n13.ARMS}
-    assert names == {"n13_a1", "n13_null", "n13_cpu0", "n13_a7"}  # never n6a or n6b
+    assert names == {"n13_a1", "n13_base0", "n13_null", "n13_a7"}  # never n6a or n6b
     assert not any(common.is_rerun(Path("private") / n / "units" / "convnext_tiny_f0") for n in names)
-    assert common.is_rerun(Path("private") / "n13_a1_r" / "units" / "convnext_tiny_f0")  # a unit rerun
-    with pytest.raises(ValueError):
-        n13.arm_spec("a7")  # A7 needs the schedule chosen in iteration 2
-    with pytest.raises(ValueError):
-        n13.arm_spec("a1", schedule_epochs=30)  # fixed by the plan
-    with pytest.raises(ValueError):
-        n13.arm_spec("a2")
-    with pytest.raises(ValueError):
-        n13.run("a1", rerun=True)  # a rerun names its folds
+    assert all(common.is_rerun(Path("private") / r / "units" / "convnext_tiny_f0") for r in ("n13_a1_r", "n13_a1_r2"))
+    for bad in (lambda: n13.arm_spec("a7"),  # A7 needs the schedule written in the plan
+                lambda: n13.arm_spec("a1", schedule_epochs=30),  # fixed by the plan
+                lambda: n13.arm_spec("cpu0"),  # now base0
+                lambda: n13.arm_spec("a2"),
+                lambda: n13.run("a1", rerun=True, folds=(2,)),  # a rerun names its encoders ...
+                lambda: n13.run("a1", rerun=1, encoders=("convnext_tiny",)),  # ... and its folds
+                lambda: n13.run("a7", schedule_epochs=8, patience=3, encoders=MAIN),  # ConvNeXt-T only
+                lambda: n13.run("a1", encoders=("vit_s16",))):
+        with pytest.raises(ValueError):
+            bad()
 
 
 def test_n13_a1_arm_end_to_end(stage_env, monkeypatch, capfd):
@@ -400,9 +451,11 @@ def test_n13_a1_arm_end_to_end(stage_env, monkeypatch, capfd):
     assert rj["step"] == "n13_a1" and c["test_overrides"] is True and c["test_overrides_reason"] == n13.REASON
     assert (c["schedule_epochs"], c["patience"], c["seed"], c["encoders"]) == (8, 3, 0, ["dinov2_vits14"])
     assert "space_overrides" not in c  # recorded only when given
+    # the environment: in run.json and in the summary block, the same fields
+    assert (c["arm"], c["rerun"]) == ("a1", 0) and c["environment"] == out["environment"] == n13.environment()
+    assert set(out["environment"]) == set(n13.ENV_FIELDS) and out["environment"]["device_name"] == "cpu"
     assert out["all_units_ok"] and out["leakage_assertion_passed"] and out["all_nested"]
-    assert out["settings"] == {"l1": "gated|all", "n_trials": 1, "schedule_epochs": 8, "patience": 3, "seed": 0,
-                               "space_overrides": None}
+    assert out["settings"] == n13.settings(n13.arm_spec("a1")) and out["encoders"] == ["dinov2_vits14"]
     assert json.loads((paths.WORKING / "agg_n13_a1_inner.json").read_text()) == json.loads(json.dumps(out))
     for k in (0, 1):
         ud = paths.WORKING / "private" / "n13_a1" / "units" / f"dinov2_vits14_f{k}"
@@ -417,7 +470,7 @@ def test_n13_a1_arm_end_to_end(stage_env, monkeypatch, capfd):
         trials, l1 = pd.read_csv(ud / "trials.csv"), pd.read_csv(ud / "l1.csv")
         assert len(trials) == 1 and len(l1) == 1 and all(1 <= e <= 8 for e in json.loads(trials["best_epochs"][0]))
         assert trials["value"][0] == l1["inner_score"][0]  # L1's one config is trial 0: same fits, same seeds
-        assert u["head_sha16"] == common.sha16(ud / "head.pt")
+        assert u["head_sha16"] == common.sha16(ud / "head.pt") == out["heads_sha16"]["dinov2_vits14"][f"fold_{k}"]
     # N10 reads these units with its own, unchanged loader (n10._units, as at the bundle's commit)
     from knee.nb import n10
 
@@ -433,72 +486,308 @@ def test_n13_a1_arm_end_to_end(stage_env, monkeypatch, capfd):
     assert chk["match"] is False  # equal hashes, but a submission needs all five S2 folds
 
 
-def _unit_scores(base: float, diffs) -> dict:
-    return {k: base + d for k, d in enumerate(diffs)}
-
-
 def test_n13_keep_rule_on_hand_made_numbers():
     from knee.nb import n13
 
-    base = {"dinov2_vits14": {0: 0.70, 1: 0.72, 2: 0.74, 3: 0.71, 4: 0.73},
-            "convnext_tiny": {0: 0.75, 1: 0.76, 2: 0.74, 3: 0.77, 4: 0.75}}
-    nd = {"dinov2_vits14": [0.002, -0.002, 0.001, -0.001, 0.0], "convnext_tiny": [0.003, -0.003, 0.0, 0.001, -0.001]}
-    null = {e: {k: base[e][k] + nd[e][k] for k in range(5)} for e in base}
-    s_hand = math.sqrt(30e-6 / 9)  # the 10 differences have mean 0 and squares summing to 30e-6
-    a1 = {"dinov2_vits14": {k: base["dinov2_vits14"][k] + d for k, d in enumerate([0.010, 0.008, 0.006, 0.012, -0.001])},
-          "convnext_tiny": {k: base["convnext_tiny"][k] + d for k, d in enumerate([0.004, 0.006, 0.003, 0.005, 0.006])}}
-    r = n13.decide(a1, base, null)
-    assert r["dinov2_vits14"]["s"] == pytest.approx(s_hand, rel=1e-9) == r["convnext_tiny"]["s"]
+    null = _scores(BASE, NULL_D)
+    a1 = _scores(BASE, {"dinov2_vits14": [0.010, 0.008, 0.006, 0.012, -0.001],
+                        "convnext_tiny": [0.004, 0.006, 0.003, 0.005, 0.006]})
+    r = n13.decide(_summary("a1", a1), _summary("base0", BASE), _summary("null", null))
+    s_hand = math.sqrt(30e-6 / 9)  # the 10 differences: mean 0, squares summing to 30e-6, n - 1 divisor
+    assert r["status"] == "decided" and r["environment"] == ENV and r["same_knee_commit"] is True
+    assert r["s"] == pytest.approx(s_hand, rel=1e-6) and r["s_divisor"] == "n - 1 (sample SD)"
+    assert r["n_null"] == 10 and r["null_mean"] == pytest.approx(0.0, abs=1e-12)
+    assert r["null_mean_se"] == pytest.approx(s_hand / math.sqrt(10), rel=1e-6)
     assert 2 * s_hand / math.sqrt(5) == pytest.approx(0.001633, abs=1e-6)  # below 0.005: min_gain binds
-    for e in base:
-        assert r[e]["threshold"] == 0.005
-    assert r["dinov2_vits14"]["gain"] == pytest.approx(0.007) and r["dinov2_vits14"]["folds_up"] == 4
-    assert r["dinov2_vits14"]["keep"] is True
-    assert r["convnext_tiny"]["gain"] == pytest.approx(0.0048) and r["convnext_tiny"]["folds_up"] == 5
-    assert r["convnext_tiny"]["keep"] is False  # every fold up, but the mean gain is under 0.005
-    assert r["dinov2_vits14"]["per_fold"][4] == pytest.approx(-0.001)
+    dino, conv = r["encoders"]["dinov2_vits14"], r["encoders"]["convnext_tiny"]
+    assert r["threshold"] == dino["threshold"] == conv["threshold"] == 0.005
+    assert (dino["gain"], dino["folds_up"], dino["keep"]) == (0.007, 4, True)
+    assert (conv["gain"], conv["folds_up"], conv["keep"]) == (0.0048, 5, False)  # every fold up, gain under 0.005
+    assert dino["s"] == conv["s"] == r["s"] and dino["per_fold"] == {0: 0.01, 1: 0.008, 2: 0.006, 3: 0.012, 4: -0.001}
     # a large gain in only 3 of 5 folds is not kept
-    a1b = {**a1, "convnext_tiny": {k: base["convnext_tiny"][k] + d for k, d in enumerate([0.02, 0.02, 0.02, -0.001, -0.001])}}
-    rb = n13.decide(a1b, base, null)["convnext_tiny"]
-    assert rb["gain"] == pytest.approx(0.0116) and rb["folds_up"] == 3 and rb["keep"] is False
-    # a wide null spread raises the bar above min_gain: the same 0.007 gain is then not kept
-    wide = {e: {k: base[e][k] + d for k, d in enumerate([0.01, -0.01, 0.01, -0.01, 0.0])} for e in base}
-    rw = n13.decide(a1, base, wide)["dinov2_vits14"]
-    assert rw["s"] == pytest.approx(math.sqrt(8e-4 / 9), rel=1e-9)
-    assert rw["threshold"] == pytest.approx(2 * math.sqrt(8e-4 / 9) / math.sqrt(5), rel=1e-9)  # about 0.0084
-    assert rw["keep"] is False
-    # strictly greater: a gain equal to the threshold is not kept (dyadic numbers, so exact)
-    b0 = {e: {k: 0.5 for k in range(5)} for e in base}
-    up = {e: {k: 0.5078125 for k in range(5)} for e in base}
-    assert n13.decide(up, b0, b0, min_gain=0.0078125)["dinov2_vits14"]["keep"] is False
-    assert n13.decide(up, b0, b0, min_gain=0.0078)["dinov2_vits14"]["keep"] is True
-    # JSON fold keys ("0" or "fold_0") give the same result
-    as_json = {e: {f"fold_{k}": v for k, v in m.items()} for e, m in a1.items()}
-    assert n13.decide(as_json, json.loads(json.dumps(base)), null) == r
-    # the rule needs every unit: a missing fold, a missing score or a missing null encoder is refused
-    for bad in (({**a1, "convnext_tiny": {k: v for k, v in a1["convnext_tiny"].items() if k != 2}}, base, null),
-                ({**a1, "dinov2_vits14": {**a1["dinov2_vits14"], 1: None}}, base, null),
-                (a1, base, {"dinov2_vits14": null["dinov2_vits14"]}),
-                ({}, base, null)):
+    a1b = _scores(BASE, {"dinov2_vits14": [0.0] * 5, "convnext_tiny": [0.02, 0.02, 0.02, -0.001, -0.001]})
+    rb = n13.decide(_summary("a1", a1b), _summary("base0", BASE), _summary("null", null))["encoders"]["convnext_tiny"]
+    assert (rb["gain"], rb["folds_up"], rb["keep"]) == (0.0116, 3, False)
+    # a wide null spread raises the bar above min_gain: threshold 2 s / sqrt(5) = 0.0084 at 4 decimals
+    wide = _scores(BASE, {e: [0.01, -0.01, 0.01, -0.01, 0.0] for e in MAIN})
+    rw = n13.decide(_summary("a1", a1), _summary("base0", BASE), _summary("null", wide))
+    assert rw["s"] == pytest.approx(math.sqrt(8e-4 / 9), rel=1e-6) and rw["threshold"] == 0.0084
+    assert rw["threshold_unrounded"] == pytest.approx(2 * math.sqrt(8e-4 / 9) / math.sqrt(5), rel=1e-6)
+    assert rw["encoders"]["dinov2_vits14"]["keep"] is False  # the same 0.007 gain
+    # the result is the same from the JSON files
+    files = [json.loads(json.dumps(_summary(a, sc))) for a, sc in (("a1", a1), ("base0", BASE), ("null", null))]
+    assert json.loads(json.dumps(n13.decide(*files))) == json.loads(json.dumps(r))
+
+
+def test_n13_keep_rule_compares_at_4_decimals():
+    from knee.nb import n13
+
+    null = _scores(BASE, NULL_D)  # threshold 0.005 (min_gain binds)
+    # review r1, S2: decimal gain exactly 0.0050 (float 0.0050000000000000044) and 5 folds up: a tie, not kept
+    tie_a1, tie_b = [0.6974, 0.7422, 0.773, 0.7649, 0.7664], [0.6937, 0.7382, 0.7667, 0.7621, 0.7582]
+    assert sum(a - b for a, b in zip(tie_a1, tie_b)) / 5 > 0.005  # float noise above the bar
+    base = {**BASE, "convnext_tiny": dict(enumerate(tie_b))}
+    a1 = {"dinov2_vits14": dict(BASE["dinov2_vits14"]), "convnext_tiny": dict(enumerate(tie_a1))}
+    null_t = _scores(base, NULL_D)
+    r = n13.decide(_summary("a1", a1), _summary("base0", base), _summary("null", null_t))["encoders"]["convnext_tiny"]
+    assert (r["gain"], r["threshold"], r["folds_up"], r["keep"]) == (0.005, 0.005, 5, False)
+    # one unit of the 4th decimal above the bar is kept
+    a1_up = {**a1, "convnext_tiny": {k: round(v + (0.0005 if k == 0 else 0.0), 4) for k, v in a1["convnext_tiny"].items()}}
+    r_up = n13.decide(_summary("a1", a1_up), _summary("base0", base), _summary("null", null_t))["encoders"]["convnext_tiny"]
+    assert (r_up["gain"], r_up["keep"]) == (0.0051, True)
+    # a gain that rounds to the threshold at 4 decimals is a tie too (0.00502 -> 0.0050)
+    a1_r = _scores(BASE, {"dinov2_vits14": [0.0051, 0.0051, 0.0050, 0.0049, 0.0050], "convnext_tiny": [0.0] * 5})
+    rr = n13.decide(_summary("a1", a1_r), _summary("base0", BASE), _summary("null", null))["encoders"]["dinov2_vits14"]
+    assert rr["gain_unrounded"] == pytest.approx(0.00502) and (rr["gain"], rr["keep"]) == (0.005, False)
+    # a threshold tie from s: gain 0.0084 against threshold 0.0084 is not kept, 0.0085 is
+    wide = _scores(BASE, {e: [0.01, -0.01, 0.01, -0.01, 0.0] for e in MAIN})
+    for d, kept in ((0.0084, False), (0.0085, True)):
+        a1_w = _scores(BASE, {"dinov2_vits14": [d] * 5, "convnext_tiny": [0.0] * 5})
+        rw = n13.decide(_summary("a1", a1_w), _summary("base0", BASE), _summary("null", wide))["encoders"]["dinov2_vits14"]
+        assert (rw["threshold"], rw["gain"], rw["keep"]) == (0.0084, d, kept)
+    # "higher in a fold" is round(a1 - base0, 4) > 0: a difference below half a unit of the 4th decimal is a tie
+    a1_f = _scores(BASE, {"dinov2_vits14": [0.01, 0.01, 0.01, 0.0, 0.0], "convnext_tiny": [0.0] * 5})
+    a1_f["dinov2_vits14"][3] += 0.00004  # not a 4-decimal value: up to float rounding, still level
+    rf = n13.decide(_summary("a1", a1_f), _summary("base0", BASE), _summary("null", null))["encoders"]["dinov2_vits14"]
+    assert rf["per_fold"][3] == 0.0 and rf["folds_up"] == 3 and rf["keep"] is False
+
+
+def test_n13_keep_rule_refuses_other_units_and_environments():
+    from knee.nb import n13
+
+    null = _scores(BASE, NULL_D)
+    a1 = _scores(BASE, {"dinov2_vits14": [0.010, 0.008, 0.006, 0.012, -0.001],
+                        "convnext_tiny": [0.004, 0.006, 0.003, 0.005, 0.006]})
+    b, n = _summary("base0", BASE), _summary("null", null)
+    ok = n13.decide(_summary("a1", a1), b, n)
+    bad_inputs = [
+        (_summary("a1", {"convnext_tiny": a1["convnext_tiny"]}), b, n),  # review r1, S1: one encoder only
+        (_summary("a1", {**a1, "vit_s16": a1["convnext_tiny"]}), b, n),  # S1: a third encoder
+        (_summary("a1", {**a1, "convnext_tiny": {k: v for k, v in a1["convnext_tiny"].items() if k != 2}}), b, n),
+        (_summary("a1", {**a1, "convnext_tiny": {**a1["convnext_tiny"], 5: 0.7}}), b, n),  # a sixth fold
+        (_summary("a1", {**a1, "dinov2_vits14": {**a1["dinov2_vits14"], 1: None}}), b, n),  # no score
+        (_summary("a1", a1, failed={("convnext_tiny", 2)}), b, n),  # an unfinished unit, not rerun
+        (_summary("a1", a1), _summary("null", null), n),  # the null arm passed as base0
+        (_summary("a1", a1, sett={**n13.settings(n13.arm_spec("a1")), "schedule_epochs": 30}), b, n),
+        ({**_summary("a1", a1), "environment": None}, b, n),  # no environment record
+        (_summary("a1", a1), b, {"dinov2_vits14": null["dinov2_vits14"]}),  # not a summary
+    ]
+    for args in bad_inputs:
         with pytest.raises(ValueError):
-            n13.decide(*bad)
-    # trial0_scores reads n6's per-unit summaries (e.g. knee-n6a's agg_n6a_<encoder>_f<k>.json)
-    units = [{"encoder": e, "fold": k, "default_trial_score": v} for e, m in base.items() for k, v in m.items()]
-    assert n13.trial0_scores(units) == base
+            n13.decide(*args)
+    with pytest.raises(ValueError, match="exactly one unit"):
+        n13.decide(*bad_inputs[0])
+    # a rerun replaces a failed unit (and only a failed one)
+    orig = _summary("a1", a1, failed={("convnext_tiny", 2)})
+    rerun = _summary("a1", {"convnext_tiny": {2: a1["convnext_tiny"][2]}}, step="n13_a1_r")
+    r = n13.decide([orig, rerun], b, n)
+    assert r["encoders"] == ok["encoders"] and r["arms"]["a1"]["steps"] == ["n13_a1", "n13_a1_r"]
+    assert r["arms"]["a1"]["heads_sha16"]["convnext_tiny"]["fold_2"] == rerun["heads_sha16"]["convnext_tiny"]["fold_2"]
+    twice = _summary("a1", {"convnext_tiny": {3: a1["convnext_tiny"][3]}}, step="n13_a1_r")
+    with pytest.raises(ValueError, match="two finished units"):
+        n13.decide([_summary("a1", a1), twice], b, n)  # a second finished unit for one fold: refused
+    # environments: every field equal, or no decision
+    other = dict(ENV, torch="2.6.1+cu124")
+    for args in ((_summary("a1", a1), b, _summary("null", null, env=other)),
+                 ([orig, _summary("a1", {"convnext_tiny": {2: a1["convnext_tiny"][2]}}, step="n13_a1_r", env=other)], b, n)):
+        r = n13.decide(*args)
+        assert r["status"] == "env_mismatch" and r["env_differences"] == ["torch"]
+        assert all(v["keep"] is False and v["gain"] is None for v in r["encoders"].values())
+    r = n13.decide(_summary("a1", a1), b, _summary("null", null, env=dict(ENV, device_name="cpu")))
+    assert r["status"] == "env_mismatch" and r["env_differences"] == ["device_name"]
+
+
+def test_n13_stage_a_check_is_descriptive():
+    from knee.nb import n13
+
+    stage_a = [{"encoder": e, "fold": k, "tuning": "nested", "l1_winner": {"pooling": "gated", "planes": "all"},
+                "default_trial_score": v, "best_inner_score": v + 0.003} for e, m in BASE.items() for k, v in m.items()]
+    same = n13.stage_a_check(_summary("base0", BASE), stage_a)
+    assert same["descriptive"] is True and same["used_in_rule"] is False
+    assert same["all_equal_at_4_decimals"] is True and same["max_abs_difference"] == 0
+    moved = _scores(BASE, {"dinov2_vits14": [0.0, 0.0003, 0.0, 0.0, 0.0], "convnext_tiny": [0.0, 0.0, 0.0, 0.0, -0.0012]})
+    r = n13.stage_a_check(_summary("base0", moved), stage_a)
+    assert r["per_unit"]["dinov2_vits14_f1"] == 0.0003 and r["per_unit"]["convnext_tiny_f4"] == -0.0012
+    assert r["all_equal_at_4_decimals"] is False and r["max_abs_difference"] == 0.0012
+    for bad in ([{**u, "l1_winner": {"pooling": "max", "planes": "all"}} if i == 3 else u for i, u in enumerate(stage_a)],
+                [{**u, "tuning": "simplified (not nested)"} if i == 0 else u for i, u in enumerate(stage_a)],
+                stage_a[:-1], stage_a + stage_a[:1],
+                [{**u, "default_trial_score": None} if i == 5 else u for i, u in enumerate(stage_a)]):
+        with pytest.raises(ValueError):
+            n13.stage_a_check(_summary("base0", BASE), bad)
 
 
 def test_n13_check_heads():
     from knee.nb import n13
 
-    inner = {"units": {**{f"convnext_tiny_f{k}": {"ok": True, "head_sha16": f"c{k}"} for k in range(5)},
-                       **{f"dinov2_vits14_f{k}": {"ok": True, "head_sha16": f"d{k}"} for k in range(5)}}}
-    n10 = {"heads_sha16": {f"fold_{k}": f"c{k}" for k in range(5)}}
-    assert n13.check_heads(n10, inner) == {"encoder": "convnext_tiny", "folds": [0, 1, 2, 3, 4],
-                                           "mismatched_folds": [], "match": True}
-    other = {"heads_sha16": {**n10["heads_sha16"], "fold_3": "x"}}  # e.g. a knee-n6a head picked up beside N13
-    assert n13.check_heads(other, inner)["mismatched_folds"] == [3] and not n13.check_heads(other, inner)["match"]
-    short = {"heads_sha16": {f"fold_{k}": f"c{k}" for k in range(4)}}
-    assert n13.check_heads(short, inner)["mismatched_folds"] == [4]
-    failed = {"units": {**inner["units"], "convnext_tiny_f1": {"ok": False, "error": "x"}}}
-    assert not n13.check_heads(n10, failed)["match"]
-    assert not n13.check_heads(n10, inner, encoder="dinov2_vits14")["match"]
+    a1 = _summary("a1", _scores(BASE, {e: [0.0] * 5 for e in MAIN}))
+    conv = a1["heads_sha16"]["convnext_tiny"]
+    n10 = {"heads_sha16": dict(conv)}
+    assert n13.check_heads(n10, a1) == {"encoder": "convnext_tiny", "folds": [0, 1, 2, 3, 4],
+                                        "mismatched_folds": [], "match": True}
+    other = {"heads_sha16": {**conv, "fold_3": "x"}}  # e.g. a knee-n6a head picked up beside N13
+    assert n13.check_heads(other, a1)["mismatched_folds"] == [3] and not n13.check_heads(other, a1)["match"]
+    short = {"heads_sha16": {f"fold_{k}": conv[f"fold_{k}"] for k in range(4)}}
+    assert n13.check_heads(short, a1)["mismatched_folds"] == [4]
+    assert not n13.check_heads(n10, a1, encoder="dinov2_vits14")["match"]
+    # a rerun fills the failed fold; N10 then loads the rerun's head
+    orig = _summary("a1", _scores(BASE, {e: [0.0] * 5 for e in MAIN}), failed={("convnext_tiny", 1)})
+    rerun = _summary("a1", {"convnext_tiny": {1: 0.76}}, step="n13_a1_r")
+    n10_r = {"heads_sha16": {**conv, "fold_1": rerun["heads_sha16"]["convnext_tiny"]["fold_1"]}}
+    assert n13.check_heads(n10_r, [orig, rerun])["match"] is True
+    assert n13.check_heads(n10_r, orig)["mismatched_folds"] == [1]  # without the rerun's summary
+    with pytest.raises(ValueError):
+        n13.check_heads(n10, [a1, rerun])  # the rerun repeats a finished unit
+    with pytest.raises(ValueError):
+        n13.check_heads(n10, _summary("base0", BASE))  # N10 submits the a1 arm only
+
+
+@pytest.fixture(scope="module")
+def dev_env(tmp_path_factory):
+    """A synthetic stage with a1 and base0 outputs shaped like N13's (both main encoders, 5 folds)."""
+    from knee.nb import n13
+    from tests.synth_stage import make_stage, make_units
+
+    root = tmp_path_factory.mktemp("it2dev") / "input"
+    facts = make_stage(root)
+    summ = {}
+    for arm, strengths, seed in (("a1", {"dinov2_vits14": 1.5, "convnext_tiny": 1.1}, 5),
+                                 ("base0", {"dinov2_vits14": 1.3, "convnext_tiny": 1.0}, 6)):
+        spec = n13.arm_spec(arm)
+        make_units(root, name=spec["name"], strengths=strengths, seed=seed)
+        ud_all = root / spec["name"] / "private" / spec["name"] / "units"
+        for ud in sorted(ud_all.iterdir()):
+            cfg = json.loads((ud / "config.json").read_text())
+            st = n13.settings(spec)
+            cfg.update({"tuning": "nested", "default_trial_score": cfg["best_inner_score"],
+                        "schedule_epochs": st["schedule_epochs"], "patience": st["patience"], "seed": st["seed"],
+                        "device": "cuda:0", "device_name": "Tesla T4",
+                        "predictions_sha16": common_sha16(ud / "predictions.csv")})
+            (ud / "config.json").write_text(json.dumps(cfg))
+            (ud / "head.pt").write_bytes(hashlib.sha256(f"{arm}/{ud.name}".encode()).digest())
+        s6 = {"units": {ud.name: {"ok": True} for ud in ud_all.iterdir()}}
+        summ[arm] = json.loads(json.dumps(n13.inner_summary(arm, spec, s6, ud_all, environment=ENV)))
+    null = {e: {k: round(v + 0.001 * (-1) ** k, 4) for k, v in m.items()}
+            for e, m in {e: {int(k): v for k, v in sc.items()} for e, sc in summ["base0"]["trial0_inner_scores"].items()}.items()}
+    summ["null"] = _summary("null", null)
+    return root, facts, summ
+
+
+def common_sha16(p):
+    from knee.nb import common
+
+    return common.sha16(p)
+
+
+def _independent_s2(root: Path, arm_dirs: list[Path]):
+    """S2 metrics recomputed without knee.metrics or StageData: sklearn per fold, pairs inside folds."""
+    from sklearn.metrics import roc_auc_score
+
+    from tests.synth_stage import FINDINGS as F
+
+    folds = pd.read_csv(root / "n3" / "private" / "n3" / "folds.csv").set_index("StudyInstanceUID")
+    usable = pd.read_csv(root / "n5" / "private" / "n5" / "index.csv").set_index("StudyInstanceUID")["usable"]
+    binary = pd.read_csv(root / "n0" / "private" / "n0" / "labels_binary.csv").set_index("StudyInstanceUID")[F]
+    keep = folds["train"] & folds["scored"] & usable.reindex(folds.index).fillna(False) & (folds["s2_fold"] >= 0)
+    preds = {}
+    for d in arm_dirs:  # {(arm, encoder): frame indexed by UID}
+        for ud in sorted(d.iterdir()):
+            enc = ud.name.rsplit("_f", 1)[0]
+            p = pd.read_csv(ud / "predictions.csv").set_index("StudyInstanceUID")[F]
+            preds.setdefault((d.parent.name, enc), []).append(p)
+    preds = {k: pd.concat(v) for k, v in preds.items()}
+    ev = folds.index[keep]
+    for p in preds.values():
+        ev = ev[np.isfinite(p.reindex(ev).to_numpy()).all(axis=1)]
+    y = binary.reindex(ev).fillna(0.0).to_numpy()  # uncertain counts as negative
+    f = folds.loc[ev, "s2_fold"].to_numpy()
+    out = {}
+    for key, p in preds.items():
+        s = p.reindex(ev).to_numpy()
+        strat, per_fold = [], []
+        for j in range(len(F)):
+            num = den = 0.0
+            for k in np.unique(f):
+                m = f == k
+                pos, neg = (y[m, j] == 1).sum(), (y[m, j] == 0).sum()
+                if pos and neg:
+                    num += roc_auc_score(y[m, j], s[m, j]) * pos * neg
+                    den += pos * neg
+            strat.append(num / den)
+        for k in np.unique(f):
+            m = f == k
+            per_fold.append(np.mean([roc_auc_score(y[m, j], s[m, j]) for j in range(len(F))]))
+        out[key] = {"fold_stratified_macro_auc": float(np.mean(strat)), "mean_of_fold_macros": float(np.mean(per_fold))}
+    return out, len(ev)
+
+
+def test_n13_dev_recomputes_the_development_numbers(dev_env, tmp_path, monkeypatch):
+    from knee import safe_log
+    from knee.nb import n13
+
+    root, facts, summ = dev_env
+    decision = n13.decide(summ["a1"], summ["base0"], summ["null"])
+    assert decision["status"] == "decided"
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "work")
+    # refused without the written decision, or with one written on other units
+    for bad in (None, {}, {"status": "decided"}, json.dumps({"status": "maybe"})):
+        with pytest.raises(ValueError):
+            n13.dev(bad, root=root)
+    other = json.loads(json.dumps(decision))
+    other["arms"]["a1"]["heads_sha16"]["convnext_tiny"]["fold_3"] = "0" * 16
+    with pytest.raises(safe_log.StepFailed):  # the attached units are not those the decision was written on
+        n13.dev(other, root=root)
+    assert not (paths.WORKING / "agg_n13_dev.json").exists()
+    # from the dict, from its JSON text and from its file: the same numbers
+    dec_file = tmp_path / "a1_decision.json"
+    dec_file.write_text(json.dumps(decision))
+    out = n13.dev(decision, root=root)
+    assert n13.dev(dec_file.read_text(), root=root)["s2"] == out["s2"] == n13.dev(str(dec_file), root=root)["s2"]
+    saved = json.loads((paths.WORKING / "agg_n13_dev.json").read_text())
+    assert saved["s2"] == json.loads(json.dumps(out["s2"]))
+    assert out["label"] == "development: these studies were test studies in iteration 1; likely optimistic"
+    assert out["descriptive"] is True and out["added_after_results"] is True and out["status"] == "ok"
+    assert out["decision"]["keep"] == {e: decision["encoders"][e]["keep"] for e in MAIN}
+    assert all(c["s2_folds_match_units"] for c in out["chain"].values())
+    text = (paths.WORKING / "agg_n13_dev.json").read_text() + (paths.WORKING / "run.json").read_text()
+    assert not [u for u in facts["uids"] if u in text]
+    # the same numbers, recomputed independently (sklearn per fold; pairs inside folds)
+    want, n_ev = _independent_s2(root, [root / "n13_a1" / "private" / "n13_a1" / "units",
+                                        root / "n13_base0" / "private" / "n13_base0" / "units"])
+    assert out["evaluation_studies"] == agg.count(n_ev)
+    for e in MAIN:
+        for arm, name in (("a1", "n13_a1"), ("base0", "n13_base0")):
+            for m in ("fold_stratified_macro_auc", "mean_of_fold_macros"):
+                assert out["s2"][e][arm][m] == pytest.approx(want[(name, e)][m], abs=5.1e-5)
+        for m in ("fold_stratified_macro_auc", "mean_of_fold_macros"):
+            diff = want[("n13_a1", e)][m] - want[("n13_base0", e)][m]
+            assert out["s2"][e]["a1_minus_base0"][m] == pytest.approx(diff, abs=5.1e-5)
+
+
+def test_n13_a7_summary_is_descriptive(dev_env):
+    from knee.nb import n13
+    from tests.synth_stage import make_units
+
+    root, _, summ = dev_env
+    spec = n13.arm_spec("a7", schedule_epochs=8, patience=3)
+    make_units(root, name="n13_a7", strengths={"convnext_tiny": 1.0}, seed=9)  # 30 trials per unit
+    ud_all = root / "n13_a7" / "private" / "n13_a7" / "units"
+    for ud in ud_all.iterdir():
+        cfg = json.loads((ud / "config.json").read_text())
+        cfg.update({"tuning": "nested", "default_trial_score": round(cfg["best_inner_score"] - 0.02, 4),
+                    "schedule_epochs": 8, "patience": 3, "seed": 0, "device": "cuda:0", "device_name": "Tesla T4"})
+        (ud / "config.json").write_text(json.dumps(cfg))
+        (ud / "head.pt").write_bytes(ud.name.encode())
+    s6 = {"units": {ud.name: {"ok": True} for ud in ud_all.iterdir()}}
+    out = n13.inner_summary("a7", spec, s6, ud_all, environment=ENV, U=20.0, encoders=("convnext_tiny",))
+    agg._check(json.loads(json.dumps(out)))  # passes the agg rules
+    assert out["descriptive"] is True and out["keep_decision"].startswith("none (plan r3)")
+    assert out["encoders"] == ["convnext_tiny"] and out["settings"]["n_trials"] == 30
+    assert out["settings"]["space_overrides"] == {"batch_size": [8, 128], "weight_decay": [1e-06, 1.0]}
+    assert sorted(out["best_inner_scores"]["convnext_tiny"]) == [0, 1, 2, 3, 4]
+    assert all(u["best_minus_trial0"] == 0.02 for u in out["units"].values())
+    b = out["boundary_widened_ranges"]
+    assert b["batch_size"]["range"] == [8, 128] and b["weight_decay"]["range"] == [1e-06, 1.0]
+    assert b["lr"]["range"] == [1e-05, 0.01]  # the other ranges stay registered
+    with pytest.raises(ValueError):  # A7 never enters the keep rule
+        n13.decide(json.loads(json.dumps(out)), summ["base0"], summ["null"])

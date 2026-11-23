@@ -259,7 +259,8 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
     schedule_epochs: length of the cosine schedule in epochs (None: MAX_EPOCHS = 30, as registered).
     max_epochs: the most epochs a fit without `epochs` or `steps` runs; None means schedule_epochs
     when that is given, else MAX_EPOCHS. So an inner fit never runs past its own schedule, and a
-    refit with epochs=E and the same schedule_epochs stops at E of that schedule.
+    refit with epochs=E and the same schedule_epochs stops at E of that schedule (E above
+    schedule_epochs is refused: those epochs would train at learning rate 0).
     With schedule_epochs, max_epochs and patience left at their defaults the fit is the registered
     one, bit for bit (tests/test_iteration2.py compares it with commit a260cde).
     on_epoch(epoch, score) -> True stops the fit as pruned (the HPO demo's successive halving)."""
@@ -268,6 +269,8 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
 
     if schedule_epochs is not None and int(schedule_epochs) < 1:
         raise ValueError("schedule_epochs must be at least 1")
+    if schedule_epochs is not None and epochs is not None and int(epochs) > int(schedule_epochs):
+        raise ValueError("a refit cannot run past its schedule (epochs > schedule_epochs)")
     _check_guard(train_idx, val_idx, forbidden)
     t0 = time.time()
     gen = torch.Generator().manual_seed(seed)

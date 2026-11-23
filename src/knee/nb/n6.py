@@ -474,7 +474,7 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
         mode: str = "nested", backstop_utc: str | None = None, unit_hours_est: float | None = None,
         n_trials: int | None = None, l1_grid: list | None = None, demo_epochs: int | None = None,
         schedule_epochs: int | None = None, patience: int | None = None, space_overrides: dict | None = None,
-        overrides_reason: str | None = None) -> dict:
+        overrides_reason: str | None = None, extra_config: dict | None = None) -> dict:
     """name: n6a (DINOv2 and ConvNeXt-T) or n6b (ViT-S/16 and the demo); folds=(0,) for the one-unit smoke.
     mode: "nested" (the plan) or "simplified" (the pilot projected N6a above 6 h; labelled "not nested").
     backstop_utc: the backstop as UTC, e.g. "2026-11-24T03:00:00Z" (Tue 08:00 Almaty): a fold whose units
@@ -486,7 +486,9 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
     schedule_epochs (cosine schedule length; None = 30) and patience (None = 5), and for the L2 search
     space_overrides ({setting: [low, high]}; None = the registered space). The demo keeps the registered
     schedule and space. Any of these marks run.json with test_overrides true; overrides_reason is a
-    one-line reason recorded beside it. With none of them the run is the registered one, bit for bit."""
+    one-line reason recorded beside it. extra_config: more entries for run.json's config (N13: the arm
+    and its environment), recorded only when given. With none of them the run is the registered one,
+    bit for bit."""
     if schedule_epochs is not None and (int(schedule_epochs) != schedule_epochs or schedule_epochs < 1):
         raise ValueError("schedule_epochs must be a whole number of epochs, at least 1")
     if patience is not None and (int(patience) != patience or patience < 1):
@@ -505,11 +507,19 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
                      ("test_overrides_reason", overrides_reason)):
         if val is not None:
             cfg[key] = val
+    if extra_config:
+        if set(extra_config) & set(cfg):
+            raise ValueError("extra_config repeats a key of run.json's config")
+        cfg.update(extra_config)
     with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
         import torch
 
         t0 = time.time()
         d = stage.StageData(root, expect)
+        if overrides:  # trial 0 is the registered defaults: every widened range must still contain them
+            dflt = space_defaults(d.pos_cap_upper(), True)
+            if any(not lo <= dflt[k] <= hi for k, (lo, hi) in overrides.items()):
+                raise ValueError("space_overrides: a range leaves out the registered default (trial 0)")
         K = d.n_folds("s2")
         elig = list(range(len(FINDINGS))) if K >= 2 else []  # the S2 macro is over all 12 findings
         s["upstream"] = d.upstream
