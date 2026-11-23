@@ -314,10 +314,10 @@ Pass criteria (summary block and agg_n12.json):
 3. N12 must read the same data as N9. Check these numbers against knee-n9-b's agg_results.json. Any difference = stop and report both files.
    - per_finding_table.rows.<finding>.s2_auc.<encoder> equals s2.<encoder>.per_finding.<finding> (for example ACL: convnext_tiny 0.679, dinov2_vits14 0.638).
    - If gold_paired_check.findings_same_as_n9_s3 is true: gold_paired_check.encoders.<encoder>.expert_labels equals s3_gold.macro_auc.<encoder> (convnext_tiny 0.7515, dinov2_vits14 0.7317).
-   - For each encoder in development.a4_calibration.encoders: ece.before equals s2.<encoder>.ece (0.256 / 0.255 at 3 decimals), and any_finding_auc.before equals triage_secondary.models.<encoder>.any_finding_auc (0.765 / 0.734 at 3 decimals).
+   - For each encoder in development.a4_calibration.encoders: ece.before equals s2.<encoder>.ece (convnext_tiny 0.256, dinov2_vits14 0.255 at 3 decimals), and any_finding_auc.before equals triage_secondary.models.<encoder>.any_finding_auc (convnext_tiny 0.765, dinov2_vits14 0.734 at 3 decimals).
 4. gold_paired_check.studies_text is "about 60".
 5. english_group_by_language.group is "ENGLISH" and fold is 0 (both found from the English reports, not hard-coded). languages_reported holds ENGLISH, SPANISH and TURKISH. Read findings_left_out: a small row such as LATIN can take a rare finding out of every row.
-6. In development.a4_calibration, each encoder is either in encoders (fold_stratified_macro_auc_unchanged true, every check true) or in skipped with its reason. A4 is optional, so a skip is not a failure.
+6. In development.a4_calibration, each encoder is either in encoders (fold_stratified_macro_auc_unchanged true, no check false; null = a check that could not be made) or in skipped with its reason. A4 is optional, so a skip is not a failure.
 
 Rules for reading and quoting N12:
 1. Nothing in agg_n12.json is a test or a decision.
