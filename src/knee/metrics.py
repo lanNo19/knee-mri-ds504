@@ -115,3 +115,128 @@ def eligible(y, strata, min_pos: int = 5, min_neg: int = 5) -> list[int]:
         if ok and (st >= 0).any():
             keep.append(j)
     return keep
+
+
+# ---------------------------------------------------------------- secondary metrics (descriptive)
+
+def average_precision(scores, y, w=None) -> tuple[float, float]:
+    """(AP, positive weight). AP = the sum over distinct score thresholds, from the highest down, of
+    precision times the step in recall (tied scores share one threshold): scikit-learn's definition."""
+    s = np.asarray(scores, dtype=float)
+    y = np.asarray(y, dtype=float)
+    w = np.ones_like(s) if w is None else np.asarray(w, dtype=float)
+    m = np.isfinite(s) & ~np.isnan(y) & (w > 0)
+    s, y, w = s[m], y[m], w[m]
+    wp = w * (y == 1)
+    P = wp.sum()
+    if P <= 0:
+        return float("nan"), 0.0
+    order = np.argsort(-s, kind="mergesort")
+    s, wp, w = s[order], wp[order], w[order]
+    _, start = np.unique(-s, return_index=True)
+    tp, flagged = np.add.reduceat(wp, start), np.add.reduceat(w, start)
+    precision = np.cumsum(tp) / np.cumsum(flagged)
+    return float((tp * precision).sum() / P), float(P)
+
+
+def random_ap(P: float, n: float) -> float:
+    """The expected AP of a random ranking (no ties) with P positives among n studies:
+    (P-1)/(n-1) + (n-P)/(n-1) * H_n/n, H_n the n-th harmonic number. It is above the prevalence P/n,
+    clearly so for rare findings (5 in 700: 0.016 against 0.007), so "times chance" must use this."""
+    from scipy.special import digamma
+
+    if n <= 1:
+        return 1.0 if P > 0 else float("nan")
+    H = float(digamma(n + 1.0) + np.euler_gamma)
+    return float((P - 1) / (n - 1) + (n - P) / (n - 1) * H / n)
+
+
+def _strata(strata):
+    st = np.asarray(strata)
+    return st, [k for k in np.unique(st) if not (isinstance(k, (int, np.integer)) and k < 0)]
+
+
+def stratified_ap(scores, y, strata, w=None) -> tuple[float, float]:
+    """(AP, positive weight) with scores ranked only inside a stratum (test fold).
+
+    Each stratum's AP is weighted by its positives, so the result is the mean over all positives of
+    the precision at that positive's rank inside its own fold; scores of different fold models are
+    never compared. Strata < 0 are left out; a stratum without positives adds nothing."""
+    s = np.asarray(scores, dtype=float)
+    y = np.asarray(y, dtype=float)
+    st, keys = _strata(strata)
+    w = np.ones_like(s) if w is None else np.asarray(w, dtype=float)
+    num = den = 0.0
+    for k in keys:
+        m = st == k
+        a, P = average_precision(s[m], y[m], w[m])
+        if P > 0:
+            num += a * P
+            den += P
+    return (num / den if den > 0 else float("nan")), den
+
+
+def stratified_ap_chance(y, strata) -> tuple[float, float]:
+    """(chance, prevalence_weighted) for stratified_ap, from labels and strata only.
+
+    chance: each stratum's random_ap, weighted by its positives exactly as the AP is.
+    prevalence_weighted: the same weighting of each stratum's plain prevalence (a lower, cruder level)."""
+    y = np.asarray(y, dtype=float)
+    st, keys = _strata(strata)
+    rand = prev = den = 0.0
+    for k in keys:
+        yk = y[(st == k) & ~np.isnan(y)]
+        P, n = float((yk == 1).sum()), float(len(yk))
+        if P > 0:
+            rand += P * random_ap(P, n)
+            prev += P * P / n
+            den += P
+    if den <= 0:
+        return float("nan"), float("nan")
+    return rand / den, prev / den
+
+
+def macro_ap(scores, y, strata, findings, w=None) -> float:
+    """Mean over the fixed findings of stratified_ap; NaN if one is undefined."""
+    vals = [stratified_ap(scores[:, j], y[:, j], strata, w) for j in findings]
+    if not vals or any(not v[1] > 0 for v in vals):
+        return float("nan")
+    return float(np.mean([v[0] for v in vals]))
+
+
+def macro_ap_chance(y, strata, findings) -> tuple[float, float]:
+    """(chance, prevalence_weighted): means over the fixed findings of stratified_ap_chance."""
+    vals = [stratified_ap_chance(y[:, j], strata) for j in findings]
+    if not vals or any(not np.isfinite(v[0]) for v in vals):
+        return float("nan"), float("nan")
+    return float(np.mean([v[0] for v in vals])), float(np.mean([v[1] for v in vals]))
+
+
+def threshold_at_sensitivity(scores, positive, target: float = 0.95) -> float:
+    """The highest threshold t for which at least `target` of the positives score >= t (NaN without positives)."""
+    p = np.sort(np.asarray(scores, dtype=float)[np.asarray(positive, dtype=bool)])
+    if not len(p):
+        return float("nan")
+    return float(p[int(np.floor((1 - target) * len(p) + 1e-9))])
+
+
+def confusion(flagged, positive) -> dict:
+    """Exact counts of a binary decision against binary labels (callers round them before reporting)."""
+    f, p = np.asarray(flagged, dtype=bool), np.asarray(positive, dtype=bool)
+    return {"tp": int((f & p).sum()), "fp": int((f & ~p).sum()), "fn": int((~f & p).sum()), "tn": int((~f & ~p).sum())}
+
+
+def rates(c: dict, suppress_small: bool = False) -> dict:
+    """Sensitivity, specificity, precision and F1 from confusion counts (None where undefined).
+
+    suppress_small (for summaries): a rate is None when a cell it uses holds 1 to 4 studies, because a
+    rate beside a cell shown as "<5" would give that small count back."""
+    def div(a, b, cells):
+        if suppress_small and any(1 <= c[k] <= 4 for k in cells):
+            return None
+        return a / b if b > 0 else None
+
+    return {"sensitivity": div(c["tp"], c["tp"] + c["fn"], ("tp", "fn")),
+            "specificity": div(c["tn"], c["tn"] + c["fp"], ("tn", "fp")),
+            "precision": div(c["tp"], c["tp"] + c["fp"], ("tp", "fp")),
+            "f1": div(2 * c["tp"], 2 * c["tp"] + c["fp"] + c["fn"], ("tp", "fp", "fn"))}

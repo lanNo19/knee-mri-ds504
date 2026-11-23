@@ -69,6 +69,15 @@ def suggest(trial, U: float, gated: bool) -> dict:
     return p
 
 
+def space(U: float, gated: bool) -> dict:
+    """{setting: (low, high, log scale)} exactly as suggest() draws it (read by the descriptive HPO evidence)."""
+    sp = {"lr": (1e-5, 1e-2, True), "weight_decay": (1e-6, 1e-1, True), "dropout": (0.0, 0.5, False),
+          "pos_cap": (1.0, float(U), True), "batch_size": (16, 128, True)}
+    if gated:
+        sp["attn_hidden"] = (64, 512, True)
+    return sp
+
+
 # ---------------------------------------------------------------- workers
 
 def _init(counter, n_gpus: int, root, expect, shared=None):

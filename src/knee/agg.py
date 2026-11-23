@@ -36,6 +36,7 @@ STRUCTURAL = {
     "languages", "language_merges", "seed", "limit", "n_columns", "tier", "k", "version",
     "workers", "repeat", "per_study", "planes", "n_tables", "budget_h", "n_tables_used",
     "min_support_per_language", "margin_mm", "inner_folds", "E", "epoch", "epochs",
+    "seeds", "n_bins", "n_trials",
 }
 UID_RE = re.compile(r"\d+(\.\d+){4,}")
 MAX_STR = 200

@@ -25,6 +25,11 @@ over G-lang groups and a delete-one-group jackknife t-interval:
   H3: floor A's macro AUC; supported if its lower bound is above 0.5.
   Anti-claim 1: dArch = ViT-S/16 - ConvNeXt, dPre = DINOv2 - ViT-S/16.
   S3 (gold) and S4 (hidden test): "consistent" = the same sign as Delta1.
+
+Chain guard (first step): every attached Stage A unit's test fold must equal S2 fold k of the
+attached folds.csv (knee.units says what this does and does not guarantee). The result is the
+"chain" block; a mismatch writes the file with status "chain mismatch" and fails the step.
+Secondary, descriptive blocks (knee.nb.n9x) are added after the decisions and change none of them.
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ import numpy as np
 import pandas as pd
 
 from .. import agg, intervals, metrics, paths, stage
+from .. import units as unit_files
 from ..labels import FINDINGS, UID
 from . import common
 
@@ -43,18 +49,12 @@ TARGETS = {"s2_mean_of_fold_macros": 0.78, "s2_stretch": 0.82, "gold_macro_auc":
 DINO, CONV, VIT = "dinov2_vits14", "convnext_tiny", "vit_s16"
 
 
-def _load_units(base: Path, n: int, row_of: dict) -> dict:
+def _load_units(base: Path, n: int, row_of: dict, seen: dict | None = None) -> dict:
     """{encoder: [N, 12] S2 predictions} from every attached unit (a rerun replaces the original)."""
     out: dict = {}
-    seen: dict = {}
-    for p in paths.glob_outputs("private/*/units/*_f*/predictions.csv", base):
-        enc, fold = p.parent.name.rsplit("_f", 1)
-        key = (enc, int(fold))
-        if key in seen and not common.is_rerun(p.parent):
-            continue
-        seen[key] = p
-    for (enc, _), p in sorted(seen.items()):
-        df = pd.read_csv(p)
+    seen = unit_files.unit_dirs(base) if seen is None else seen
+    for (enc, _), ud in sorted(seen.items()):
+        df = pd.read_csv(ud / "predictions.csv")
         P = out.setdefault(enc, np.full((n, len(FINDINGS)), np.nan))
         rows = df[UID].astype(str).map(row_of)
         ok = rows.notna().to_numpy()
@@ -132,9 +132,12 @@ def _ece(p, y, bins: int = 10) -> float | None:
 
 
 def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneemri_json: str | None = None,
-        n_boot: int = intervals.N_BOOT, seed: int = 0, budget_h: float = 2.0, quiet: bool = True) -> dict:
+        n_boot: int = intervals.N_BOOT, seed: int = 0, budget_h: float = 2.0, quiet: bool = True,
+        compare_with: dict | None = None) -> dict:
     """hidden: {"dinov2_vits14": score, "convnext_tiny": score} from the Kaggle late submissions (S4).
-    kneemri_json: path or https URL (the repo's raw file) of agg_kneemri.json (S5), if KneeMRI ran."""
+    kneemri_json: path or https URL (the repo's raw file) of agg_kneemri.json (S5), if KneeMRI ran.
+    compare_with: the "decisions" block of an earlier freeze file (for a rerun, e.g. once N6b has
+    finished): the summary then says whether H1, H2 and H3 are the same. It changes nothing else."""
     s: dict = {"frozen_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     cfg = {"n_boot": n_boot, "seed": seed, "hidden": bool(hidden), "kneemri": bool(kneemri_json)}
     with common.notebook("n9", cfg, quiet=quiet, budget_h=budget_h):
@@ -144,10 +147,16 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
         f2, fv, f1 = d.folds["s2_fold"], d.folds["vendor_fold"], d.folds["s1_fold"]
         Y = d.eval_y  # uncertain = negative
         Y_drop = d.binary  # sensitivity: uncertain dropped
-        units = _load_units(base, d.n, row_of)
+        dirs = unit_files.unit_dirs(base)
+        units = _load_units(base, d.n, row_of, dirs)
         unit_folds = units.pop("_folds")
         K = d.n_folds("s2")
         s["upstream"] = d.upstream
+        s["chain"] = unit_files.chain_summary(d, dirs, Path(root) if root else None)
+        if s["chain"]["s2_folds_match_units"] is False:  # None = no unit attached: "main units missing" below
+            s["status"] = "chain mismatch"
+            agg.write("results", s)
+            raise unit_files.ChainError("Stage A units do not match the attached S2 folds")
         s["units_found"] = {e: {"folds": v} for e, v in unit_folds.items()}
         tr_all = np.flatnonzero(d.train & (f2 >= 0))
         ev_all = tr_all[d.scored[tr_all]]
@@ -357,9 +366,30 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                               "H3": ("supported" if s["h3"].get("supported") else
                                      "not supported" if s["h3"].get("supported") is False else "not run"),
                               "H4": "not run (cut 22 Nov)"}
+
+            if compare_with:  # a rerun never replaces an earlier freeze file silently
+                diff = [h for h in ("H1", "H2", "H3") if compare_with.get(h) != s["decisions"][h]]
+                s["compare_with_previous"] = {"previous": {h: compare_with.get(h) for h in ("H1", "H2", "H3")},
+                                              "same_h1_h2_h3": not diff, "differs": diff}
+
+            # Secondary, descriptive blocks (new keys only; no decision or existing number changes)
+            from . import n9x
+
+            n9x.add_all(s, n9x.Ctx(d=d, ev=ev, Y=Y, units=units, elig=elig, n_boot=n_boot, seed=seed,
+                                   root=Path(root) if root else None, row_of=row_of,
+                                   floor=FA if FA is not None and np.isfinite(FA[ev]).all() else None,
+                                   gold=gold, g_find=g_find, h1=h1_lang, cat_lang=cat_lang,
+                                   n7_dir=nv.parent if nv else None, dirs=dirs))
             agg.write("results", s)
     common.summary({"decisions": s.get("decisions"), "main_complete": s.get("main_complete"),
                     "controls_ok": (s.get("controls") or {}).get("all_leakage_assertions_passed"),
                     "findings_match_pilot": s.get("findings", {}).get("matches_pilot"),
+                    "chain": s.get("chain"),
+                    "seed_sensitive": (s.get("seed_sensitivity") or {}).get("seed_sensitive"),
+                    "seed0_refit": {k: ((s.get("seed_sensitivity") or {}).get("seed0_refit_check") or {}).get(k)
+                                    for k in ("reproduces_stage_a", "delta1_gap", "refit_device")},
+                    "compare_with_previous": s.get("compare_with_previous"),
+                    "sign_agrees_with_primary": ((s.get("h1") or {}).get("secondary") or {}).get("sign_agrees_with_primary"),
+                    "secondary_errors": s.get("secondary_errors"),
                     "status": s.get("status")})
     return s

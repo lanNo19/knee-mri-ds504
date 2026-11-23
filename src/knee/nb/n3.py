@@ -6,7 +6,8 @@ Writes private/n3/folds.csv with, per study:
   s1_fold      random fold with the same sizes as S2 (seen sites)
   s2_inner_k / vendor_inner_k   inner fold within outer fold k, -1 when not in that training set
   train, scored, is_gold
-and agg_n3.json with fold sizes and group counts.
+and agg_n3.json with fold sizes and group counts, what happened to the flagged pairs
+(pairs.*: applied, together, across folds) and s2_sha16 (the file's hash without s1_fold).
 
 After the pilot: flagged near-duplicate pairs come from the pilot's private
 pairs.csv (pair_id, uid_a, uid_b). Ablay confirms pairs by looking at their
@@ -52,6 +53,24 @@ def _merge_groups(st: pd.DataFrame, confirmed: list[tuple[str, str]]) -> int:
             for g, v in zip(st["g_lang"], st["g_vendor"])
         ]
     return made
+
+
+def pair_facts(out: pd.DataFrame, pairs: list[tuple[str, str]]) -> dict:
+    """What the flagged pairs did to the folds (counts rounded as usual).
+
+    applied: both studies are training studies with an S2 fold, so the pair shaped the S1 folds
+        (folds.seen_site_folds silently skips any other pair; those are counted as not_applied).
+    together: every applied pair shares an S1 fold (None when no pair was applied).
+    across_vendor_folds / across_s2_folds: pairs, with both studies in the table, whose folds differ
+        (such a pair sits on both sides of a train-test split under that grouping)."""
+    known = [(a, b) for a, b in pairs if a in out.index and b in out.index]
+    ok = out["train"] & (out["s2_fold"] >= 0)
+    applied = [(a, b) for a, b in known if ok[a] and ok[b]]
+    return {"pairs_applied": agg.count(len(applied)),
+            "pairs_not_applied": agg.count(len(pairs) - len(applied)),
+            "pairs_together": all(out.at[a, "s1_fold"] == out.at[b, "s1_fold"] for a, b in applied) if applied else None,
+            "pairs_across_vendor_folds": agg.count(sum(out.at[a, "vendor_fold"] != out.at[b, "vendor_fold"] for a, b in known)),
+            "pairs_across_s2_folds": agg.count(sum(out.at[a, "s2_fold"] != out.at[b, "s2_fold"] for a, b in known))}
 
 
 def run(studies_csv: str | Path | None = None, expect_n0: str | None = None,
@@ -105,10 +124,13 @@ def run(studies_csv: str | Path | None = None, expect_n0: str | None = None,
         s["s1"] = {"sizes_match_s2": bool((s1.value_counts().sort_index() == s2.value_counts().sort_index()).all())}
         s["train_studies"] = agg.count(int(out["train"].sum()))
         s["scored_train_studies"] = agg.count(int((out["train"] & out["scored"]).sum()))
+        s["pairs"].update(pair_facts(out, pairs))
         out.reset_index().to_csv(od / "folds.csv", index=False)
         s["folds_sha16"] = common.sha16(od / "folds.csv")
+        s["s2_sha16"] = folds.s2_sha16(od / "folds.csv")  # unchanged by a rerun that only regroups S1
         agg.write("n3", s)
     common.summary({"s2": {k: s["s2"][k] for k in ("scheme", "n_groups", "n_folds")},
                     "vendor": {k: s["vendor"][k] for k in ("scheme", "n_groups", "n_folds")},
-                    "upstream_n0": s["upstream_n0"], "folds_sha16": s["folds_sha16"]})
+                    "upstream_n0": s["upstream_n0"], "folds_sha16": s["folds_sha16"],
+                    "s2_sha16": s["s2_sha16"], "pairs": s["pairs"]})
     return s

@@ -45,11 +45,11 @@ import knee.safe_log as sl; sl.install()
 | knee-n6p | GPU T4 x2 | On | Outputs of knee-n0, knee-n3 and knee-n5 |
 | knee-n8 | None (CPU) | On | Outputs of knee-n0, knee-n3 and knee-n5 (N5's usable mask) |
 | knee-n6a-smoke, knee-n6a, knee-n6b | GPU T4 x2 | On | Outputs of knee-n0, knee-n3 and knee-n5 |
-| knee-n7 | GPU T4 x2 | On | Outputs of knee-n0, knee-n3, knee-n5, knee-n6a and knee-n6b (and any rerun such as knee-n6a-r) |
+| knee-n7 | GPU T4 x2 (or None (CPU) if no GPU is free: the code runs on either) | On | Outputs of knee-n0, **knee-n3-r** (not knee-n3), knee-n5, knee-n6a and knee-n6b (and a unit rerun such as knee-n6a-r). Never knee-n6a-smoke. Exactly one output per upstream step. While knee-n6b is still queued or running: leave it out (see "N7 and N9 after the pilot reviews") |
 | knee-n10-canary | None (CPU) | **Off** | Competition; the bundle dataset; output of knee-n0 |
 | knee-n10, knee-n10-convnext | GPU T4 x2 | **Off** | Competition; the bundle dataset; outputs of knee-n0 and knee-n6a |
 | knee-bundle | None (CPU) | On | None (public wheels and checkpoints only; with Ablay's OK its output becomes a private versioned dataset) |
-| knee-n9 | None (CPU) | On | Outputs of knee-n0, knee-n3, knee-n5, knee-n6p, knee-n6a, knee-n6b (and reruns), knee-n7 and knee-n8 |
+| knee-n9 | None (CPU) | On | Outputs of knee-n0, **knee-n3-r** (not knee-n3), knee-n5, knee-n6p, knee-n6a, knee-n6b (and a unit rerun such as knee-n6a-r), knee-n7 and knee-n8. Never knee-n6a-smoke. Exactly one output per upstream step. While knee-n6b is still queued or running: leave it out |
 | knee-montage | None (CPU) | On | Outputs of the three N4 notebooks; after the pilot also knee-n6p (Claude starts it, never opens it) |
 
 Keep the editor on accelerator None while editing; switch to GPU T4 x2 only for the
@@ -74,8 +74,8 @@ lixin73/rsna-knee-llm-report-labels-sol56. Ablay records each one's version and 
 | knee-n6a-smoke | `from knee.nb import n6; n6.run("n6a_smoke", encoders=("dinov2_vits14",), folds=(0,))` | 15-40 min | all_units_ok and leakage_assertion_passed true; the unit's seconds times 10 / 4 workers is N6a's expected wall time |
 | knee-n6a | `from knee.nb import n6; n6.run("n6a", encoders=("dinov2_vits14", "convnext_tiny"), backstop_utc="2026-11-24T03:00:00Z", unit_hours_est=<pilot: projection.unit_hours_one_process of the slower main encoder>)` (if the pilot's projection.n6a_over_6h_gate is true: add `mode="simplified"`) | 1.5-3 h | all_units_ok and leakage_assertion_passed true; fold_modes all "nested" (else the slides label those folds "not nested"); a failed unit: rerun it alone in knee-n6a-r with `n6.run("n6a_r", ..., folds=(k,))`, the same `mode`, and knee-n6a attached (a simplified rerun reuses its fold 0) |
 | knee-n6b | `from knee.nb import n6; n6.run("n6b", encoders=("vit_s16",), demo=True, backstop_utc="2026-11-24T03:00:00Z")` | 1-2 h | as N6a; demo.curves has the three arms |
-| knee-n7 | `from knee.nb import n7; n7.run()` | 20-60 min | missing_units empty for every encoder; the consensus configs go to the repo as configs/consensus.json (for KneeMRI S5) |
-| knee-n9 | `from knee.nb import n9; n9.run(hidden={"dinov2_vits14": <score>, "convnext_tiny": <score>})` (leave out hidden if S4 did not run) | 5-15 min | main_complete and findings_match_pilot true; agg_results.json is the freeze file; decisions.H1-H4 are read from it, never recomputed by hand |
+| knee-n7 | `from knee.nb import n7; n7.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | GPU 40-100 min; CPU 45-75 min for two encoders (15 min with `extras=False`) | chain.s2_folds_match_units true (false = the step fails: wrong N3 or unit attached); missing_units empty for every encoder; extras_ok true and extras_errors empty (a failed extra costs only its own block); leakage_assertion_passed true; the consensus configs go to the repo as configs/consensus.json (for KneeMRI S5) |
+| knee-n9 | `from knee.nb import n9; n9.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` or, with S4, `from knee.nb import n9; n9.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, hidden={"dinov2_vits14": <score>, "convnext_tiny": <score>})` (leave out hidden if S4 did not run) | 15-30 min | chain.s2_folds_match_units true (false = the step fails and no decision is written); main_complete and findings_match_pilot true; secondary_errors empty; agg_results.json is the freeze file; decisions.H1-H4 are read from it, never recomputed by hand |
 | knee-n10-canary | offline cell 1, then `from knee.nb import n10; n10.run(canary=True)` | 1-3 h on the hidden test | the commit run on the public test files passes; submitted after Ablay's OK; scored = at most 1% of hidden studies failed to decode, a scoring error = more than 1% (deliberate) |
 | knee-n10, knee-n10-convnext | offline cell 1, then `from knee.nb import n10; n10.run("dinov2_vits14")` (knee-n10-convnext: `from knee.nb import n10; n10.run("convnext_tiny")`) | 2-5 h on the hidden test | submission.layout wide; folds lists every S2 fold from N3; failed_share at most 0.01; then ask Ablay before submitting (at most 5 a day) |
 | knee-bundle | `from knee.nb import bundle; bundle.run()` | 5-10 min | wheels_ok and checkpoints_ok true; then ask Ablay before saving the output as a private versioned dataset |
@@ -88,6 +88,130 @@ structural numbers (folds, groups), never exact counts.
 With the CLI fallback, `python scripts/make_notebooks.py --user <name> --commit <sha>` writes the
 same cells; add `--dread-file <file>.csv` (and `--dread-provenance-ok` if Ablay recorded that the
 labels are LLM output on report text only) to attach and check the dreaddevelopment table.
+
+## N7 and N9 after the pilot reviews (23 Nov)
+
+Attach rules for both notebooks:
+1. Attach knee-n3-r, not knee-n3. knee-n3-r is the N3 rerun with the pilot's pairs.csv: flagged pairs share an S1 fold. Its S2, G-vendor and inner folds are identical to knee-n3; only s1_fold changed.
+2. Never attach knee-n6a-smoke. Its fold-0 unit would compete with the real one.
+3. Attach exactly one output per upstream step. Two outputs holding the same file name resolve by path order, not by intent.
+4. Pass the expect hashes shown in the card. A wrong attached version then fails the step at once.
+
+While knee-n6b is still queued or running (the control encoder ViT-S/16 is then missing):
+1. Do not attach knee-n6b to N7 or N9. A queued notebook mounts nothing or an older version.
+2. N7 cell 2: `from knee.nb import n7; n7.run(encoder_names=("dinov2_vits14", "convnext_tiny"), expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})`. N9 cell 2 is unchanged.
+3. Expected in N9 then: anti_claim_1 is null; tuned_vit_s16 and the b2_default vit rows show complete false; baselines.same_studies_and_folds_for_every_row is false with those rows in incomplete_rows. H1, H2 and H3 do not use ViT-S/16.
+4. When knee-n6b has finished: run N7 and N9 again in NEW notebooks (knee-n7-b, knee-n9-b) with knee-n6b attached and all three encoders. Never save a new version over tonight's knee-n7 or knee-n9. In knee-n9-b pass tonight's decisions: `n9.run(expect={...}, compare_with={"H1": "<tonight>", "H2": "<tonight>", "H3": "<tonight>"})`.
+5. Read compare_with_previous.same_h1_h2_h3 in the summary block. True = use the new file for the control rows only. False = stop and report both files; do not pick one.
+With the CLI fallback: `python scripts/make_notebooks.py ... --without-n6b` (and `--n7-cpu` for N7 without a GPU).
+
+If no GPU is free for N7: set the accelerator to None (CPU). Nothing in N7 needs CUDA; it picks the device itself and records it as device. On CPU expect about 15 min for S1 and G-vendor of two encoders and 45-75 min with all extras. To save time use `extras=("seeds", "defaults")` (no triage fits, no probe) or `extras=False`. A CPU refit is not equal to Stage A's T4 refit, even with seed 0: weights and batch order are the same, but dropout draws come from the device's own generator, so the CPU refit behaves like one more seed. seed_sensitivity.seed0_refit_check.reproduces_stage_a will then be false. That is not a chain problem (the chain block is the chain check). Read delta1_gap against delta1_sd (delta1_gap_within_seed_sd true = fine).
+
+Known and intended: Stage A ran before the rerun, so agg_n6a.json and agg_n6b.json record the old N3 hash (a21b342fec48d2b6), while N7 and N9 record the new one (670ddcc8c1927355). chain.n3_hash_same_as_stage_a is therefore false. That is by design: the chain guard checks the S2 folds themselves.
+
+What the chain guard proves: every unit's test studies and gold studies are exactly S2 fold k of the attached folds.csv, so (with all folds present and the N0 and N5 hashes checked) every unit's training set is the same too. What it does not prove: that the inner folds are the same (units do not store them).
+
+Everything below is secondary and descriptive. No field changes H1, H2, H3, the primary metric or a chosen setting. Decisions use seed 0.
+
+New fields in agg_n7.json (the summary block shows chain, device, leakage_assertion_passed, extras_ok, extras_errors and near_duplicate_probe):
+
+| Field | Meaning |
+|---|---|
+| chain.s2_folds_match_units | true = every attached Stage A unit's test fold and gold studies equal the attached S2 fold; false fails the step; null = no unit attached (nothing was checked) |
+| chain.units_checked | number of units the guard checked (rounded) |
+| chain.mismatched_units | names (encoder_fK) of units that do not match; empty when the guard passes |
+| chain.mismatch_counts | per failing unit: studies of its fold it lacks (missing) and studies it has beyond its fold (extra), rounded |
+| device | cuda or cpu: where N7's fits ran |
+| base_seconds, extras_seconds | time of the base pass, and of each extra block |
+| extras_requested | the extra blocks asked for (seeds, defaults, triage, probe) |
+| extras_errors | empty when every requested block ran; else block name with the error type and place; the other blocks still ran |
+| chain.n3_folds_sha16 | hash of the attached folds.csv (expect 670ddcc8...) |
+| chain.s2_sha16 | hash of the attached folds.csv without its s1_fold column; equal to agg_n3.json's s2_sha16 of knee-n3-r |
+| chain.stage_a_n3_folds_sha16 | the N3 hash each Stage A notebook recorded (the old one, by design) |
+| chain.n3_hash_same_as_stage_a | false is expected here (only s1_fold changed) |
+| extras.<encoder>.seeds | seeds refit for S2 (main encoders only): 0 is a reproduction check, 1-5 the sensitivity seeds |
+| extras.<encoder>.default_l2_defaults | epochs E per fold, and their source, for the default head = the fold's L1 winner at the L2 defaults |
+| extras.<encoder>.default_fixed | the same for the default head = gated attention over all planes at the L2 defaults (no selection at all) |
+| extras.<encoder>.triage | true = this encoder's triage thresholds were written |
+| extras_ok | true = no extra block failed; null = no extras were run |
+| near_duplicate_probe.cosine_above_T.pairs | study pairs with cosine above T (0.90, 0.95, 0.98) between the pilot's DINOv2 study vectors |
+| near_duplicate_probe.cosine_above_T.across_language_groups, across_vendor_groups | how many of those pairs have different groups |
+| near_duplicate_probe.cosine_above_T.pairs_both_training | pairs whose two studies are both training studies |
+| near_duplicate_probe.cosine_above_T.across_s2_folds, across_vendor_folds, across_s1_folds | of the both-training pairs, how many sit in different folds |
+| leakage_assertion_passed | true = no fit received a test-fold or gold study; in the base pass a breach fails the step, in an extra it is recorded and turns this false |
+
+N7 also writes, under private/ only: s2seeds_<encoder>.csv, default_<encoder>.csv, default_fixed_<encoder>.csv and triage_thresholds.csv. N9 reads them.
+
+New fields in agg_results.json (the summary block shows chain, seed_sensitive, seed0_refit, sign_agrees_with_primary, compare_with_previous and secondary_errors):
+
+| Field | Meaning |
+|---|---|
+| chain.* | as in agg_n7.json; a false s2_folds_match_units writes status "chain mismatch", no decision, and fails the step |
+| h1.secondary.per_fold_delta1 | Delta1 (DINOv2 minus ConvNeXt) inside each S2 test fold, in fold order |
+| h1.secondary.pair_share | each fold's share of the primary metric's pair weight, in fold order |
+| h1.secondary.findings_without_pairs | per fold, the findings with no positive (or no negative) there; they are left out of that fold's Delta1 |
+| h1.secondary.unweighted_mean_of_fold_delta1 | the plain mean of the per-fold Delta1 values (every fold counts the same) |
+| h1.secondary.primary_delta1 | the primary, pair-weighted Delta1, repeated for comparison |
+| h1.secondary.sign_agrees_with_primary | true = the unweighted mean has the same sign as the primary Delta1 |
+| h1.g_lang.interval_within_fold_study_bootstrap | second interval for Delta1: studies resampled inside each test fold (2,000 draws, percentile); it shows sampling noise inside folds with sites fixed; used_for_decisions is false |
+| average_precision.definition | how macro AP is computed: AP inside each test fold, folds weighted by positives, mean over the 12 findings |
+| average_precision.chance | the chance level of that macro AP: the exact expected AP of a random ranking per fold, weighted like the AP; use this for "times chance" |
+| average_precision.prevalence_weighted | the same weighting of each fold's plain prevalence (lower than chance for rare findings; reference only) |
+| average_precision.chance_per_finding | the chance level per finding |
+| average_precision.mean_prevalence | mean over findings of the pooled share of positives |
+| average_precision.models.<model> | macro_ap and per_finding AP for each encoder and for floor_a |
+| seed_sensitivity.delta1_per_seed | Delta1 per refit seed; seed_0 is Stage A's value, the one decisions use |
+| seed_sensitivity.delta1_sd | standard deviation of Delta1 over the six seeds |
+| seed_sensitivity.delta1_low_high | lowest and highest Delta1 over the six seeds |
+| seed_sensitivity.interval_per_seed | the G-lang decision interval of Delta1 for seeds 1-5 |
+| seed_sensitivity.decision_per_seed | the unchanged decision rule applied per seed (G-lang category only) |
+| seed_sensitivity.seed_sensitive | true = some seed's category differs from seed 0's; report H1 as seed-sensitive |
+| seed_sensitivity.share_of_extra_seeds_same_category | share of seeds 1-5 whose category equals seed 0's (the "k of 5" on the slide) |
+| seed_sensitivity.sign_same_all_seeds | true = Delta1 has the same sign in all six seeds |
+| seed_sensitivity.macro_auc_per_seed | S2 macro AUC of each main encoder per seed |
+| seed_sensitivity.seed0_refit_check | N7's seed-0 refit against Stage A's stored predictions: refit_device, tolerance, max_abs_probability_gap, delta1_of_refit, delta1_gap, reproduces_stage_a (gap within tolerance; expected on a GPU), delta1_gap_within_seed_sd (the reading on CPU) |
+| compare_with_previous | only with compare_with: the earlier H1-H3, same_h1_h2_h3 and the list that differs |
+| triage.models.<encoder>.confusion | pooled confusion matrix (tp, fp, fn, tn; rounded to 5) for "any finding" at the 95%-sensitivity threshold from inner out-of-fold predictions |
+| triage.models.<encoder>.sensitivity, specificity, precision, f1 | rates from the exact counts (2 decimals; the rounded matrix will not reproduce them exactly); null when a cell the rate uses holds 1 to 4 studies |
+| triage.models.<encoder>.normal_studies_moved_back_share | share of studies without a finding that fall below the threshold (= specificity) |
+| triage.models.<encoder>.inner_sensitivity_mean | mean sensitivity reached on the inner predictions the thresholds were set on |
+| baselines.rows | one table: b0_chance, b1_scanner_tags, b2_default_<encoder>, b2_default_fixed_<encoder>, tuned_<encoder> |
+| baselines.same_studies_and_folds_for_every_row | true = every row is complete, so all rows use the same studies and folds; false = see incomplete_rows |
+| baselines.incomplete_rows | rows without numbers (model or its N7 file missing) |
+| baselines.rows.*.s2_macro_auc | the primary metric with its group-level decision interval |
+| baselines.rows.*.mean_of_fold_macros | mean over folds of each fold's macro AUC (use this beside published fold means) |
+| baselines.rows.*.gain_over_b1 | S2 macro AUC minus floor A's |
+| baselines.rows.tuned_*.gain_over_own_default | tuned minus the same encoder's b2_default row, with the decision interval |
+| baselines.rows.*.macro_ap | macro average precision; its chance level is b0_chance.macro_ap |
+| baselines.rows.*.gold58_macro_auc | macro AUC on the gold studies |
+| baselines.rows.b0_chance.measured_permuted_label_null | the pilot's permuted-label macro AUC, if the pilot is attached |
+| baselines.reference_row | says the published-numbers row is not computed; add it by hand |
+| hpo_evidence.boundary.<setting> | share of units whose chosen value, and of top-5 trials, lies in the outer 5% of the search range (low end, high end, both) |
+| hpo_evidence.best_so_far.<encoder>.mean_best_so_far | best inner score after each of the 30 trials, mean over units |
+| hpo_evidence.best_so_far.<encoder>.first_trial_of_final_best_median | trial number (the logged number, from 0) that first reached the final best, median over units |
+| hpo_evidence.best_so_far.<encoder>.share_units_best_is_trial_0 | share of units where the defaults were never beaten |
+| hpo_evidence.best_so_far.<encoder>.mean_gain_after_startup_trials | final best minus the best after the 10 start-up trials (what the GP phase added) |
+| hpo_evidence.hierarchy.<encoder>.per_unit | per fold: l1_margin (L1 winner minus runner-up) and l2_gain (best after BO minus the winner at the defaults) |
+| hpo_evidence.hierarchy.<encoder>.share_units_l2_gain_above_l1_margin | share of units where L2 tuning gained more than the L1 choice |
+| hpo_evidence.profiles.<encoder>.<setting> | inner score in 6 equal-width bins of the (log) range, from the start-up trials only (trial number below 10: the defaults and 9 random draws): mean, mean_centred (each unit's mean removed), trial_share |
+| hpo_evidence.profiles_from | says which trials the profiles use |
+| hpo_evidence.units_without_own_search | units tuned in simplified mode; they are left out of the evidence |
+| near_duplicate_probe | copied from agg_n7.json |
+| secondary_errors | empty when every secondary block ran; else the block name with the error type and place |
+
+New fields in other summaries:
+
+| File | Field | Meaning |
+|---|---|---|
+| agg_n3.json | pairs.pairs_applied | flagged pairs with both studies in the training index; only these shape the S1 folds |
+| agg_n3.json | pairs.pairs_not_applied | flagged pairs that were skipped (a study outside the training index) |
+| agg_n3.json | pairs.pairs_together | true = every applied pair shares an S1 fold |
+| agg_n3.json | pairs.pairs_across_vendor_folds | flagged pairs whose two studies sit in different G-vendor folds |
+| agg_n3.json | pairs.pairs_across_s2_folds | flagged pairs whose two studies sit in different S2 folds |
+| agg_n3.json | s2_sha16 | hash of folds.csv without s1_fold; it must not change in a rerun that only regroups S1 |
+| agg_n8.json | features.missing_share | now also holds manufacturer and model; 1.0 for a feature means it is dead |
+| agg_n8.json | features.columns_absent | feature columns that tags.csv does not have (should be empty) |
+| agg_pilot.json | projection.corrected | the Stage A time projection with the review's fixes: real inner-fit size, x1.26 for batch size, 30 epochs per fit, divided by 2; the old keys are unchanged |
 
 ## If a run fails
 

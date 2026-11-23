@@ -260,4 +260,57 @@ def _projection(d, fdf: pd.DataFrame, K: int) -> dict:
         demo = 3 * 900 * float(dm.median()) / 3600 if len(dm) else 0.0
         one = K * unit["vit_s16"] + demo
         out["n6b_wall_hours"] = {"low": round(one / 4, 2), "high": round(one / 2, 2)}
+    out["corrected"] = _projection_corrected(d, fdf, K)
+    return out
+
+
+BATCH_FACTOR = 1.26  # mean extra optimiser steps of the searched batch sizes (16-128, log) against the default 48
+
+
+def _projection_corrected(d, fdf: pd.DataFrame, K: int) -> dict:
+    """The projection again with the three faults the 23 Nov code review found removed (finding 1).
+
+    The keys above are kept as they were (the pilot gate read them). Here, per unit:
+    1. seconds per epoch are scaled from the pilot fit's size (outer training set minus inner
+       fold 0) to the mean size of Stage A's inner fits (time per epoch is proportional to steps);
+    2. times BATCH_FACTOR for the searched batch sizes;
+    3. every search fit is counted at all 30 epochs, i.e. times 30 / (median best epoch + 5):
+       low learning rates keep improving, so early stopping often does not fire;
+    and the wall time divides one process's total by 2 only (two GPUs; four processes do not give 4x).
+    Each unit's refit on the whole outer training set is added. Loading and the sampler are not."""
+    size = {}
+    for k in range(K):
+        tr, _, _ = d.split(k)
+        inner = d.inner(k)[tr]
+        js = sorted(set(inner[inner >= 0].tolist()))
+        pilot_n = int((inner != 0).sum())
+        if js and pilot_n:
+            size[k] = {"k_in": len(js), "scale": float(np.mean([(inner != j).sum() for j in js])) / pilot_n,
+                       "refit_scale": len(tr) / pilot_n}
+    fits_per_inner = len(heads.L1_GRID) + 30
+    unit: dict = {}
+    for enc, g in fdf.groupby("encoder"):
+        best = float(g["best_epoch"].median())
+        for _, row in g.iterrows():
+            z = size.get(int(row["fold"]))
+            if z is None:
+                continue
+            search = fits_per_inner * z["k_in"] * heads.MAX_EPOCHS * row["per_epoch_s"] * z["scale"] * BATCH_FACTOR
+            refit = best * row["per_epoch_s"] * z["refit_scale"]
+            unit.setdefault(enc, {})[int(row["fold"])] = (search + refit) / 3600
+    out = {"unit_hours_one_process": {e: {"folds": sorted(v), "hours": [round(v[k], 2) for k in sorted(v)]}
+                                      for e, v in unit.items()},
+           "inner_fit_size_factor": {"folds": sorted(size), "factor": [round(size[k]["scale"], 2) for k in sorted(size)]},
+           "batch_factor": BATCH_FACTOR,
+           "epoch_factor": {e: round(heads.MAX_EPOCHS / min(heads.MAX_EPOCHS, float(g["best_epoch"].median()) + heads.PATIENCE), 2)
+                            for e, g in fdf.groupby("encoder")},
+           "wall_divisor": 2.0}
+    main = [sum(unit[e].values()) for e in encoders.MAIN if e in unit]
+    if len(main) == len(encoders.MAIN):
+        out["n6a_wall_hours"] = round(sum(main) / 2, 2)
+        out["n6a_over_6h"] = bool(sum(main) / 2 > 6)  # information only: the pilot gate used the old key
+    if "vit_s16" in unit:  # N6b: the control encoder's units plus the HPO demo (its fits already have the pilot's size)
+        dm = fdf.loc[fdf["encoder"] == encoders.MAIN[0], "per_epoch_s"]
+        demo = 3 * 900 * float(dm.median()) / 3600 if len(dm) else 0.0
+        out["n6b_wall_hours"] = round((sum(unit["vit_s16"].values()) + demo) / 2, 2)
     return out

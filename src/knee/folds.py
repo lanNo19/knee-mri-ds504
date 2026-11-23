@@ -88,6 +88,19 @@ def inner_folds(groups: pd.Series, train_mask: pd.Series, max_k: int = 4) -> pd.
     return out
 
 
+def s2_sha16(folds_csv) -> str:
+    """Hash of a folds.csv without its s1_fold column (first 16 hex characters of the SHA-256).
+
+    A rerun of N3 that only regroups the seen-site folds (flagged pairs kept together) changes the
+    file's hash but not this one, so Stage A units trained before the rerun can be tied to it.
+    """
+    import hashlib
+
+    df = pd.read_csv(folds_csv, dtype=str, keep_default_na=False)
+    text = df.drop(columns=["s1_fold"], errors="ignore").to_csv(index=False)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def fold_summary(fold: pd.Series, groups: pd.Series) -> list[dict]:
     from . import agg
 

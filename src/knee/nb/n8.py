@@ -106,8 +106,11 @@ def run(root=None, expect: dict | None = None, n_trials: int = N_TRIALS, workers
         s["upstream"] = d.upstream
         s["usable_from_n5"] = d.usable_from_n5
         s["findings"] = [FINDINGS[j] for j in elig]
+        # a column absent from tags.csv becomes all-missing without an error: both facts are reported
         s["features"] = {"categorical": CATEGORICAL, "numeric": NUMERIC,
-                         "missing_share": {c: agg.share(X[c].isna().mean()) for c in NUMERIC}}
+                         "missing_share": {**{c: agg.share((X[c].astype(str) == "MISSING").mean()) for c in CATEGORICAL},
+                                           **{c: agg.share(X[c].isna().mean()) for c in NUMERIC}},
+                         "columns_absent": [c for c in CATEGORICAL + NUMERIC if c not in tags.columns]}
         P = np.full((d.n, len(FINDINGS)), np.nan, np.float32)
         trials, chosen = [], {}
         guard_ok = True

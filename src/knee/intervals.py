@@ -76,6 +76,38 @@ def decision_interval(stat: Callable[[np.ndarray], float], groups, n_boot: int =
             "n_groups": int(G), "approximate": G < 10}
 
 
+def within_fold_bootstrap(stat: Callable[[np.ndarray], float], folds, n_boot: int = N_BOOT, seed: int = 0) -> dict:
+    """Secondary interval: a study-level bootstrap inside each test fold (percentile 2.5-97.5).
+
+    Each resample draws, inside every fold, as many studies as the fold has, with replacement;
+    `stat` gets the multiplicities, so both encoders see the same draw (paired). Folds < 0 are
+    left out (weight 0).
+
+    What the two intervals capture:
+      decision interval (groups resampled): variation between site groups, i.e. how the result
+        would move with another set of test sites. It ignores sampling noise inside a fold that
+        is one single group: such a group is in or out as a whole and its own AUC never changes.
+      this interval (studies resampled inside folds): sampling noise of the studies inside each
+        fold, with the sites and the fold models held fixed. It says nothing about other sites.
+    It is descriptive and decides nothing.
+    """
+    f = np.asarray(folds)
+    parts = [np.flatnonzero(f == k) for k in np.unique(f) if k >= 0]
+    rng = np.random.default_rng(seed)
+    vals = np.empty(n_boot)
+    for b in range(n_boot):
+        w = np.zeros(len(f))
+        for rows in parts:
+            w += np.bincount(rng.choice(rows, size=len(rows)), minlength=len(f))
+        vals[b] = stat(w)
+    ok = np.isfinite(vals)
+    if not ok.any():
+        return {"lo": None, "hi": None, "half_width": None, "valid_share": 0.0, "n_boot": int(n_boot)}
+    lo, hi = np.percentile(vals[ok], [2.5, 97.5])
+    return {"lo": float(lo), "hi": float(hi), "half_width": float(hi - lo) / 2, "valid_share": float(ok.mean()),
+            "n_boot": int(n_boot)}
+
+
 def decide(lo, hi, margin: float = MARGIN, a: str = "A better", b: str = "B better") -> str:
     if lo is None or hi is None:
         return "not testable"

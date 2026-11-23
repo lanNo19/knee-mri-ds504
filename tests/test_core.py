@@ -171,6 +171,21 @@ def test_notebook_cells_match_runbook():
         if name not in ("n3", "n6p", "n6a", "n6b", "n9", "n4-coronal", "n4-axial"):  # the card adds values; n4: "likewise"
             assert mk.cell2(name) in runbook, name
     assert mk.DREAD not in mk.metadata("u", "n0")["dataset_sources"]
+    # N7 and N9 attach the N3 rerun and check the upstream hashes (23 Nov)
+    for name in ("n7", "n9"):
+        assert "u/knee-n3-r" in mk.metadata("u", name)["kernel_sources"]
+        assert "u/knee-n3" not in mk.metadata("u", name)["kernel_sources"]
+        assert "u/knee-n6a-smoke" not in mk.metadata("u", name)["kernel_sources"]
+        assert f"expect={mk.EXPECT}" in mk.cell2(name) and f"expect={mk.EXPECT}" in runbook
+    # tonight's variants: N6b still queued (main encoders only) and N7 on CPU
+    for name in ("n7", "n9"):
+        assert "u/knee-n6b" in mk.metadata("u", name)["kernel_sources"]
+        src = mk.metadata("u", name, without_n6b=True)["kernel_sources"]
+        assert "u/knee-n6b" not in src and "u/knee-n6a" in src and "u/knee-n3-r" in src
+    assert mk.cell2("n7", without_n6b=True) in runbook and "convnext_tiny" in mk.cell2("n7", without_n6b=True)
+    assert mk.cell2("n9", without_n6b=True) == mk.cell2("n9")  # N9 needs no other call without N6b
+    assert mk.metadata("u", "n7")["enable_gpu"] and not mk.metadata("u", "n7", cpu=True)["enable_gpu"]
+    assert "machine_shape" not in mk.metadata("u", "n7", cpu=True)
     for name in ("smoke", "n0"):
         assert mk.DREAD in mk.metadata("u", name, "labels.csv")["dataset_sources"]
         assert "dread_file='labels.csv'" in mk.cell2(name, "labels.csv", True)

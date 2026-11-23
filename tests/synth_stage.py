@@ -116,16 +116,19 @@ def make_stage(root: Path, n: int = 800, n_groups: int = 8, S: int = 8, D: int =
 
 
 def make_units(root: Path, name: str = "n6a", strengths: dict | None = None, seed: int = 1) -> None:
-    """Synthetic Stage A unit outputs (predictions.csv + config.json per encoder and fold) from make_stage's files."""
+    """Synthetic Stage A unit outputs (predictions.csv, config.json, l1.csv and trials.csv per encoder and
+    fold) from make_stage's files. As in n6._unit, a unit predicts its usable test-fold and gold studies."""
     rng = np.random.default_rng(seed)
+    log_rng = np.random.default_rng(seed + 1)  # the search logs draw from their own stream
     strengths = strengths or {"dinov2_vits14": 1.6, "convnext_tiny": 0.9, "vit_s16": 1.1}
     n0 = root / "n0" / "private" / "n0"
     lab = pd.read_csv(n0 / "labels_binary.csv").set_index(UID)
     folds = pd.read_csv(root / "n3" / "private" / "n3" / "folds.csv").set_index(UID)
     y = lab.loc[folds.index, FINDINGS].fillna(0.5).to_numpy()
+    usable = pd.read_csv(root / "n5" / "private" / "n5" / "index.csv").set_index(UID)["usable"].reindex(folds.index).to_numpy()
     for e, st in strengths.items():
         for k in range(5):
-            rows = ((folds["s2_fold"] == k) & (folds["train"] | folds["is_gold"])).to_numpy()
+            rows = ((folds["s2_fold"] == k) & (folds["train"] | folds["is_gold"])).to_numpy() & usable
             ud = root / name / "private" / name / "units" / f"{e}_f{k}"
             ud.mkdir(parents=True, exist_ok=True)
             p = 1 / (1 + np.exp(-(st * (y[rows] - 0.3) * 3 + rng.normal(0, 1, (int(rows.sum()), 12)))))
@@ -139,6 +142,7 @@ def make_units(root: Path, name: str = "n6a", strengths: dict | None = None, see
             (ud / "config.json").write_text(json.dumps({
                 "encoder": e, "fold": k, "l1_winner": {"pooling": cfg["pooling"], "planes": "all"},
                 "config": cfg, "best_inner_score": 0.7 + 0.01 * k, "E": 6}))
+            _search_logs(ud, cfg["pooling"], 0.7 + 0.01 * k, log_rng)
     # floor A: a weak scanner signal
     fa = root / "n8" / "private" / "n8"
     fa.mkdir(parents=True, exist_ok=True)
@@ -148,3 +152,23 @@ def make_units(root: Path, name: str = "n6a", strengths: dict | None = None, see
     df.insert(0, "s2_fold", folds["s2_fold"].to_numpy()[rows])
     df.insert(0, UID, folds.index[rows])
     df.to_csv(fa / "predictions.csv", index=False)
+
+
+def _search_logs(ud: Path, pooling: str, best: float, rng, n_trials: int = 30) -> None:
+    """l1.csv and trials.csv shaped like n6._unit's: trial 0 = the L2 defaults, the last trial is the best."""
+    grid = [(p, s) for p in ("mean", "max", "gated") for s in ("sag", "sag+cor", "all")]
+    l1 = pd.DataFrame([{"pooling": p, "planes": s, "inner_score": best - (0.02 if (p, s) == (pooling, "all") else 0.05),
+                        "median_best_epoch": 5.0} for p, s in grid])
+    l1.to_csv(ud / "l1.csv", index=False)
+    t = pd.DataFrame({
+        "number": np.arange(n_trials), "state": "COMPLETE",
+        "value": np.r_[best - 0.02, best - 0.02 - rng.uniform(0, 0.05, n_trials - 2), best],
+        "lr": np.r_[3e-4, np.exp(rng.uniform(np.log(1e-5), np.log(1e-2), n_trials - 1))],
+        "weight_decay": np.r_[3e-4, np.exp(rng.uniform(np.log(1e-6), np.log(1e-1), n_trials - 1))],
+        "dropout": np.r_[0.25, rng.uniform(0, 0.5, n_trials - 1)],
+        "pos_cap": np.r_[1.5, np.exp(rng.uniform(0, np.log(2.0), n_trials - 1))],
+        "batch_size": np.r_[48, np.exp(rng.uniform(np.log(16), np.log(128), n_trials - 1)).astype(int)],
+        "best_epochs": json.dumps([4, 4, 5, 5])})
+    if pooling == "gated":
+        t["attn_hidden"] = np.r_[192, np.exp(rng.uniform(np.log(64), np.log(512), n_trials - 1)).astype(int)]
+    t.to_csv(ud / "trials.csv", index=False)

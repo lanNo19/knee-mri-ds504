@@ -112,6 +112,14 @@ def test_n3(env, capfd):
             assert g in set(st.loc[tr.index[tr["s2_fold"] == k], "g_lang"])
     assert s["s1"]["sizes_match_s2"]
     assert s["upstream_n0"]["sha16"]
+    # 23 Nov: what the flagged pairs did, and the hash that a rerun regrouping only S1 must keep
+    assert {"pairs_applied", "pairs_not_applied", "pairs_together", "pairs_across_vendor_folds",
+            "pairs_across_s2_folds"} <= set(s["pairs"])
+    assert s["pairs"]["pairs_applied"] == 0 and s["pairs"]["pairs_together"] is None  # no pilot attached yet
+    from knee import folds as kfolds
+
+    assert s["s2_sha16"] == kfolds.s2_sha16(env["work"] / "private" / "n3" / "folds.csv") != s["folds_sha16"]
+    assert f'"s2_sha16": "{s["s2_sha16"]}"' in printed.out
 
 
 @pytest.mark.parametrize("plane", ["sagittal", "coronal", "axial"])

@@ -39,8 +39,10 @@ NOTEBOOKS = {
     "n6a-smoke": (True, False, False, ["n0", "n3", "n5"], 7200),
     "n6a": (True, False, False, ["n0", "n3", "n5"], 32400),
     "n6b": (True, False, False, ["n0", "n3", "n5"], 32400),
-    "n7": (True, False, False, ["n0", "n3", "n5", "n6a", "n6b"], 14400),
-    "n9": (False, False, False, ["n0", "n3", "n5", "n6p", "n6a", "n6b", "n7", "n8"], 7200),
+    # N7 and N9 attach the rerun knee-n3-r (S1 folds keep flagged pairs together; S2 unchanged), never
+    # knee-n3 and never knee-n6a-smoke: exactly one output per upstream step
+    "n7": (True, False, False, ["n0", "n3-r", "n5", "n6a", "n6b"], 14400),
+    "n9": (False, False, False, ["n0", "n3-r", "n5", "n6p", "n6a", "n6b", "n7", "n8"], 7200),
     "bundle": (False, False, False, [], 3600),
     # internet OFF; the bundle dataset comes from --bundle-dataset
     "n10-canary": (False, True, False, ["n0"], 32400),
@@ -50,7 +52,14 @@ NOTEBOOKS = {
 }
 
 
-def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> str:
+# The first 8 characters of each upstream file's sha16 for the 23 Nov chain (n3_folds: knee-n3-r)
+EXPECT = '{"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}'
+
+
+MAIN_ONLY = 'encoder_names=("dinov2_vits14", "convnext_tiny"), '
+
+
+def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, without_n6b: bool = False) -> str:
     if name == "smoke":
         arg = f"dread_file={dread_file!r}" if dread_file else ""
         return f"from knee.nb import smoke; smoke.run({arg})"
@@ -65,9 +74,9 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False) -> s
     if name == "n8":
         return "from knee.nb import n8; n8.run()"
     if name == "n7":
-        return "from knee.nb import n7; n7.run()"
+        return f"from knee.nb import n7; n7.run({MAIN_ONLY if without_n6b else ''}expect={EXPECT})"
     if name == "n9":
-        return "from knee.nb import n9; n9.run()"
+        return f"from knee.nb import n9; n9.run(expect={EXPECT})"
     if name == "n6a-smoke":
         return 'from knee.nb import n6; n6.run("n6a_smoke", encoders=("dinov2_vits14",), folds=(0,))'
     if name == "n6a":
@@ -126,8 +135,15 @@ def notebook_json(commit: str, code: str, offline: bool = False) -> dict:
             "nbformat": 4, "nbformat_minor": 5}
 
 
-def metadata(user: str, name: str, dread_file: str | None = None, bundle: str | None = None) -> dict:
+def metadata(user: str, name: str, dread_file: str | None = None, bundle: str | None = None,
+             without_n6b: bool = False, cpu: bool = False) -> dict:
+    """without_n6b: N7 and N9 leave knee-n6b out of their inputs (it is still queued or running); they
+    are rerun in new notebooks once it has finished. cpu: N7 without an accelerator (its code runs on either)."""
     gpu, comp, tables, up, _ = NOTEBOOKS[name]
+    if without_n6b and name in ("n7", "n9"):
+        up = [u for u in up if u != "n6b"]
+    if cpu and name == "n7":
+        gpu = False
     datasets = list(TABLES) if tables else []
     if dread_file and name in ("smoke", "n0"):
         datasets.append(DREAD)
@@ -155,13 +171,17 @@ def main(argv=None):
     ap.add_argument("--dread-file", default=None)
     ap.add_argument("--dread-provenance-ok", action="store_true")
     ap.add_argument("--bundle-dataset", default=None, help="owner/slug of the private bundle dataset (N10)")
+    ap.add_argument("--without-n6b", action="store_true",
+                    help="N7 and N9 without knee-n6b attached (main encoders only); rerun both when N6b has finished")
+    ap.add_argument("--n7-cpu", action="store_true", help="N7 without a GPU (the T4 queue is full)")
     a = ap.parse_args(argv)
     for name in NOTEBOOKS:
         d = Path(a.out) / name
         d.mkdir(parents=True, exist_ok=True)
-        code = cell2(name, a.dread_file, a.dread_provenance_ok)
+        code = cell2(name, a.dread_file, a.dread_provenance_ok, a.without_n6b)
         (d / "notebook.ipynb").write_text(json.dumps(notebook_json(a.commit, code, offline=name in OFFLINE), indent=1))
-        (d / "kernel-metadata.json").write_text(json.dumps(metadata(a.user, name, a.dread_file, a.bundle_dataset), indent=1))
+        (d / "kernel-metadata.json").write_text(json.dumps(
+            metadata(a.user, name, a.dread_file, a.bundle_dataset, a.without_n6b, a.n7_cpu), indent=1))
         (d / "timeout_s").write_text(f"{NOTEBOOKS[name][4]}\n")
     print(f"wrote {len(NOTEBOOKS)} notebooks under {a.out}/")
 

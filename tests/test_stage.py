@@ -192,6 +192,13 @@ def test_n6p_pilot(stage_env, monkeypatch, capfd):
     assert all(frozenset(p) in got for p in facts["dup_pairs"])
     wall = s["projection"]["n6a_wall_hours"]
     assert 0 < wall["low"] <= wall["high"]
+    # the corrected projection (code review finding 1): old keys kept, corrected ones beside them
+    cor = s["projection"]["corrected"]
+    assert cor["wall_divisor"] == 2.0 and cor["batch_factor"] == 1.26
+    assert all(v >= 1.0 for v in cor["epoch_factor"].values())
+    assert len(cor["inner_fit_size_factor"]["factor"]) == 5 and min(cor["inner_fit_size_factor"]["factor"]) > 0
+    assert cor["n6a_wall_hours"] >= 1.2 * wall["high"]  # 30 epochs, x1.26, divided by 2 only
+    assert isinstance(cor["n6a_over_6h"], bool) and "n6a_over_6h_gate" in s["projection"]
     json.loads((paths.WORKING / "agg_pilot.json").read_text())
 
 
@@ -208,6 +215,12 @@ def test_n8_floor_a(stage_env, monkeypatch, capfd):
     text = printed.out + printed.err + (paths.WORKING / "agg_n8.json").read_text()
     assert not [u for u in facts["uids"] if u in text]
     assert s["leakage_assertion_passed"] and s["n_folds"] == 5
+    ms = s["features"]["missing_share"]
+    assert set(ms) == set(n8.CATEGORICAL + n8.NUMERIC) and ms["manufacturer"] == 0.0 and 0 < ms["sagittal_echo_time"] < 0.2
+    assert s["features"]["columns_absent"] == []
+    tags = pd.read_csv(root / "input" / "n0" / "private" / "n0" / "tags.csv")
+    X = n8.features(tags.drop(columns=["model"]), tags["StudyInstanceUID"].astype(str))
+    assert (X["model"].astype(str) == "MISSING").all()  # an absent column is all-missing: now visible in the summary
     assert 0.5 < s["s2_macro_auc"] < 0.7  # only one tag carries label signal that transfers to unseen sites
     pred = pd.read_csv(paths.WORKING / "private" / "n8" / "predictions.csv")
     lab = pd.read_csv(root / "input" / "n0" / "private" / "n0" / "labels_binary.csv").set_index("StudyInstanceUID")
@@ -253,6 +266,38 @@ def test_n6_stage_a_units_and_demo(stage_env, monkeypatch, capfd):
     demo = s["demo"]
     assert set(demo["curves"]) == {"random", "successive_halving", "gp"}
 
+    # N7's seed refit is Stage A's refit: with seed 0 it gives the unit's stored predictions back
+    from knee import heads, stage, units
+    from knee.nb import n7
+
+    d = stage.StageData(root / "input")
+    ud = paths.WORKING / "private" / "n6a" / "units" / "dinov2_vits14_f0"
+    u = json.loads((ud / "config.json").read_text())
+    bank = d.bank("dinov2_vits14", "cpu")
+    spec = {0: (heads.config_from(u["config"]), int(u["E"]))}
+    P = n7.s2_refits(d, bank, spec.get, seed=0)
+    pred = pd.read_csv(ud / "predictions.csv")
+    rows = pred["StudyInstanceUID"].astype(str).map({x: i for i, x in enumerate(d.uids)}).to_numpy()
+    FIND = [c for c in pred.columns if c not in ("StudyInstanceUID", "s2_fold", "is_gold")]
+    assert np.isfinite(P[rows]).all() and np.isnan(np.delete(P, rows, axis=0)).all()  # fold 0 and its gold only
+    assert np.abs(P[rows] - pred[FIND].to_numpy()).max() < 1e-4
+    assert np.abs(n7.s2_refits(d, bank, spec.get, seed=1)[rows] - pred[FIND].to_numpy()).max() > 1e-4  # seeds differ
+    # the default-head settings come from the unit's own inner logs
+    specs = units.default_specs(ud, d.pos_cap_upper())
+    cfg, E, source = specs["l2_defaults"]
+    t0 = pd.read_csv(ud / "trials.csv").iloc[0]
+    assert source == "BO trial 0" and E == max(1, int(np.median(json.loads(t0["best_epochs"]))))
+    assert (cfg.pooling, cfg.planes) == (u["l1_winner"]["pooling"], u["l1_winner"]["planes"])
+    assert cfg.lr == heads.Config().lr and cfg.pos_cap == pytest.approx(np.sqrt(d.pos_cap_upper()))
+    assert specs["fixed"][0] == heads.default_config(d.pos_cap_upper()) and specs["fixed"][2] == "l1.csv"
+    # the chain guard accepts real units and the attached folds
+    dirs = units.unit_dirs(paths.WORKING)
+    assert set(dirs) == {("dinov2_vits14", 0), ("dinov2_vits14", 1)}
+    ok = units.check_units(d, dirs)
+    assert ok["s2_folds_match_units"] is True and ok["mismatched_units"] == [] and ok["units_checked"] == "<5"
+    none = units.check_units(d, {})
+    assert none["s2_folds_match_units"] is None and none["units_checked"] == 0  # nothing checked is not a pass
+
 
 # ---------------------------------------------------------------- N7 and N9
 
@@ -267,6 +312,25 @@ def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
     con = s7["consensus"]["dinov2_vits14"]
     assert con["config"]["pooling"] == "gated" and con["E"] == 6  # gated won 3 of 5 folds
     assert not any(v["folds"] for v in s7["missing_units"].values())
+    assert s7["chain"]["s2_folds_match_units"] and s7["leakage_assertion_passed"] and s7["device"] == "cpu"
+    assert s7["extras_ok"] is True and s7["extras_errors"] == {} and s7["chain"]["units_checked"] == 15
+    assert s7["extras_requested"] == ["seeds", "defaults", "triage", "probe"] and s7["base_seconds"] <= s7["seconds"]
+    assert {"dinov2_vits14.seeds", "vit_s16.triage", "probe"} <= set(s7["extras_seconds"])
+    assert s7["extras"]["dinov2_vits14"]["seeds"] == [0, 1, 2, 3, 4, 5] and "seeds" not in s7["extras"]["vit_s16"]
+    assert s7["extras"]["vit_s16"]["default_l2_defaults"]["E"]["epochs"] == [4] * 5  # BO trial 0's inner epochs
+    assert s7["extras"]["vit_s16"]["default_fixed"]["E"]["epochs"] == [5] * 5  # l1.csv's row
+    n7d = paths.WORKING / "private" / "n7"
+    seeds = pd.read_csv(n7d / "s2seeds_convnext_tiny.csv")
+    assert sorted(seeds["seed"].unique()) == [0, 1, 2, 3, 4, 5] and seeds.groupby("seed").size().nunique() == 1
+    thr = pd.read_csv(n7d / "triage_thresholds.csv")
+    assert len(thr) == 15 and (thr["inner_sensitivity"] >= 0.95).all() and thr["threshold"].between(0, 1).all()
+    probe = s7["near_duplicate_probe"]
+    assert set(probe) == {"encoder", "cosine_above_0.90", "cosine_above_0.95", "cosine_above_0.98"}
+    assert probe["cosine_above_0.98"]["pairs"] == "<5"  # the three planted duplicates
+    assert set(probe["cosine_above_0.90"]) == {"pairs", "across_language_groups", "across_vendor_groups",
+                                               "pairs_both_training", "across_s2_folds", "across_vendor_folds",
+                                               "across_s1_folds"}
+    assert not [u for u in facts["uids"] if u in (paths.WORKING / "agg_n7.json").read_text()]
     monkeypatch.setattr(paths, "WORKING", root / "working_n9")
     s9 = n9.run(root=root / "input", n_boot=200, hidden={"dinov2_vits14": 0.9, "convnext_tiny": 0.85}, quiet=True)
     printed = capfd.readouterr()
@@ -280,6 +344,187 @@ def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
     assert s9["s3_gold"]["consistent"] and s9["s4_hidden"]["consistent"]
     assert s9["anti_claim_1"]["d_pre"]["estimate"] > 0
     assert s9["decisions"]["H4"].startswith("not run")
+    _check_secondary(s9, root)
+
+
+def _check_secondary(s9, root):
+    """The 23 Nov additions: new keys only, descriptive, privacy-safe."""
+    assert s9["secondary_errors"] == {}
+    # A. chain guard
+    ch = s9["chain"]
+    assert ch["s2_folds_match_units"] is True and ch["mismatched_units"] == [] and ch["units_checked"] == 15
+    assert ch["n3_folds_sha16"] == s9["upstream"]["n3_folds"]["sha16"] and len(ch["s2_sha16"]) == 16
+    # B. per-fold Delta1
+    sec = s9["h1"]["secondary"]
+    assert len(sec["per_fold_delta1"]) == 5 and sum(sec["pair_share"]) == pytest.approx(1.0, abs=0.03)
+    assert sec["unweighted_mean_of_fold_delta1"] == pytest.approx(np.mean(sec["per_fold_delta1"]), abs=1e-4)
+    assert sec["sign_agrees_with_primary"] is True and sec["primary_delta1"] == s9["h1"]["g_lang"]["estimate"]
+    old = [s9["h1"]["per_fold"][f"fold_{k}"]["delta1"] for k in range(5)]
+    assert sec["per_fold_delta1"] == pytest.approx(old, abs=1e-4)  # all findings present: equals the existing view
+    # C. the second interval sits beside the first and decides nothing
+    gl = s9["h1"]["g_lang"]
+    wb = gl["interval_within_fold_study_bootstrap"]
+    assert wb["lo"] < gl["estimate"] < wb["hi"] and wb["used_for_decisions"] is False and wb["n_boot"] == 200
+    assert {"estimate", "lo", "hi", "half_width", "bootstrap", "jackknife", "category"} <= set(gl)
+    # D. seed sensitivity
+    sd = s9["seed_sensitivity"]
+    assert sd["seeds"] == [0, 1, 2, 3, 4, 5] and sd["decision_seed"] == 0
+    assert sd["delta1_per_seed"]["seed_0"] == gl["estimate"] and sd["decision_per_seed"]["seed_0"] == gl["category"]
+    assert len(sd["delta1_per_seed"]) == 6 and sd["delta1_sd"] > 0
+    same = [sd["decision_per_seed"][f"seed_{k}"] == gl["category"] for k in range(1, 6)]
+    assert sd["seed_sensitive"] == (not all(same)) and sd["share_of_extra_seeds_same_category"] == np.mean(same)
+    signs = {np.sign(v) for v in sd["delta1_per_seed"].values()}
+    assert sd["sign_same_all_seeds"] == (len(signs) == 1)
+    rc = sd["seed0_refit_check"]
+    assert rc["reproduces_stage_a"] is False  # the synthetic units are not real refits
+    assert rc["refit_device"] == "cpu" and rc["tolerance"] == 1e-3 and rc["delta1_gap"] > 0
+    assert rc["delta1_gap"] == pytest.approx(abs(rc["delta1_of_refit"] - gl["estimate"]), abs=2e-4)
+    assert isinstance(rc["delta1_gap_within_seed_sd"], bool)
+    # F. average precision and the triage confusion matrix
+    ap = s9["average_precision"]
+    assert 0.2 < ap["prevalence_weighted"] < ap["chance"] < 0.45  # a random ranking beats the plain prevalence
+    assert ap["models"]["dinov2_vits14"]["macro_ap"] > ap["models"]["convnext_tiny"]["macro_ap"] > ap["chance"]
+    assert len(ap["chance_per_finding"]) == 12 and s9["baselines"]["rows"]["b0_chance"]["macro_ap"] == ap["chance"]
+    assert s9["baselines"]["same_studies_and_folds_for_every_row"] is True and s9["baselines"]["incomplete_rows"] == []
+    assert len(ap["models"]["floor_a"]["per_finding"]) == 12
+    tr = s9["triage"]["models"]["dinov2_vits14"]
+    assert set(tr["confusion"]) == {"tp", "fp", "fn", "tn"} and all(v == "<5" or v % 5 == 0 for v in tr["confusion"].values())
+    assert {"sensitivity", "specificity", "precision", "f1", "normal_studies_moved_back_share"} <= set(tr)
+    # E. the baselines table: one structure, the same studies and folds for every row
+    rows = s9["baselines"]["rows"]
+    assert list(rows)[:2] == ["b0_chance", "b1_scanner_tags"] and rows["b0_chance"]["s2_macro_auc"]["estimate"] == 0.5
+    for e in ("convnext_tiny", "vit_s16", "dinov2_vits14"):
+        for name in (f"b2_default_{e}", f"b2_default_fixed_{e}", f"tuned_{e}"):
+            assert rows[name]["complete"], name
+            assert {"estimate", "lo", "hi"} <= set(rows[name]["s2_macro_auc"]) and rows[name]["macro_ap"] is not None
+            assert rows[name]["gold58_macro_auc"] is not None
+        t = rows[f"tuned_{e}"]
+        assert t["s2_macro_auc"]["estimate"] == s9["s2"][e]["fold_stratified_macro_auc"]
+        assert t["mean_of_fold_macros"] == s9["s2"][e]["mean_of_fold_macros"]
+        assert t["gain_over_b1"] == pytest.approx(t["s2_macro_auc"]["estimate"] - s9["h3"]["estimate"], abs=2e-4)
+        assert t["gain_over_own_default"]["estimate"] == pytest.approx(
+            t["s2_macro_auc"]["estimate"] - rows[f"b2_default_{e}"]["s2_macro_auc"]["estimate"], abs=2e-4)
+    assert rows["b1_scanner_tags"]["s2_macro_auc"]["estimate"] == s9["h3"]["estimate"]
+    assert rows["tuned_dinov2_vits14"]["role"] == "tuned, target model"
+    assert rows["tuned_dinov2_vits14"]["gold58_macro_auc"] == s9["s3_gold"]["macro_auc"]["dinov2_vits14"]
+    # G. HPO evidence (inner scores only)
+    hp = s9["hpo_evidence"]
+    assert set(hp["boundary"]) == {"lr", "weight_decay", "dropout", "pos_cap", "batch_size", "attn_hidden"}
+    assert len(hp["best_so_far"]["dinov2_vits14"]["mean_best_so_far"]) == 30
+    assert hp["best_so_far"]["dinov2_vits14"]["first_trial_of_final_best_median"] == 29.0
+    assert hp["hierarchy"]["vit_s16"]["per_unit"]["fold_0"] == {"l1_margin": 0.03, "l2_gain": 0.02}
+    assert len(hp["profiles"]["convnext_tiny"]["lr"]["mean_centred"]) == 6
+    # H. the probe is copied from N7
+    assert s9["near_duplicate_probe"]["cosine_above_0.98"]["pairs"] == "<5"
+    # the freeze file itself
+    saved = json.loads((paths.WORKING / "agg_results.json").read_text())
+    assert saved["baselines"]["rows"].keys() == rows.keys() and saved["chain"] == ch
+
+
+def test_secondary_faults_never_cost_the_freeze_file_or_the_base_outputs(stage_env, tmp_path, monkeypatch):
+    """Review round 2, findings 1 and 2: a failing or unsafe secondary block is recorded and skipped."""
+    import shutil
+
+    from knee.nb import n7, n9, n9x
+    from tests.synth_stage import make_units
+
+    root, facts = stage_env
+    inp = tmp_path / "input"
+    for part in ("n0", "n3", "n5"):
+        shutil.copytree(root / "input" / part, inp / part)
+    make_units(inp, strengths={"dinov2_vits14": 1.6, "convnext_tiny": 0.9})  # the two main encoders only: no N6b
+    # N7 without N6b, a reduced extras set, and one block that fails for every encoder
+    monkeypatch.setattr(paths, "WORKING", inp / "n7out")
+    seen_agg = {}
+
+    def broken(*a, **k):
+        seen_agg["base"] = json.loads((paths.WORKING / "agg_n7.json").read_text())  # already on disk
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(n7, "_default_block", broken)
+    s7 = n7.run(("dinov2_vits14", "convnext_tiny"), root=inp, device="cpu", quiet=True,
+                extras=("seeds", "defaults"), seeds=(0, 1))
+    assert set(s7["extras_errors"]) == {"dinov2_vits14.defaults", "convnext_tiny.defaults"} and s7["extras_ok"] is False
+    assert all("RuntimeError" in v and "boom" not in v for v in s7["extras_errors"].values())
+    assert s7["extras"]["convnext_tiny"] == {"seeds": [0, 1]}  # the other block still ran
+    assert "near_duplicate_probe" not in s7 and s7["leakage_assertion_passed"] is True
+    n7d = paths.WORKING / "private" / "n7"
+    assert {p.name for p in n7d.glob("*.csv")} == {f"{a}_{e}.csv" for a in ("s1", "vendor", "s2seeds")
+                                                   for e in ("dinov2_vits14", "convnext_tiny")}
+    assert seen_agg["base"]["consensus"] == s7["consensus"] and seen_agg["base"]["extras_ok"] is None
+    assert set(seen_agg["base"]["files_sha16"]) == {f"{a}_{e}.csv" for a in ("s1", "vendor")
+                                                    for e in ("dinov2_vits14", "convnext_tiny")}
+    saved7 = json.loads((paths.WORKING / "agg_n7.json").read_text())
+    assert saved7["extras_errors"] == s7["extras_errors"] and saved7["files_sha16"] == s7["files_sha16"]
+    with pytest.raises(ValueError):
+        n7.run(root=inp, device="cpu", extras=("nonsense",))
+    # N9: one block raises, one returns a small count, one returns report-like text
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "working")
+    monkeypatch.setattr(n9x, "triage", lambda c: 1 / 0)
+    monkeypatch.setattr(n9x, "hpo", lambda c: {"units": 3})
+    monkeypatch.setattr(n9x, "near_duplicate_probe", lambda c: {"note": "x" * 300})
+    s9 = n9.run(root=inp, n_boot=50, quiet=True, compare_with={"H1": "DINOv2 better", "H2": "supported", "H3": "supported"})
+    saved = json.loads((paths.WORKING / "agg_results.json").read_text())  # the freeze file exists
+    assert set(saved["secondary_errors"]) == {"triage", "hpo_evidence", "near_duplicate_probe"}
+    assert "ZeroDivisionError" in saved["secondary_errors"]["triage"] and "UnsafeSummary" in saved["secondary_errors"]["hpo_evidence"]
+    assert not {"triage", "hpo_evidence", "near_duplicate_probe"} & set(saved)
+    assert set(saved["decisions"]) == {"H1", "H2", "H3", "H4"} and saved["decisions"] == s9["decisions"]
+    assert saved["h1"]["g_lang"]["category"] == "DINOv2 better" and saved["anti_claim_1"] is None  # no control encoder
+    cmp = saved["compare_with_previous"]
+    assert cmp["same_h1_h2_h3"] == (not cmp["differs"]) and set(cmp["previous"]) == {"H1", "H2", "H3"}
+    assert cmp["differs"] == [h for h in ("H1", "H2", "H3") if cmp["previous"][h] != saved["decisions"][h]]
+    # the blocks that depend on what N7 did or did not write
+    rows = saved["baselines"]["rows"]
+    assert rows["tuned_vit_s16"]["complete"] is False and rows["b2_default_dinov2_vits14"]["complete"] is False
+    assert saved["baselines"]["same_studies_and_folds_for_every_row"] is False
+    assert "tuned_vit_s16" in saved["baselines"]["incomplete_rows"]
+    assert saved["seed_sensitivity"]["seeds"] == [0, 1] and "seed0_refit_check" in saved["seed_sensitivity"]
+    assert not [u for u in facts["uids"] if u in json.dumps(saved)]
+
+
+def test_chain_guard_refuses_units_from_other_s2_folds(stage_env, tmp_path, monkeypatch):
+    import shutil
+
+    from knee import folds as kfolds, stage, units
+    from knee.nb import n9
+    from tests.synth_stage import make_units
+
+    root, _ = stage_env
+    inp = tmp_path / "input"
+    for part in ("n0", "n3", "n5"):
+        shutil.copytree(root / "input" / part, inp / part)
+    make_units(inp)
+    fp = inp / "n3" / "private" / "n3" / "folds.csv"
+    before = stage.StageData(inp)
+    dirs = units.unit_dirs(inp)
+    assert len(dirs) == 15 and units.check_units(before, dirs)["s2_folds_match_units"]
+    # a rerun of N3 that only regroups the seen-site folds: another file hash, the same S2 hash, guard passes
+    f = pd.read_csv(fp)
+    f["s1_fold"] = f["s1_fold"].to_numpy()[::-1]
+    f.to_csv(fp, index=False)
+    after = stage.StageData(inp)
+    old = before.upstream["n3_folds"]["sha16"]
+    assert after.upstream["n3_folds"]["sha16"] != old
+    (inp / "n6a" / "agg_n6a.json").write_text(json.dumps({"upstream": {"n3_folds": {"sha16": old}}}))  # as Stage A wrote it
+    ch = units.chain_summary(after, dirs, inp)
+    assert ch["stage_a_n3_folds_sha16"] == {"n6a": old} and ch["n3_hash_same_as_stage_a"] == {"n6a": False}  # by design
+    assert ch["s2_folds_match_units"] and ch["s2_sha16"] == kfolds.s2_sha16(root / "input" / "n3" / "private" / "n3" / "folds.csv")
+    # one training study moved to another S2 fold: two units no longer match, and N9 refuses to freeze
+    i = int(np.flatnonzero((f["train"] & (f["s2_fold"] == 0)).to_numpy() & after.usable)[0])
+    f.loc[i, "s2_fold"] = 1
+    f.to_csv(fp, index=False)
+    moved = stage.StageData(inp)
+    bad = units.check_units(moved, dirs)
+    assert not bad["s2_folds_match_units"]
+    assert set(bad["mismatched_units"]) == {f"{e}_f{k}" for e in ("dinov2_vits14", "convnext_tiny", "vit_s16") for k in (0, 1)}
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "working")
+    from knee import safe_log
+
+    with pytest.raises(safe_log.StepFailed, match="ChainError"):  # fails loudly: the step, with the error type
+        n9.run(root=inp, n_boot=50, quiet=True)
+    saved = json.loads((paths.WORKING / "agg_results.json").read_text())
+    assert saved["status"] == "chain mismatch" and saved["chain"]["s2_folds_match_units"] is False
+    assert "decisions" not in saved and "h1" not in saved
 
 
 

@@ -48,6 +48,7 @@ class StageData:
         st_path = get("n0_studies", "studies.csv", n0_dir)
         n0d = st_path.parent
         folds_path = get("n3_folds", "folds.csv", n3_dir)
+        self.folds_path = folds_path
         studies = pd.read_csv(st_path).set_index(UID)
         folds = pd.read_csv(folds_path).set_index(UID)
         if need_embeddings:
