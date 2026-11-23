@@ -212,6 +212,9 @@ def test_n12_blocks_privacy_and_independent_recomputation(env, monkeypatch, capf
     assert set(saved["not_run"]) == {"label_agreement_strata", "g_vendor_strata", "missing_plane_fallback",
                                      "per_finding_x_language", "laterality"}
     assert saved["upstream"]["n0_studies"]["sha16"].startswith(env["expect"]["n0_studies"])
+    ins = saved["inputs"]
+    assert ins["n7_seed_refits_found"] is True and ins["language_column"] is True and ins["n7_device"] == "cpu"
+    assert all(len(ins["s2seeds_sha16"][e]) == 16 for e in MAIN) and ins["s2seeds_sha16"]["vit_s16"] is None
 
     # privacy: no identifier anywhere, the summary checks pass, no per-study list, nothing private written
     uids = env["facts"]["uids"]
@@ -455,14 +458,18 @@ def test_n12_a_failing_block_costs_only_itself_and_a4_says_why_it_is_skipped(env
     monkeypatch.setattr(paths, "WORKING", tmp_path / "w1")
     monkeypatch.setattr(n12, "gold_label_quality", lambda c, n_boot, seed: 1 / 0)
     monkeypatch.setattr(n12, "a3_encoder_ensemble", lambda c: {"descriptive": True, "studies": 3})  # an unsafe count
+    monkeypatch.setattr(n12, "_languages", lambda d: 1 / 0)  # the report languages cannot be read
+    monkeypatch.setattr(n12, "_inputs", lambda c: 1 / 0)
     s = n12.run(root=inp, n_boot=20, quiet=True)
     saved = json.loads((paths.WORKING / "agg_n12.json").read_text())
-    assert set(saved["errors"]) == {"gold_label_quality", "development.a3_encoder_ensemble"}
+    assert set(saved["errors"]) == {"gold_label_quality", "development.a3_encoder_ensemble", "english_group_by_language",
+                                    "inputs"}
     assert "ZeroDivisionError" in saved["errors"]["gold_label_quality"]
     assert "UnsafeSummary" in saved["errors"]["development.a3_encoder_ensemble"]
-    assert "gold_label_quality" not in saved and "a3_encoder_ensemble" not in saved["development"]
+    assert not {"gold_label_quality", "english_group_by_language", "inputs"} & set(saved)
+    assert "a3_encoder_ensemble" not in saved["development"]
     assert s["status"].startswith("ok, some blocks failed")
-    for key in ("gold_paired_check", "per_finding_table", "english_group_by_language"):
+    for key in ("gold_paired_check", "per_finding_table"):
         assert saved[key]["descriptive"] is True, key
     assert saved["per_finding_table"]["rows"]["ACL"]["label_quality"]["soft_label_auc"] is not None  # its own copy
     a4 = saved["development"]["a4_calibration"]

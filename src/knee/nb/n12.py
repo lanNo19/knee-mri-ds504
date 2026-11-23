@@ -47,6 +47,7 @@ from . import n9x
 
 MIN_EACH = 5  # positives and negatives a finding needs inside a stratum
 MIN_STUDIES = 50  # studies a stratum needs
+MIN_FINDINGS = 5  # findings a Spearman correlation across findings needs
 ENGLISH = "ENGLISH"  # report language (lingua's name) that identifies the English G-lang group
 ENCODERS = (core.DINO, core.CONV, core.VIT)
 DEV_LABEL = "development: these studies were test studies in iteration 1; likely optimistic"
@@ -271,7 +272,7 @@ def per_finding_table(c, n_boot: int, seed: int) -> dict:
     for e in models:
         x = [raw[FINDINGS[j]]["soft_label_auc"] for j in used]
         y = [auc[e][j] for j in used]
-        rho = float(spearmanr(x, y).statistic) if len(used) >= MIN_EACH and np.isfinite(y).all() else float("nan")
+        rho = float(spearmanr(x, y).statistic) if len(used) >= MIN_FINDINGS and np.isfinite(y).all() else float("nan")
         sp[e] = {"rho": core._r(rho, 3)}
     out["spearman_label_quality_vs_s2_auc"] = {
         "encoders": sp, "findings_used": [FINDINGS[j] for j in used],
@@ -529,6 +530,15 @@ def _n7_dir(root) -> Path | None:
     return None
 
 
+def _inputs(c) -> dict:
+    """Which N7 seed-refit files were read (their hashes) and whether studies.csv has the report language."""
+    n7 = c.n7_dir
+    return {"n7_seed_refits_found": n7 is not None, "n7_device": n9x._n7_device(c),
+            "s2seeds_sha16": {e: (common.sha16(n7 / f"s2seeds_{e}.csv")
+                                  if n7 is not None and (n7 / f"s2seeds_{e}.csv").exists() else None) for e in ENCODERS},
+            "language_column": "language" in pd.read_csv(Path(c.d.n0_dir) / "studies.csv", nrows=0).columns}
+
+
 def _summary_values(s: dict) -> dict:
     def get(*path):
         v = core._at(s, path)
@@ -551,7 +561,7 @@ def _summary_values(s: dict) -> dict:
                                "findings_suppressed": lq.get("findings_suppressed")},
         "spearman_label_quality_vs_s2_auc": {e: v.get("rho") for e, v in
                                              (get("per_finding_table", "spearman_label_quality_vs_s2_auc", "encoders")).items()},
-        "per_finding_rows": len(pf.get("rows") or {}) == len(FINDINGS),
+        "per_finding_table_has_12_rows": len(pf.get("rows") or {}) == len(FINDINGS),
         "english_group": {"group": eg.get("group"), "fold": eg.get("fold"), "languages_reported": eg.get("languages_reported"),
                           "languages_suppressed": eg.get("languages_suppressed"), "findings_left_out": eg.get("findings_left_out"),
                           "rows": {L: {e: [v.get("macro_auc"), v.get("lo"), v.get("hi")] for e, v in (r.get("encoders") or {}).items()}
@@ -624,16 +634,9 @@ def run(root=None, expect: dict | None = None, n_boot: int = intervals.N_BOOT, s
             gold = d.gold_rows()
             gold = gold[np.isfinite(units[core.DINO][gold]).all(axis=1) & np.isfinite(units[core.CONV][gold]).all(axis=1)]
             g_find = metrics.eligible(d.gold_y[gold], np.zeros(len(gold), int)) if len(gold) else []
-            n7 = _n7_dir(rootp)
             c = n9x.Ctx(d=d, ev=ev, Y=Y, units=units, elig=elig, n_boot=n_boot, seed=seed, root=rootp, row_of=row_of,
-                        floor=None, gold=gold, g_find=g_find, h1={}, cat_lang="not used", n7_dir=n7, dirs=dirs)
-            language = _languages(d)
+                        floor=None, gold=gold, g_find=g_find, h1={}, cat_lang="not used", n7_dir=_n7_dir(rootp), dirs=dirs)
             chain_ok = s["chain"]["s2_folds_match_units"] is True
-            s["inputs"] = {"n7_seed_refits_found": n7 is not None, "n7_device": n9x._n7_device(c),
-                           "s2seeds_sha16": {e: (common.sha16(n7 / f"s2seeds_{e}.csv")
-                                                 if n7 is not None and (n7 / f"s2seeds_{e}.csv").exists() else None)
-                                             for e in ENCODERS},
-                           "language_column": language is not None}
             errors: dict = {}
             s["errors"] = errors
 
@@ -646,10 +649,11 @@ def run(root=None, expect: dict | None = None, n_boot: int = intervals.N_BOOT, s
                 except Exception as e:  # noqa: BLE001 - descriptive blocks must not stop each other
                     errors[name] = safe_log.describe(type(e), e.__traceback__)
 
+            put("inputs", _inputs, s, "inputs")
             put("gold_paired_check", lambda c: gold_paired_check(c, n_boot, seed), s, "gold_paired_check")
             put("gold_label_quality", lambda c: gold_label_quality(c, n_boot, seed), s, "gold_label_quality")
             put("per_finding_table", lambda c: per_finding_table(c, n_boot, seed), s, "per_finding_table")
-            put("english_group_by_language", lambda c: english_group_by_language(c, language, n_boot, seed), s,
+            put("english_group_by_language", lambda c: english_group_by_language(c, _languages(c.d), n_boot, seed), s,
                 "english_group_by_language")
             s["development"] = _dev("S2 development numbers of A2, A3 and A4 (plan r2, section 5); "
                                     "never a gain over iteration 1, never in a slide title")
