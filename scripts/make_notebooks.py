@@ -49,6 +49,8 @@ NOTEBOOKS = {
     "n10": (True, True, False, ["n0", "n6a"], 32400),
     "n10-convnext": (True, True, False, ["n0", "n6a"], 32400),
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
+    # N12 (plan r2, error analysis; RUNBOOK "Error analysis N12"): CPU, descriptive, existing outputs only
+    "n12": (False, False, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 3600),
 }
 
 
@@ -100,6 +102,8 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return 'from knee.nb import n10; n10.run("dinov2_vits14")'
     if name == "n10-convnext":
         return 'from knee.nb import n10; n10.run("convnext_tiny")'
+    if name == "n12":
+        return f"from knee.nb import n12; n12.run(expect={EXPECT})"
     raise KeyError(name)
 
 
