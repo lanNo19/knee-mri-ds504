@@ -169,7 +169,7 @@ New fields in agg_results.json (the summary block shows chain, seed_sensitive, s
 | seed_sensitivity.share_of_extra_seeds_same_category | share of seeds 1-5 whose category equals seed 0's (the "k of 5" on the slide) |
 | seed_sensitivity.sign_same_all_seeds | true = Delta1 has the same sign in all six seeds |
 | seed_sensitivity.macro_auc_per_seed | S2 macro AUC of each main encoder per seed |
-| seed_sensitivity.seed0_refit_check | N7's seed-0 refit against Stage A's stored predictions: refit_device, tolerance, max_abs_probability_gap, delta1_of_refit, delta1_gap, reproduces_stage_a (gap within tolerance; expected on a GPU), delta1_gap_within_seed_sd (the reading on CPU) |
+| seed_sensitivity.seed0_refit_check | N7's seed-0 refit against Stage A's stored predictions: refit_device, tolerance, max_abs_probability_gap, delta1_of_refit, delta1_gap, reproduces_stage_a (gap within tolerance; expected on a GPU), delta1_gap_within_seed_sd (on CPU this is false in about half of healthy runs, because the gap is a difference of two draws; worry only if delta1_gap is above 3 times delta1_sd) |
 | compare_with_previous | only with compare_with: the earlier H1-H3, same_h1_h2_h3 and the list that differs |
 | triage.models.<encoder>.confusion | pooled confusion matrix (tp, fp, fn, tn; rounded to 5) for "any finding" at the 95%-sensitivity threshold from inner out-of-fold predictions |
 | triage.models.<encoder>.sensitivity, specificity, precision, f1 | rates from the exact counts (2 decimals; the rounded matrix will not reproduce them exactly); null when a cell the rate uses holds 1 to 4 studies |
