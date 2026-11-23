@@ -346,12 +346,16 @@ def add_all(s: dict, c: Ctx) -> None:
 
     Nothing here may cost the primary results: a block that raises, returns an unsafe value or has no
     place to go is recorded under secondary_errors; so is knee.nb.n9c when it cannot be imported.
-    The n9c blocks get a deep copy of the summary. n9.run wrote the freeze file before this call and
-    checks H1, H2, H3 and the decisions after it."""
+    The n9c blocks get a deep copy of the summary, and every block a fresh copy of H1 and H2.
+    n9.run wrote the freeze file before this call and checks after it that nothing written before it
+    changed (n9._restore_earlier)."""
     errors = s.setdefault("secondary_errors", {})
+    h1_0, h2_0 = copy.deepcopy(c.h1), copy.deepcopy(c.h2)
 
     def put(name: str, fn, where, key: str) -> None:
         try:
+            # every block sees H1 and H2 as decided, whatever an earlier block did to its copy
+            c.h1, c.h2 = copy.deepcopy(h1_0), copy.deepcopy(h2_0)
             val = fn()
             # the same check agg.write applies to the whole file: an unsafe value (a small count, a
             # data-like string) costs this block only, never the decisions

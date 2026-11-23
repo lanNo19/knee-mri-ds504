@@ -37,6 +37,7 @@ work on copies, and H1, H2, H3 and the decisions are compared with a snapshot af
 from __future__ import annotations
 
 import copy
+import decimal
 import json
 import time
 from pathlib import Path
@@ -148,6 +149,39 @@ def _same(a, b) -> bool:
     return text(a) == text(b)
 
 
+def _restore_earlier(s: dict, before: dict, snapshot: dict) -> bool:
+    """True if a secondary block changed anything the primary pass had written: H1, H2, H3 and the
+    decisions (see _restore_primary) or any other key that was in the summary before the blocks ran
+    (before = a deep copy taken then). Each is put back. New top-level keys are what the blocks are
+    for and stay. Never raises."""
+    changed = _restore_primary(s, snapshot)
+    for k, v in before.items():
+        if k in PRIMARY or k == "secondary_errors":
+            continue
+        try:
+            same = k in s and _same(s[k], v)
+        except Exception:  # noqa: BLE001 - not even comparable: it was changed
+            same = False
+        if not same:
+            s[k] = copy.deepcopy(v)
+            changed = True
+    return changed
+
+
+def _write_final(s: dict, before: dict) -> None:
+    """The second write of the freeze file, with the secondary blocks. If it fails, the file keeps the
+    primary results only (before), and says why; whether a block had changed them is kept."""
+    try:
+        agg.write("results", s)
+    except Exception as e:  # noqa: BLE001 - the secondary blocks made the file unwritable: keep the primary one
+        mutated = s.get("secondary_mutated_primary")
+        s.clear()
+        s.update(copy.deepcopy(before))
+        s["secondary_errors"] = {"final_write": safe_log.describe(type(e), e.__traceback__)}
+        s["secondary_mutated_primary"] = mutated if isinstance(mutated, bool) else None
+        agg.write("results", s)
+
+
 def _restore_primary(s: dict, snapshot: dict) -> bool:
     """True if a secondary block changed H1, H2, H3 or the decisions. They are then put back from the
     snapshot taken before the blocks; the keys the blocks may add inside them are kept. Never raises."""
@@ -171,9 +205,13 @@ def _restore_primary(s: dict, snapshot: dict) -> bool:
 
 def _decimals(x) -> int:
     """Decimals of an expected number as it was supplied: "-0.0530" has 4, "-0.056" has 3 (a float
-    loses trailing zeros, so pass strings). At most 4, the precision of the freeze file."""
-    text = str(x).strip()
-    return min(MAX_DECIMALS, len(text.split(".")[1]) if "." in text else 0)
+    loses trailing zeros, so pass strings); "1e-3" has 3. At most 4, the precision of the freeze file.
+    Unreadable input gives 0 (the comparison itself then reports it)."""
+    try:
+        exp = decimal.Decimal(str(x).strip()).as_tuple().exponent
+    except (decimal.InvalidOperation, ValueError, TypeError):
+        return 0
+    return min(MAX_DECIMALS, max(0, -exp)) if isinstance(exp, int) else 0
 
 
 def primary_matches(s: dict, expect_primary: dict) -> dict:
@@ -182,13 +220,15 @@ def primary_matches(s: dict, expect_primary: dict) -> dict:
     expect_primary: {"delta1_g_lang" | "delta1_g_vendor" | "delta2" | "h3": [estimate, lo, hi]} (or a
     dict with those three keys). Each number is compared at the number of decimals it was supplied
     with (at most 4): it matches when the freeze file's value is within half a unit of that last
-    decimal. Result: one boolean per number and all_match. It reports; it never raises and it
-    changes nothing."""
-    out: dict = {"numbers": {}, "compared_at_decimals": {}, "unknown_keys": []}
+    decimal. Result: one boolean per number, complete_card (all four names with all three parts were
+    supplied) and all_match (complete_card and every number matches). An unknown name is only
+    marked as present (unknown_keys_present), never echoed: the file may not carry arbitrary text.
+    It reports; it never raises and it changes nothing."""
+    out: dict = {"numbers": {}, "compared_at_decimals": {}, "unknown_keys_present": False}
     try:
         for name, exp in expect_primary.items():
             if name not in PRIMARY_NUMBERS:
-                out["unknown_keys"].append(str(name)[:40])
+                out["unknown_keys_present"] = True
                 continue
             block = _at(s, PRIMARY_NUMBERS[name]) or {}
             exp = exp if isinstance(exp, dict) else dict(zip(("estimate", "lo", "hi"), exp))
@@ -206,9 +246,12 @@ def primary_matches(s: dict, expect_primary: dict) -> dict:
             out["numbers"][name] = flags
             out["compared_at_decimals"][name] = ", ".join(decs)
         every = [v for f in out["numbers"].values() for v in f.values()]
-        out["all_match"] = bool(every) and all(every) and not out["unknown_keys"]
+        out["complete_card"] = (set(out["numbers"]) == set(PRIMARY_NUMBERS)
+                                and all(set(f) == {"estimate", "lo", "hi"} for f in out["numbers"].values()))
+        out["all_match"] = bool(every) and all(every) and out["complete_card"] and not out["unknown_keys_present"]
     except Exception as e:  # noqa: BLE001 - a comparison aid must never cost the freeze file
         out["all_match"] = False
+        out["complete_card"] = False
         out["error"] = safe_log.describe(type(e), e.__traceback__)
     return out
 
@@ -524,15 +567,8 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                 if not isinstance(s.get("secondary_errors"), dict):
                     s["secondary_errors"] = {}
                 s["secondary_errors"]["n9x"] = safe_log.describe(type(e), e.__traceback__)
-            s["secondary_mutated_primary"] = _restore_primary(s, snapshot)
-            try:
-                agg.write("results", s)
-            except Exception as e:  # noqa: BLE001 - the secondary blocks made the file unwritable: keep the primary one
-                s.clear()
-                s.update(primary_only)
-                s["secondary_errors"] = {"final_write": safe_log.describe(type(e), e.__traceback__)}
-                s["secondary_mutated_primary"] = False
-                agg.write("results", s)
+            s["secondary_mutated_primary"] = _restore_earlier(s, primary_only, snapshot)
+            _write_final(s, primary_only)
     common.summary({"decisions": s.get("decisions"), "main_complete": s.get("main_complete"),
                     "controls_ok": (s.get("controls") or {}).get("all_leakage_assertions_passed"),
                     "findings_match_pilot": s.get("findings", {}).get("matches_pilot"),

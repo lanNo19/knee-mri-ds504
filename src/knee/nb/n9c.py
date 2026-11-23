@@ -5,11 +5,11 @@ private/n7/{s1,vendor,s2seeds,default,default_fixed}_<encoder>.csv, triage_thres
 agg_n7.json, and each unit's predictions.csv, trials.csv, l1.csv, config.json. No block fits a
 model. Each runs under n9x.add_all's wrapper, so a failure costs that block only. Each block
 carries `descriptive: true` and a one-line `scope`; none changes a decision or an existing key.
-Each block gets a deep copy of the summary, and n9.run checks afterwards that H1, H2, H3 and the
-decisions are what they were (see n9._restore_primary).
+Each block gets a deep copy of the summary, and n9.run checks afterwards that H1, H2, H3, the
+decisions and every other key written before the blocks are what they were (see n9._restore_earlier).
 
   baselines.same_device_gain        tuned minus default, both refit by N7 on N7's device
-  refit_agreement                   N7's seed-0 refit against Stage A's fit, with a seed-1 yardstick
+  refit_agreement                   N7's seed-0 refit against Stage A's fit; yardstick: N7 seed pairs
   triage_secondary                  any-finding AUC, specificity interval, threshold overshoot
   largest_site_decomposition        the largest site: unseen (S2) against seen (S1) at equal and larger training size
   best_epoch_spread                 inner best epochs, and the learning rate reached at E
@@ -30,7 +30,7 @@ from . import n9 as core
 from . import n9x
 
 LOOKALIKE_COSINE = 0.90
-GAP_FACTOR = 1.5  # refit_agreement: the Stage A gap may be at most this many times the seed-0-to-seed-1 gap
+GAP_FACTOR = 1.5  # refit_agreement: the Stage A gap may be at most this many times the median gap between two N7 seeds
 TARGET_SENSITIVITY = 0.95
 MIN_N_FOR_INTERVAL = 20  # triage: no Wilson interval from fewer studies (it would give the exact count back)
 N_DRAWS = 2000  # study bootstraps for the descriptive standard errors
@@ -127,8 +127,8 @@ def refit_agreement(c, s) -> dict:
     preds = {e: n9x._seed_predictions(c, e) for e in (core.DINO, core.CONV)}
     seeds = sorted(sd for sd in set(preds[core.DINO]) & set(preds[core.CONV])
                    if c.complete(preds[core.DINO][sd]) and c.complete(preds[core.CONV][sd]))
-    if 0 not in seeds or 1 not in seeds:
-        return {"descriptive": True, "status": "not available (N7 wrote no seed 0 and seed 1 refits)"}
+    if 0 not in seeds or len(seeds) < 2:
+        return {"descriptive": True, "status": "not available (N7 wrote no seed-0 refit, or fewer than two seeds)"}
     out = {"descriptive": True,
            "scope": "N7's refits against Stage A's stored predictions; a check of the refit, decides nothing",
            "factor": GAP_FACTOR, "flag_is": "a rule of thumb (factor chosen after the results), not a test",

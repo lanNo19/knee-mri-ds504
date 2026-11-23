@@ -167,7 +167,8 @@ def test_primary_numbers_are_compared_at_the_decimals_supplied():
     card = {"delta1_g_lang": ["-0.0213", "-0.0530", "+0.0105"], "delta1_g_vendor": ["-0.0173", "-0.056", "+0.022"],
             "delta2": ["+0.0142", "-0.006", "+0.034"], "h3": ["0.506", "0.490", "0.517"]}
     m = n9.primary_matches(s, card)
-    assert m["all_match"] is True and m["unknown_keys"] == [] and "error" not in m
+    assert m["all_match"] is True and m["complete_card"] is True and m["unknown_keys_present"] is False
+    assert "error" not in m
     assert m["numbers"]["delta1_g_vendor"] == {"estimate": True, "lo": True, "hi": True}
     assert m["compared_at_decimals"] == {"delta1_g_lang": "4, 4, 4", "delta1_g_vendor": "4, 3, 3",
                                          "delta2": "4, 3, 3", "h3": "3, 3, 3"}
@@ -185,7 +186,21 @@ def test_primary_numbers_are_compared_at_the_decimals_supplied():
     for bad in ({"h3": ["x", None, "0.5"]}, {"nonsense": [1, 2, 3]}, {"h3": 7}, {}):
         r = n9.primary_matches(s, bad)
         assert r["all_match"] is False
-    assert n9.primary_matches(s, {"nonsense": [1, 2, 3]})["unknown_keys"] == ["nonsense"]
+    # review r2, N1: an incomplete card can never pass, even when every number it has matches
+    short = {k: v for k, v in card.items() if k != "h3"}
+    r = n9.primary_matches(s, short)
+    assert r["complete_card"] is False and r["all_match"] is False and all(v for f in r["numbers"].values() for v in f.values())
+    r = n9.primary_matches(s, {**card, "h3": ["0.506", "0.490"]})
+    assert r["complete_card"] is False and r["all_match"] is False
+    # review r2, N2: an unknown name is marked, never echoed; a UID-like one cannot make the file unwritable
+    uid_like = "1.2.840.113619.2.55.3"
+    r = n9.primary_matches(s, {**card, uid_like: ["0", "0", "0"]})
+    assert r["unknown_keys_present"] is True and r["all_match"] is False and uid_like not in json.dumps(r)
+    agg._check(json.loads(json.dumps(r)))
+    assert n9.primary_matches(s, {"nonsense": [1, 2, 3]})["unknown_keys_present"] is True
+    # review r2, N6: exponent notation and unreadable input
+    assert n9._decimals("1e-3") == 3 and n9._decimals("5e-05") == 4 and n9._decimals("-0.0530") == 4
+    assert n9._decimals("x") == 0 and n9._decimals(None) == 0 and n9._decimals("nan") == 0 and n9._decimals("2") == 0
 
 
 def test_a_changed_primary_block_is_put_back_from_the_snapshot():
@@ -216,6 +231,68 @@ def test_a_changed_primary_block_is_put_back_from_the_snapshot():
         assert n9._restore_primary(s, snap) is False
     s["h1"]["g_lang"] = object()  # not even comparable: put back, without raising
     assert n9._restore_primary(s, snap) is True and n9._primary_view(s) == snap
+
+
+def test_every_key_written_before_the_blocks_is_put_back_and_a_failed_final_write_keeps_the_flag(monkeypatch):
+    """Review r2, N3 and N5."""
+    import copy
+
+    from knee.nb import n9
+
+    s = {"h1": {"g_lang": {"estimate": 0.01}, "decision": "inconclusive"}, "h2": {"estimate": 0.02},
+         "h3": {"estimate": 0.5}, "decisions": {"H1": "inconclusive"}, "s2": {"x": 1.0}, "chain": {"ok": True}}
+    before, snap = copy.deepcopy(s), n9._primary_view(s)
+    s["average_precision"] = {"a": 0.5}  # a new key: what the blocks are for
+    assert n9._restore_earlier(s, before, snap) is False and s["average_precision"] == {"a": 0.5}
+    for change in (lambda s: s.update(s2={"x": 9.0}), lambda s: s["chain"].update(extra=True), lambda s: s.pop("chain"),
+                   lambda s: s.update(chain=object())):
+        change(s)
+        assert n9._restore_earlier(s, before, snap) is True
+        assert s["s2"] == {"x": 1.0} and s["chain"] == {"ok": True} and s["average_precision"] == {"a": 0.5}
+    s["decisions"]["H1"] = "DINOv2 better"
+    assert n9._restore_earlier(s, before, snap) is True and s["decisions"]["H1"] == "inconclusive"
+
+    # the second write fails: the file gets the primary results, and the detected change is not hidden
+    written = []
+
+    def write(name, payload):
+        if not written and "average_precision" in payload:
+            written.append("refused")
+            raise RuntimeError("cannot write")
+        written.append(copy.deepcopy(payload))
+
+    monkeypatch.setattr(n9.agg, "write", write)
+    s["secondary_mutated_primary"] = True
+    n9._write_final(s, before)
+    assert written[0] == "refused" and "average_precision" not in written[1]
+    assert written[1]["secondary_mutated_primary"] is True and "RuntimeError" in written[1]["secondary_errors"]["final_write"]
+    assert written[1]["s2"] == {"x": 1.0} and written[1]["decisions"] == {"H1": "inconclusive"}
+
+
+def test_each_block_sees_h1_and_h2_as_decided(monkeypatch):
+    """Review r2, N4: a block that writes into its H1 or H2 copy changes nothing a later block reads."""
+    from knee.nb import n9c, n9x
+
+    seen = {}
+
+    def spoil(c, s):
+        c.h1["estimate"], c.h2["estimate"] = 9.0, 9.0
+        return {"descriptive": True}
+
+    def read(c, s):
+        seen["h1"], seen["h2"] = c.h1["estimate"], c.h2["estimate"]
+        return {"descriptive": True}
+
+    for name in ("per_fold_delta1", "study_bootstrap", "average_precision", "seed_sensitivity", "triage", "baselines",
+                 "hpo", "near_duplicate_probe"):
+        monkeypatch.setattr(n9x, name, lambda c: {"descriptive": True})
+    monkeypatch.setattr(n9c, "BLOCKS", [("spoil", spoil, lambda s: s, "spoil"), ("read", read, lambda s: s, "read")])
+    c = n9x.Ctx(d=None, ev=np.arange(3), Y=None, units={}, elig=[], n_boot=10, seed=0, root=None, row_of={}, floor=None,
+                gold=np.arange(0), g_find=[], h1={"estimate": 0.1}, cat_lang="inconclusive", n7_dir=None,
+                h2={"estimate": 0.2})
+    s = {"h1": {"g_lang": {}}, "decisions": {"H1": "inconclusive"}}
+    n9x.add_all(s, c)
+    assert seen == {"h1": 0.1, "h2": 0.2} and s["secondary_errors"] == {} and "read" in s and "spoil" in s
 
 
 # ---------------------------------------------------------------- the second interval
