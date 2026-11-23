@@ -37,6 +37,7 @@ STRUCTURAL = {
     "workers", "repeat", "per_study", "planes", "n_tables", "budget_h", "n_tables_used",
     "min_support_per_language", "margin_mm", "inner_folds", "E", "epoch", "epochs",
     "seeds", "n_bins", "n_trials",
+    "patience", "schedule_epochs",  # training settings (iteration 2), never counts of studies
 }
 UID_RE = re.compile(r"\d+(\.\d+){4,}")
 MAX_STR = 200

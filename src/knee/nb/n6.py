@@ -55,8 +55,18 @@ def space_defaults(U: float, gated: bool) -> dict:
     return d
 
 
-def suggest(trial, U: float, gated: bool) -> dict:
-    """The plan's L2 space (log scale where marked)."""
+SETTINGS = ("lr", "weight_decay", "dropout", "pos_cap", "batch_size", "attn_hidden")  # suggest()'s order
+INT_SETTINGS = ("batch_size", "attn_hidden")
+
+
+def suggest(trial, U: float, gated: bool, overrides: dict | None = None) -> dict:
+    """The plan's L2 space (log scale where marked). overrides (iteration 3, A7; None = the registered
+    space, drawn by the unchanged code below): {setting: [low, high]}, see space()."""
+    if overrides:
+        sp = space(U, gated, overrides)
+        return {k: (trial.suggest_int(k, int(sp[k][0]), int(sp[k][1]), log=sp[k][2]) if k in INT_SETTINGS
+                    else trial.suggest_float(k, float(sp[k][0]), float(sp[k][1]), log=sp[k][2]))
+                for k in SETTINGS if k in sp}
     p = {
         "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
@@ -69,13 +79,46 @@ def suggest(trial, U: float, gated: bool) -> dict:
     return p
 
 
-def space(U: float, gated: bool) -> dict:
-    """{setting: (low, high, log scale)} exactly as suggest() draws it (read by the descriptive HPO evidence)."""
+def space(U: float, gated: bool, overrides: dict | None = None) -> dict:
+    """{setting: (low, high, log scale)} exactly as suggest() draws it (read by the descriptive HPO evidence).
+    overrides: {setting: [low, high]} replaces that setting's range and keeps its scale (attn_hidden
+    applies to gated pooling only). None = the registered space."""
     sp = {"lr": (1e-5, 1e-2, True), "weight_decay": (1e-6, 1e-1, True), "dropout": (0.0, 0.5, False),
           "pos_cap": (1.0, float(U), True), "batch_size": (16, 128, True)}
     if gated:
         sp["attn_hidden"] = (64, 512, True)
+    for k, (lo, hi) in (check_space_overrides(overrides) or {}).items():
+        if k in sp:
+            sp[k] = (lo, hi, sp[k][2])
     return sp
+
+
+def check_space_overrides(overrides: dict | None) -> dict | None:
+    """Checked copy of search-range overrides, {setting: [low, high]} in suggest()'s order (None if none).
+
+    Fails at once (before any fit) on an unknown setting, a range that is not low < high, a log-scale
+    low of 0 or less, a non-integer bound for an integer setting, or a value the summary checks refuse."""
+    if not overrides:
+        return None
+    unknown = [k for k in overrides if k not in SETTINGS]
+    if unknown:
+        raise ValueError("space_overrides: unknown setting")
+    out = {}
+    for k in SETTINGS:
+        if k not in overrides:
+            continue
+        lo, hi = overrides[k]
+        if k in INT_SETTINGS:
+            if int(lo) != lo or int(hi) != hi:
+                raise ValueError("space_overrides: an integer setting needs integer bounds")
+            lo, hi = int(lo), int(hi)
+        else:
+            lo, hi = float(lo), float(hi)
+        if not lo < hi or (k != "dropout" and lo <= 0) or (k == "dropout" and not 0 <= lo < hi < 1):
+            raise ValueError("space_overrides: invalid range")
+        out[k] = [lo, hi]
+    agg._check({"space_overrides": out})  # recorded in each unit's summary: refuse it now, not after the fits
+    return out
 
 
 # ---------------------------------------------------------------- workers
@@ -100,6 +143,18 @@ def _init(counter, n_gpus: int, root, expect, shared=None):
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _device_name(dev: str) -> str:
+    """The GPU model of a cuda device (e.g. "Tesla T4"), else "cpu" (the keep rules pair arms on one device type)."""
+    if not str(dev).startswith("cuda"):
+        return "cpu"
+    try:
+        import torch
+
+        return str(torch.cuda.get_device_name(torch.device(dev)))
+    except Exception:  # noqa: BLE001 - descriptive only
+        return "unknown"
 
 
 def _data():
@@ -210,6 +265,10 @@ def _unit(task: dict, od: Path) -> dict:
     if mode == "skipped":
         return {"task": task["id"], "ok": False, "skipped": True, "mode": mode}
     enc, k, seed, elig = task["encoder"], task["fold"], task["seed"], task["eligible"]
+    # iteration 2 (N13): schedule length, patience and search ranges; None = the registered 30, 5 and space
+    sched_epochs = task.get("schedule_epochs")
+    patience = heads.PATIENCE if task.get("patience") is None else int(task["patience"])
+    overrides = task.get("space_overrides")
     d, bank = _data(), _bank(enc)
     od.mkdir(parents=True, exist_ok=True)
     tr, te, _ = d.split(k)
@@ -227,7 +286,8 @@ def _unit(task: dict, od: Path) -> dict:
         for j in folds_in:
             itr = tr[inner[tr] != j]
             iva = tr[(inner[tr] == j) & d.scored[tr]]
-            r = heads.fit(bank, cfg, itr, iva, elig, stats=stats, forbidden=forbid, seed=seed + j)
+            r = heads.fit(bank, cfg, itr, iva, elig, stats=stats, forbidden=forbid, seed=seed + j,
+                          patience=patience, schedule_epochs=sched_epochs)
             n_fits += 1
             sc.append(r.best_score)
             eps.append(r.best_epoch)
@@ -265,7 +325,7 @@ def _unit(task: dict, od: Path) -> dict:
         study.enqueue_trial(space_defaults(U, gated))
 
         def objective(trial):
-            cfg = replace(win_cfg, **suggest(trial, U, gated))
+            cfg = replace(win_cfg, **suggest(trial, U, gated, overrides))
             m, eps = score(cfg)
             trial.set_user_attr("best_epochs", [int(e) for e in eps])
             return m
@@ -282,8 +342,8 @@ def _unit(task: dict, od: Path) -> dict:
         E = max(1, int(np.median(best.user_attrs["best_epochs"])))
         default_score = round(float(study.trials[0].value), 4) if study.trials[0].value is not None else None
 
-    # Refit on the outer training set, then the test fold and its gold studies
-    r = heads.fit(bank, cfg_best, tr, epochs=E, stats=stats, forbidden=forbid, seed=0)
+    # Refit on the outer training set, then the test fold and its gold studies (E epochs of the same schedule)
+    r = heads.fit(bank, cfg_best, tr, epochs=E, stats=stats, forbidden=forbid, seed=0, schedule_epochs=sched_epochs)
     rows_out = np.concatenate([te, gold_k])
     P = heads.predict(bank, r.model, rows_out, cfg_best, stats)
     pred = pd.DataFrame(P, columns=FINDINGS)
@@ -303,7 +363,11 @@ def _unit(task: dict, od: Path) -> dict:
                "refit_steps": int(E * int(np.ceil(len(tr) / max(1, int(cfg_best.batch_size))))),
                "default_trial_score": default_score,
                "inner_k": len(folds_in), "seconds": round(time.time() - t0, 1),
-               "predictions_sha16": common.sha16(od / "predictions.csv")}
+               "predictions_sha16": common.sha16(od / "predictions.csv"),
+               # the values used (registered: 30, 5, the plan's space); seed: inner fit j used seed + j, the refit 0
+               "schedule_epochs": heads.MAX_EPOCHS if sched_epochs is None else int(sched_epochs),
+               "patience": patience, "space_overrides": overrides, "seed": seed,
+               "device": _W["device"], "device_name": _device_name(_W["device"])}
     (od / "config.json").write_text(json.dumps(summary, indent=1))
     _signal_fold0(task, "done")
     shared = _W.get("shared")
@@ -408,18 +472,39 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
         folds: tuple[int, ...] | None = None, demo: bool = False, root=None, expect: dict | None = None,
         workers: int = 4, seed: int = 0, budget_h: float = 8.0, quiet: bool = True,
         mode: str = "nested", backstop_utc: str | None = None, unit_hours_est: float | None = None,
-        n_trials: int | None = None, l1_grid: list | None = None, demo_epochs: int | None = None) -> dict:
+        n_trials: int | None = None, l1_grid: list | None = None, demo_epochs: int | None = None,
+        schedule_epochs: int | None = None, patience: int | None = None, space_overrides: dict | None = None,
+        overrides_reason: str | None = None) -> dict:
     """name: n6a (DINOv2 and ConvNeXt-T) or n6b (ViT-S/16 and the demo); folds=(0,) for the one-unit smoke.
     mode: "nested" (the plan) or "simplified" (the pilot projected N6a above 6 h; labelled "not nested").
     backstop_utc: the backstop as UTC, e.g. "2026-11-24T03:00:00Z" (Tue 08:00 Almaty): a fold whose units
     are projected to finish after it runs simplified, for both encoders together. unit_hours_est: the
     pilot's unit projection, used until a unit has finished. Units are queued fold by fold, and a fold
     not started by 0.75 x budget_h is skipped for every encoder (never one encoder alone).
-    n_trials, l1_grid and demo_epochs exist for tests only (the plan fixes 30, the 9-config grid and 900)."""
+    n_trials, l1_grid and demo_epochs exist for tests and for N13 (the plan fixes 30, the 9-config grid
+    and 900). Iteration 2 (N13, plan r2) also sets, for every inner fit and the refit of every unit:
+    schedule_epochs (cosine schedule length; None = 30) and patience (None = 5), and for the L2 search
+    space_overrides ({setting: [low, high]}; None = the registered space). The demo keeps the registered
+    schedule and space. Any of these marks run.json with test_overrides true; overrides_reason is a
+    one-line reason recorded beside it. With none of them the run is the registered one, bit for bit."""
+    if schedule_epochs is not None and (int(schedule_epochs) != schedule_epochs or schedule_epochs < 1):
+        raise ValueError("schedule_epochs must be a whole number of epochs, at least 1")
+    if patience is not None and (int(patience) != patience or patience < 1):
+        raise ValueError("patience must be a whole number of epochs, at least 1")
+    if overrides_reason is not None and (not isinstance(overrides_reason, str) or "\n" in overrides_reason):
+        raise ValueError("overrides_reason must be one line of text")
+    overrides = check_space_overrides(space_overrides)
     s: dict = {}
     cfg = {"name": name, "encoders": list(encoders), "folds": list(folds) if folds else None, "demo": demo,
            "workers": workers, "seed": seed, "budget_h": budget_h, "mode": mode, "backstop_utc": backstop_utc,
-           "unit_hours_est": unit_hours_est, "test_overrides": bool(n_trials or l1_grid or demo_epochs)}
+           "unit_hours_est": unit_hours_est,
+           "test_overrides": bool(n_trials or l1_grid or demo_epochs or schedule_epochs is not None
+                                  or patience is not None or overrides)}
+    # the iteration-2 arguments, recorded only when given: a call without them writes the same run.json config
+    for key, val in (("schedule_epochs", schedule_epochs), ("patience", patience), ("space_overrides", overrides),
+                     ("test_overrides_reason", overrides_reason)):
+        if val is not None:
+            cfg[key] = val
     with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
         import torch
 
@@ -438,7 +523,11 @@ def run(name: str = "n6a", encoders: tuple[str, ...] = ("dinov2_vits14", "convne
             base_task = {"seed": seed, "eligible": elig, "soft_stop": t0 + 0.75 * budget_h * 3600,
                          "backstop": _deadline_epoch(backstop_utc), "mode": mode,
                          "unit_s_est": unit_hours_est * 3600 if unit_hours_est else None,
-                         "n_trials": n_trials, "l1_grid": l1_grid}
+                         "n_trials": n_trials, "l1_grid": l1_grid,
+                         # reach every spawned worker in the task (None = the registered values)
+                         "schedule_epochs": int(schedule_epochs) if schedule_epochs is not None else None,
+                         "patience": int(patience) if patience is not None else None,
+                         "space_overrides": overrides}
             # fold by fold, so both encoders of a fold start (and are switched or skipped) together
             tasks = [{**base_task, "id": f"{e}_f{k}", "encoder": e, "fold": k, "dir": str(od / "units" / f"{e}_f{k}"),
                       "fold0_in_run": 0 in fold_list}

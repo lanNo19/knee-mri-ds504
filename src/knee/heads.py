@@ -8,6 +8,8 @@ where pilkwang says UNK, 0 where masked) and a positive weight per finding
 AdamW (0.9/0.999, eps 1e-8); 1 epoch linear warm-up, then cosine to 0 over a
 30-epoch schedule. Inner fits stop early after 5 epochs without a gain in the
 inner validation macro AUC; refits run exactly E epochs of the same schedule.
+The schedule length and the patience can be set per fit (fit's schedule_epochs and
+patience, iteration 2); the defaults are the registered 30 and 5, bit for bit.
 Features are z-scored with statistics from the outer training set only.
 Embeddings stay on the GPU; there is no DataLoader.
 
@@ -232,11 +234,12 @@ def predict(bank: Bank, model, idx, cfg: Config, stats: dict, use_flip: bool = T
     return out
 
 
-def schedule_factor(step: int, steps_per_epoch: int) -> float:
+def schedule_factor(step: int, steps_per_epoch: int, schedule_epochs: int | None = None) -> float:
     """The learning rate at optimiser step `step` (from 0) as a fraction of its peak: linear warm-up
-    over WARMUP_EPOCHS, then a cosine to 0 at the end of the MAX_EPOCHS schedule. fit() uses exactly
-    this, so a refit stopped at E epochs ends at schedule_factor(E * steps_per_epoch - 1, ...)."""
-    total = MAX_EPOCHS * steps_per_epoch
+    over WARMUP_EPOCHS, then a cosine to 0 at the end of a schedule of `schedule_epochs` epochs
+    (None: MAX_EPOCHS, the registered 30). fit() uses exactly this, so a refit stopped at E epochs
+    ends at schedule_factor(E * steps_per_epoch - 1, ...)."""
+    total = (MAX_EPOCHS if schedule_epochs is None else int(schedule_epochs)) * steps_per_epoch
     warm = WARMUP_EPOCHS * steps_per_epoch
     if step < warm:
         return (step + 1) / warm
@@ -244,18 +247,27 @@ def schedule_factor(step: int, steps_per_epoch: int) -> float:
 
 
 def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs: int | None = None,
-        seed: int = 0, stats: dict | None = None, forbidden=None, max_epochs: int = MAX_EPOCHS,
+        seed: int = 0, stats: dict | None = None, forbidden=None, max_epochs: int | None = None,
         patience: int | None = PATIENCE, on_epoch=None, steps: int | None = None,
-        schedule_steps_per_epoch: int | None = None) -> FitResult:
-    """Inner fit (val_idx given): early stopping on the validation macro AUC over `findings`.
-    Refit (epochs given): exactly that many epochs of the 30-epoch schedule; no stopping rule.
+        schedule_steps_per_epoch: int | None = None, schedule_epochs: int | None = None) -> FitResult:
+    """Inner fit (val_idx given): early stopping on the validation macro AUC over `findings`, after
+    `patience` epochs without a gain (None: no stopping rule).
+    Refit (epochs given): exactly that many epochs of the schedule; no stopping rule.
     Fixed-steps refit (steps given, KneeMRI S5): exactly `steps` optimiser steps of a schedule whose
     epoch is `schedule_steps_per_epoch` steps (the RSNA refit's), so learning rate and step count
     match the RSNA refit even though the dataset is smaller.
+    schedule_epochs: length of the cosine schedule in epochs (None: MAX_EPOCHS = 30, as registered).
+    max_epochs: the most epochs a fit without `epochs` or `steps` runs; None means schedule_epochs
+    when that is given, else MAX_EPOCHS. So an inner fit never runs past its own schedule, and a
+    refit with epochs=E and the same schedule_epochs stops at E of that schedule.
+    With schedule_epochs, max_epochs and patience left at their defaults the fit is the registered
+    one, bit for bit (tests/test_iteration2.py compares it with commit a260cde).
     on_epoch(epoch, score) -> True stops the fit as pruned (the HPO demo's successive halving)."""
     import torch
     import torch.nn.functional as F
 
+    if schedule_epochs is not None and int(schedule_epochs) < 1:
+        raise ValueError("schedule_epochs must be at least 1")
     _check_guard(train_idx, val_idx, forbidden)
     t0 = time.time()
     gen = torch.Generator().manual_seed(seed)
@@ -280,13 +292,15 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
     spe_sched = int(schedule_steps_per_epoch) if schedule_steps_per_epoch else steps_per_epoch
 
     def lr_at(step):
-        return schedule_factor(step, spe_sched)
+        return schedule_factor(step, spe_sched, schedule_epochs)
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     yb = bank.binary[train_idx]
     pos, neg = (yb == 1).sum(0), (yb == 0).sum(0)
     pw = torch.tensor(np.minimum(neg / np.maximum(pos, 1), cfg.pos_cap), dtype=torch.float32, device=bank.device)
     tr_t = torch.as_tensor(train_idx, device=bank.device)
+    if max_epochs is None:  # an inner fit runs at most its own schedule (registered: 30 epochs)
+        max_epochs = MAX_EPOCHS if schedule_epochs is None else int(schedule_epochs)
     if steps is not None:  # fixed number of optimiser steps: as many epochs as it takes
         n_epochs = math.ceil(int(steps) / steps_per_epoch)
     else:

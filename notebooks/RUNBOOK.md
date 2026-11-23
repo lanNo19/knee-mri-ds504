@@ -273,6 +273,64 @@ New fields in other summaries:
 | agg_n8.json | features.columns_absent | feature columns that tags.csv does not have (should be empty) |
 | agg_pilot.json | projection.corrected | the Stage A time projection with the review's fixes: real inner-fit size, x1.26 for batch size, 30 epochs per fit, divided by 2; the old keys are unchanged |
 
+## Iteration 2 (plan r2)
+
+Plan: iteration_plan_r2.md, sections 2, 5 and 7. Code: knee.nb.n13 (tests: tests/test_iteration2.py).
+Everything in this section is "added after the results" (R10). Iteration-1 notebooks are not rerun
+with this code; with its defaults the code is the registered code bit for bit.
+
+Rules for every N13 notebook:
+1. Cell 1 is the usual one (section "Cell 1 (every notebook)", the pip install from GitHub). COMMIT is
+   the final reviewed commit that holds knee/nb/n13.py (branch it2-a1 until it is merged).
+2. Inputs: knee-n0, knee-n3-r and knee-n5. Nothing else: no knee-n6a and no other N13 output.
+3. Never knee-n3: a GPU run with knee-n3 attached stays queued. knee-n3-r has the same S2 and inner folds.
+4. Pass the expect hashes of the card. A wrong attached version then fails the step at once.
+5. One arm per notebook, each with its own output. Never save one arm over another arm's notebook.
+6. All arms of one decision run on one device type. First choice: GPU T4 x2, as Stage A ran.
+7. If no GPU session is free (the two registered N10 runs may hold both): run a1, null and cpu0 on
+   None (CPU). A1 is then compared with cpu0, never with Stage A.
+8. Never attach an N13 output to N7 or N9 (R9). Its units look like Stage A's, and N7 and N9 take every unit they find.
+
+Expect hashes for every card: `{"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}`.
+
+| Notebook | Accelerator | Cell 2 | Expected time | Pass |
+|---|---|---|---|---|
+| knee-n13-a1 | GPU T4 x2 (None (CPU) under rule 7) | `from knee.nb import n13; n13.run("a1", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | T4: about 20 min (setup included); CPU: 1-2.5 h | STEP n13_a1: OK and STEP n13_a1_inner: OK; all_units_ok, all_nested and leakage_assertion_passed true; units holds 10 entries (dinov2_vits14 and convnext_tiny, folds 0-4), each ok with schedule_epochs 8, patience 3, seed 0 and E from 1 to 8; device_names holds one name (Tesla T4, or cpu); trial0_inner_scores has 5 folds per encoder; run.json config: test_overrides true, test_overrides_reason "iteration 2, plan r2: defaults only, see iteration_plan_r2.md", schedule_epochs 8, patience 3 |
+| knee-n13-null | the same as knee-n13-a1 | `from knee.nb import n13; n13.run("null", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | T4: 20-30 min; CPU: 1.5-3 h | as knee-n13-a1, but schedule_epochs 30, patience 5, seed 100 and E from 1 to 30; run.json config has no schedule_epochs or patience (the registered values) |
+| knee-n13-cpu0 | None (CPU); only under rule 7 | `from knee.nb import n13; n13.run("cpu0", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | CPU: 1.5-3 h | as knee-n13-null, but seed 0; device_names ["cpu"] |
+| knee-n13-a7 | GPU T4 x2, the device of its baseline arm | `from knee.nb import n13; n13.run("a7", expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule_epochs=<S>, patience=<P>)`, with S and P the schedule written in the plan before the run (8 and 3 if A1 was kept, else 30 and 5) | T4: 1-2.5 h | as knee-n13-a1 with schedule_epochs S and patience P; settings.n_trials 30; settings.space_overrides {"batch_size": [8, 128], "weight_decay": [1e-06, 1.0]}; every unit also has best_inner_score and config. Runs only if the A1 decision is written by Tue 09:00 and a GPU slot is free |
+
+A failed unit: rerun it alone in a new notebook knee-n13-<arm>-r with the same cell 2 plus
+`rerun=True, folds=(k,)`, on the same device. Its step is n13_<arm>_r. Use it with the original
+output wherever that arm is used (for N10: attach knee-n13-a1 and knee-n13-a1-r).
+
+What Claude reads: the blocks of each run (n6's STEP line and summary, then N13's STEP line and
+summary; N13's summary is also agg_n13_<arm>_inner.json) and run.json. Per unit, N13's summary gives
+trial0_inner_score (the mean over the inner folds of the
+validation macro AUC at each inner fit's best epoch: Stage A's objective), E, schedule_epochs,
+patience, seed, device, device_name and head_sha16.
+
+The A1 decision (Claude, from inner scores only, before any S2 number of A1 is read, R5):
+1. a1 = trial0_inner_scores of agg_n13_a1_inner.json.
+2. null = trial0_inner_scores of agg_n13_null_inner.json.
+3. base on T4: Stage A's trial 0 from knee-n6a's ten files agg_n6a_<encoder>_f<k>.json, read with
+   `n13.trial0_scores([...the ten dicts...])` (default_trial_score; the L1 winner was gated|all in all ten).
+4. base on CPU (rule 7): trial0_inner_scores of agg_n13_cpu0_inner.json.
+5. Check that every arm used one device type (device_names; Stage A ran on Tesla T4).
+6. `n13.decide(a1, base, null)` gives, per encoder, gain, threshold, folds_up, keep and s.
+7. Write those numbers and the decision into the plan document with the time. Only then compute A1's S2 development numbers.
+
+N10 with N13's heads (only if A1 is kept for ConvNeXt-T; Ablay presses Submit):
+
+| Notebook | Accelerator | Internet | Inputs | Cell 2 | Expected time | Pass |
+|---|---|---|---|---|---|---|
+| knee-n10-n13 | GPU T4 x2 | **Off** | Competition; the bundle dataset; knee-n0; knee-n13-a1 (and knee-n13-a1-r if a unit was rerun). Never knee-n6a | offline cell 1, then `from knee.nb import n10; n10.run("convnext_tiny")` | 2-5 h on the hidden test | as knee-n10-convnext; then `n13.check_heads(<agg_n10.json>, <agg_n13_a1_inner.json>)["match"]` is true (all five folds, every head hash equal). Only then ask Ablay to submit |
+
+N10 runs the bundle's wheel (commit 47fdcbf). Its n10.py and the head code it calls
+(heads.make_head, config_from, predict) are the same in this branch, so it reads N13's units
+unchanged. N10 records each fold head's hash as heads_sha16 in agg_n10.json (n10.py:126); its
+summary block does not show it.
+
 ## If a run fails
 
 The summary block shows `STEP <name>: FAILED - <ErrorType> at <file>:<line> in <function>()`.
