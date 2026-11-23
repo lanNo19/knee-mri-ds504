@@ -27,12 +27,14 @@ errors (error type and place only) and the other blocks still run.
 Suppression (plan r2, section 4): a finding enters a stratum only with at least 5 positives and 5
 negatives there; a stratum needs at least 50 studies; a macro uses one fixed finding list for every
 stratum it is compared with; counts go through agg.count, so the gold count shows as "about 60".
-On gold (review r1, B1), nothing may give back a cell of 1-4 studies or an exact count that agg_n0.json
-rounds: a rate from a 2x2 table (PPV, NPV, PPV + NPV - 1 and what is built on them) is blank when a cell
-it uses holds 1-4 studies (N9's rule for rates); every per-finding number has 2 decimals, because AUCs at
-3-4 decimals that share one denominator (positives x negatives) can single out the exact positive count;
-a macro keeps 4 decimals only over at least 5 findings. Gold studies without any report label are left
-out of every comparison that needs the report label (counted and flagged), never read as "absent".
+On gold (reviews r1 and r2, B1), the standard is: no cell of 1-4 studies comes back, also for a reader who
+knows the exact gold total (agg_n0's is_58). Every rate from a finding's 2x2 table (PPV, NPV,
+PPV + NPV - 1 and what is built on them) is blank when any of its four cells holds 1-4 studies. Every
+per-finding number has 2 decimals and a macro keeps 4 only over at least 5 findings (AUCs at 3-4 decimals
+that share one denominator, positives x negatives, can pin a count). Exact counts of 5 or more can still
+come back (for example from a fully shown table); the agg rule does not hide those. Gold studies without
+any report label are left out of every comparison that needs the report label (counted and flagged),
+never read as "absent".
 """
 from __future__ import annotations
 
@@ -55,7 +57,7 @@ from . import n9x
 MIN_EACH = 5  # positives and negatives a finding needs inside a stratum
 MIN_STUDIES = 50  # studies a stratum needs
 MIN_FINDINGS = 5  # findings a Spearman correlation across findings needs
-PER_FINDING_DECIMALS = 2  # every per-finding number on gold (B1): an AUC at 3-4 decimals can give an exact count back
+PER_FINDING_DECIMALS = 2  # every per-finding number on gold (B1): AUCs at 3-4 decimals sharing a denominator can pin a count
 CORE_LANGUAGES = ("ENGLISH", "SPANISH", "TURKISH")  # item 4: the rows plan r2 names; they fix the finding list
 ENGLISH = "ENGLISH"  # report language (lingua's name) that identifies the English G-lang group
 ENCODERS = (core.DINO, core.CONV, core.VIT)
@@ -122,13 +124,17 @@ def _cells(t, r) -> dict:
 
 
 def _ppv_npv(cl: dict) -> tuple[float | None, float | None]:
-    """PPV and NPV from the exact cells, blank (None) when a cell the rate uses holds 1 to 4 studies or the
-    rate is undefined: metrics.rates' suppress_small rule, as N9's triage (PPV uses tp and fp, NPV tn and fn).
-    Without it, PPV and NPV at 2 decimals beside agg_n0's rounded positives give the whole table back."""
-    ppv = (None if _small(cl["tp"]) or _small(cl["fp"]) or cl["tp"] + cl["fp"] == 0
-           else cl["tp"] / (cl["tp"] + cl["fp"]))
-    npv = (None if _small(cl["tn"]) or _small(cl["fn"]) or cl["tn"] + cl["fn"] == 0
-           else cl["tn"] / (cl["tn"] + cl["fn"]))
+    """PPV and NPV from the exact cells. Both are blank (None) when any of the four cells holds 1 to 4
+    studies (review r2, R2-B1), and a rate is blank when it is undefined.
+    Why both: the gold total is exact (agg_n0.json writes is_58), so a shown rate's denominator carries the
+    other two cells (NPV = TN / (n - TP - FP)) and, with the blank pattern, gives a small cell back. N9's
+    rule for rates blanks each rate on its own cells, which is enough only when the total is unknown.
+    What this guarantees: no cell of 1-4 studies comes back. Exact counts of 5 or more can come back (a
+    fully shown table gives its positives back), as with N9's rates."""
+    if any(_small(v) for v in cl.values()):  # the gold total is exact: one shown rate carries the rest
+        return None, None
+    ppv = None if cl["tp"] + cl["fp"] == 0 else cl["tp"] / (cl["tp"] + cl["fp"])
+    npv = None if cl["tn"] + cl["fn"] == 0 else cl["tn"] / (cl["tn"] + cl["fn"])
     return ppv, npv
 
 
@@ -282,9 +288,9 @@ def gold_label_quality(c, n_boot: int, seed: int) -> dict:
                  failure_mode="FM5, FM3",
                  soft_label="mean of the label tables' P(present) (N0), masked cells left out",
                  binary_label="present if the soft label is above 0.5; uncertain (0.5 or masked) counted as negative",
-                 ppv_npv_rule=("null when a cell the rate uses holds 1-4 studies (PPV: true and false positives; NPV: "
-                               "true and false negatives) or when it is undefined; N9's rule for rates"),
-                 precision="every per-finding number at 2 decimals, so no exact count comes back from it",
+                 ppv_npv_rule=("both rates null when any cell of the finding's 2x2 table holds 1-4 studies (the gold "
+                               "total is exact), and a rate null when undefined"),
+                 privacy="no cell of 1-4 studies comes back; per-finding numbers at 2 decimals",
                  interval="soft_label_auc_interval: study bootstrap, item 1's draws, percentile 2.5-97.5",
                  n_boot=int(n_boot))
     gold, n_without = _gold_with_report(c)
@@ -473,8 +479,8 @@ def english_group_by_language(c, language, n_boot: int, seed: int) -> dict:
     group, not by fold number); its fold is the S2 fold of those studies. One model per encoder and one
     fold, so the training set is the same in every row (training_studies, rounded). A row needs at least
     50 evaluation studies. One fixed finding list, set on the rows plan r2 names (CORE_LANGUAGES: English,
-    Spanish, Turkish, each with 50 studies): the findings with at least 5 positives and 5 negatives in
-    every one of them. Any other language of the group (French, Latin) is reported only on that list,
+    Spanish, Turkish) that have 50 studies, written as list_fixed_on: the findings with at least 5
+    positives and 5 negatives in every one of them. Any other language of the group (French, Latin) is reported only on that list,
     and only if every finding of the list has 5 positives and 5 negatives there; else it is suppressed
     with the reason. A smaller row never shrinks the list. The reference row is the whole group (all its
     languages) on the same list. Intervals: a study bootstrap inside each row (n_boot draws, every
@@ -482,7 +488,7 @@ def english_group_by_language(c, language, n_boot: int, seed: int) -> dict:
     out = _flags("one S2 fold (the English group's), its own fold model, rows by report language; decides nothing",
                  failure_mode="FM1, FM11", n_boot=int(n_boot), min_studies_per_row=MIN_STUDIES,
                  note="one model and one fold per encoder: the training set is the same in every row",
-                 list_fixed_on=list(CORE_LANGUAGES))
+                 named_rows=list(CORE_LANGUAGES))
     if language is None:
         return {**out, "status": "not available (studies.csv has no language column)"}
     ev, Y = c.ev, c.Y
@@ -513,6 +519,7 @@ def english_group_by_language(c, language, n_boot: int, seed: int) -> dict:
             strata[L] = r
     tr = c.d.split(k)[0] if hasattr(c.d, "split") else None
     out.update({"group": group, "fold": k, "group_in_one_fold": len(group_folds) == 1,
+                "list_fixed_on": core_rows,  # the named rows with 50 studies: they set the list
                 "training_studies": agg.count(len(tr)) if tr is not None else None,
                 "group_languages": sorted(str(L) for L in sizes.index),
                 "languages_reported": list(strata), "languages_suppressed": suppressed,

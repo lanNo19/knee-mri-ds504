@@ -200,9 +200,11 @@ def _small(x):
 
 
 def _rates(cl):
-    """PPV and NPV under N9's rule for rates: blank when a cell the rate uses holds 1-4 studies."""
-    ppv = None if _small(cl["tp"]) or _small(cl["fp"]) or cl["tp"] + cl["fp"] == 0 else cl["tp"] / (cl["tp"] + cl["fp"])
-    npv = None if _small(cl["tn"]) or _small(cl["fn"]) or cl["tn"] + cl["fn"] == 0 else cl["tn"] / (cl["tn"] + cl["fn"])
+    """PPV and NPV as N12 writes them (review r2): both blank when any cell holds 1-4 studies, each blank when undefined."""
+    if any(_small(v) for v in cl.values()):
+        return None, None
+    ppv = None if cl["tp"] + cl["fp"] == 0 else cl["tp"] / (cl["tp"] + cl["fp"])
+    npv = None if cl["tn"] + cl["fn"] == 0 else cl["tn"] / (cl["tn"] + cl["fn"])
     return ppv, npv
 
 
@@ -461,13 +463,13 @@ def _item4(s, ref):
     grp = ev[ref.g_lang[ev] == "ENGLISH"]
     k = int(pd.Series(ref.f2[grp]).mode().iloc[0])
     assert g["group"] == "ENGLISH" and g["fold"] == k == 0 and g["group_in_one_fold"] is True
-    assert g["list_fixed_on"] == ["ENGLISH", "SPANISH", "TURKISH"]
+    assert g["named_rows"] == ["ENGLISH", "SPANISH", "TURKISH"]
     assert g["training_studies"] == agg.count(int((ref.train & (ref.f2 >= 0) & (ref.f2 != k)).sum()))
     rows_all = grp[ref.f2[grp] == k]
     sizes = pd.Series(ref.lang[rows_all]).value_counts()
     core = [L for L in ("ENGLISH", "SPANISH", "TURKISH") if sizes.get(L, 0) >= 50]
     assert core == ["ENGLISH", "SPANISH"]  # TURKISH and FRENCH have under 50 here
-    assert g["languages_reported"] == core
+    assert g["languages_reported"] == core and g["list_fixed_on"] == core  # the rows that set the list
     assert g["languages_suppressed"] == {L: {"reason": "under 50 evaluation studies"} for L in sizes.index if sizes[L] < 50}
     strata = {L: rows_all[ref.lang[rows_all] == L] for L in core}
     find = [j for j in range(12) if all(_enough(ref.Y[r, j]) for r in strata.values())]
@@ -545,18 +547,64 @@ def _item5(s, s9, ref, inp):
         assert v["fold_stratified_macro_auc_unchanged"] is True
 
 
-# ---------------------------------------------------------------- B1: the back-calculation fails
+# ---------------------------------------------------------------- B1: no cell of 1-4 comes back
+
+def _per_rate(cl):
+    """The rule of d7c14bf, replaced after review r2: each rate blank on its own cells only."""
+    ppv = None if _small(cl["tp"]) or _small(cl["fp"]) or cl["tp"] + cl["fp"] == 0 else cl["tp"] / (cl["tp"] + cl["fp"])
+    npv = None if _small(cl["tn"]) or _small(cl["fn"]) or cl["tn"] + cl["fn"] == 0 else cl["tn"] / (cl["tn"] + cl["fn"])
+    return ppv, npv
+
+
+def test_n12_no_small_cell_comes_back_from_any_gold_table():
+    """Review r2, R2-B1: every 2x2 table of n gold studies (n exact, as agg_n0's is_58 makes it), grouped by
+    everything public about it: the expert positives rounded to 5, whether item 1 leaves the finding out
+    (report positives or negatives under 5), and item 2's ppv, npv and factor as written. No cell of 1-4
+    may be the only value left in its group. The per-rate rule fails this: with the total known, one shown
+    rate's denominator carries the other cells."""
+    from collections import defaultdict
+
+    from knee.nb import n12
+
+    def leaks(rates) -> int:
+        found = 0
+        for n in (50, 55, 58):
+            groups = defaultdict(list)
+            for pe in range(5, n - 4):
+                for tp in range(pe + 1):
+                    for fp in range(n - pe + 1):
+                        cl = {"tp": tp, "fp": fp, "fn": pe - tp, "tn": n - pe - fp}
+                        ppv, npv = rates(cl)
+                        v = n12._quality_view({"soft_label_auc": float("nan"), "soft_label_auc_draws": [], "ppv": ppv,
+                                               "npv": npv})
+                        left = tp + fp < 5 or cl["fn"] + cl["tn"] < 5
+                        groups[(agg.count(pe), left, v["ppv"], v["npv"], v["ppv_plus_npv_minus_1"])].append(cl)
+            for cands in groups.values():
+                for k in ("tp", "fp", "fn", "tn"):
+                    vals = {cl[k] for cl in cands}
+                    if len(vals) == 1 and _small(next(iter(vals))):
+                        found += len(cands)
+        return found
+
+    assert leaks(n12._ppv_npv) == 0
+    assert leaks(_per_rate) > 0  # 346 tables in review r2: the attack is real
+
 
 def _gold_ctx(rng, n=58):
     """A hand-made gold set of n studies and 12 findings (expert labels, report labels with the sensitivity
-    and specificity of probe4, soft labels, three encoders' predictions), as N12's gold blocks read it."""
+    and specificity of probe4, soft labels, three encoders' tie-free predictions), as N12's gold blocks read it."""
+    from scipy.special import expit
+
     GY, RY = np.zeros((n, 12)), np.zeros((n, 12))
     for j in range(12):
-        GY[rng.permutation(n)[:int(rng.integers(8, 36))], j] = 1.0
-        sens, spec = rng.uniform(0.6, 0.95), rng.uniform(0.8, 0.98)
+        GY[rng.permutation(n)[:int(rng.integers(5, 36))], j] = 1.0
+        if j % 4 == 3:  # a Fracture-like finding: the reports rarely say present, so item 1 often leaves it out
+            sens, spec = rng.uniform(0.05, 0.3), rng.uniform(0.97, 1.0)
+        else:
+            sens, spec = rng.uniform(0.6, 0.95), rng.uniform(0.8, 0.98)
         RY[:, j] = np.where(GY[:, j] == 1, rng.random(n) < sens, rng.random(n) > spec)
-    soft = np.clip(0.5 * RY + 0.3 * GY + rng.normal(0, 0.15, (n, 12)), 0, 1)
-    units = {e: np.clip(0.3 + 0.4 * GY + rng.normal(0, 0.3, (n, 12)), 0, 1) for e in ENCODERS}
+    soft = np.clip(0.5 * RY + 0.3 * GY + rng.normal(0, 0.15, (n, 12)), 0, 1)  # ties at 0 and 1, like a label mean
+    units = {e: expit(-1 + 2 * GY + rng.normal(0, 1, (n, 12))) for e in ENCODERS}  # probabilities: no ties
     return SimpleNamespace(gold=np.arange(n), d=SimpleNamespace(gold_y=GY, soft=soft, binary=RY.copy()), Y=RY,
                            units=units, g_find=list(range(12)))
 
@@ -569,16 +617,19 @@ def _tables(p_window, n):
 
 
 def _consistent(cl, pub, rule):
-    """Whether a candidate table could have produced the published ppv, npv and factor under a rule."""
-    if rule == "cells":
-        ppv_shown = not (_small(cl["tp"]) or _small(cl["fp"])) and cl["tp"] + cl["fp"] > 0
-        npv_shown = not (_small(cl["tn"]) or _small(cl["fn"])) and cl["tn"] + cl["fn"] > 0
-    else:  # the first version's rule: a denominator of at least 5
-        ppv_shown, npv_shown = cl["tp"] + cl["fp"] >= 5, cl["tn"] + cl["fn"] >= 5
-    if (pub["ppv"] is not None) != ppv_shown or (pub["npv"] is not None) != npv_shown:
+    """Whether a candidate table could have produced what is published under a rule: the left-out flag, the
+    blank pattern, and ppv, npv and factor at 2 decimals."""
+    if (cl["tp"] + cl["fp"] < 5 or cl["fn"] + cl["tn"] < 5) != pub["left"]:
         return False
-    ppv = cl["tp"] / (cl["tp"] + cl["fp"]) if ppv_shown else None
-    npv = cl["tn"] / (cl["tn"] + cl["fn"]) if npv_shown else None
+    if rule == "first":  # the first version's rule: a denominator of at least 5
+        ppv = cl["tp"] / (cl["tp"] + cl["fp"]) if cl["tp"] + cl["fp"] >= 5 else None
+        npv = cl["tn"] / (cl["tn"] + cl["fn"]) if cl["tn"] + cl["fn"] >= 5 else None
+    else:
+        from knee.nb import n12
+
+        ppv, npv = n12._ppv_npv(cl) if rule == "fixed" else _per_rate(cl)
+    if (pub["ppv"] is not None) != (ppv is not None) or (pub["npv"] is not None) != (npv is not None):
+        return False
     if ppv is not None and agg.share(ppv) != pub["ppv"]:
         return False
     if npv is not None and agg.share(npv) != pub["npv"]:
@@ -595,25 +646,27 @@ def _recovered_small_cells(true, pub, p_window, n, rule) -> int:
     return sum(1 for k, v in true.items() if _small(v) and {cl[k] for cl in cands} == {v})
 
 
-def _auc_feasible(a, p, n, nd):
-    """Whether some AUC m / (2 p (n - p)) with integer m rounds to a at nd decimals (ties count one half)."""
-    D = 2 * p * (n - p)
+def _auc_feasible(a, p, n, nd, ties):
+    """Whether an AUC with p positives among n studies can round to a at nd decimals: U / (p (n - p)) with U
+    whole (tie-free scores) or a multiple of one half (ties allowed)."""
+    D = (2 if ties else 1) * p * (n - p)
     m0 = int(round(a * D))
     return any(0 <= m <= D and round(m / D, nd) == a for m in range(m0 - 3, m0 + 4))
 
 
-def test_n12_gold_numbers_cannot_give_a_small_count_back():
-    """Review r1, B1. An attacker who knows everything public (the exact gold count, agg_n0's positives rounded
-    to 5, N12's rules) tries to get the 2x2 cells and the exact positive counts back from N12's gold numbers.
-    Under the first version's rule the cells of 1-4 come back, and AUCs at 4 decimals give the exact positive
-    count; under the fixed rules neither does."""
+def test_n12_gold_numbers_give_no_small_cell_back():
+    """Reviews r1 and r2, B1. An attacker who knows the exact gold count, agg_n0's positives rounded to 5 and
+    N12's rules reads item 2's rates, item 1's left-out flag and the per-finding AUCs. Standard: no cell of
+    1-4 comes back, even if the exact positive count were known (as differencing two gold macros can give
+    it); exact counts of 5 or more are not protected. The first version's rule fails this; the per-finding
+    AUCs at 2 decimals do not pin the positive count by themselves, while at 4 decimals they would."""
     from knee import metrics
     from knee.nb import n12
 
     rng = np.random.default_rng(7)
     n = 58
-    tried = recovered_new = recovered_old = with_small = 0
-    p_unique_new = p_unique_4dp = n_findings = 0
+    tried = recovered_fixed = recovered_per_rate = recovered_first = with_small = left_out = 0
+    p_unique_2dp = p_unique_4dp = 0
     for _ in range(8):
         c = _gold_ctx(rng, n)
         q = n12.gold_label_quality(c, 10, 0)
@@ -626,33 +679,41 @@ def test_n12_gold_numbers_cannot_give_a_small_count_back():
             if "suppressed" in v:
                 continue
             p_true = int((c.d.gold_y[:, j] == 1).sum())
-            shown = agg.count(p_true)  # what agg_n0.json publishes
-            window = [p for p in range(5, n - 4) if agg.count(p) == shown]
+            window = [p for p in range(5, n - 4) if agg.count(p) == agg.count(p_true)]  # what agg_n0.json allows
             true = _cells(c.d.gold_y[:, j], c.Y[:, j])
-            pub = {"ppv": v["ppv"], "npv": v["npv"], "factor": v["ppv_plus_npv_minus_1"]}
-            old_ppv = true["tp"] / (true["tp"] + true["fp"]) if true["tp"] + true["fp"] >= 5 else None
-            old_npv = true["tn"] / (true["tn"] + true["fn"]) if true["tn"] + true["fn"] >= 5 else None
-            pub_old = {"ppv": agg.share(old_ppv) if old_ppv is not None else None,
-                       "npv": agg.share(old_npv) if old_npv is not None else None}
+            left = f not in fm["findings"]  # item 1 left it out: report positives or negatives under 5
+            pub = {"left": left, "ppv": v["ppv"], "npv": v["npv"], "factor": v["ppv_plus_npv_minus_1"]}
+            first = {"left": left, "ppv": None, "npv": None}
+            if true["tp"] + true["fp"] >= 5:
+                first["ppv"] = agg.share(true["tp"] / (true["tp"] + true["fp"]))
+            if true["tn"] + true["fn"] >= 5:
+                first["npv"] = agg.share(true["tn"] / (true["tn"] + true["fn"]))
             tried += 1
+            left_out += left
             with_small += any(_small(x) for x in true.values())
-            recovered_new += _recovered_small_cells(true, pub, window, n, "cells")
-            recovered_old += _recovered_small_cells(true, pub_old, window, n, "old")
-            # the exact positive count from the per-finding AUCs against the expert labels (one denominator)
-            aucs = [v["soft_label_auc"]] + [fm["encoders"][e]["per_finding"][f]["expert_labels_auc"]
-                                            for e in ENCODERS if f in fm["encoders"][e]["per_finding"]]
-            exact = [raw[f]["soft_label_auc"]] + [metrics.auc(c.units[e][:, j], c.d.gold_y[:, j])[0] for e in ENCODERS]
-            left_new = [p for p in window if all(_auc_feasible(a, p, n, 2) for a in aucs)]
-            left_4dp = [p for p in window if all(_auc_feasible(round(a, 4), p, n, 4) for a in exact)]
-            assert p_true in left_new and p_true in left_4dp
-            n_findings += 1
-            p_unique_new += len(left_new) == 1
+            recovered_fixed += _recovered_small_cells(true, pub, [p_true], n, "fixed")  # exact positives known
+            ppv, npv = _per_rate(true)  # what d7c14bf wrote
+            per_rate = {"left": left, "ppv": agg.share(ppv) if ppv is not None else None,
+                        "npv": agg.share(npv) if npv is not None else None,
+                        "factor": agg.share(ppv + npv - 1) if ppv is not None and npv is not None else None}
+            recovered_per_rate += _recovered_small_cells(true, per_rate, [p_true], n, "per_rate")
+            recovered_first += _recovered_small_cells(true, first, window, n, "first")
+            # the positive count from the per-finding AUCs against the expert labels (one denominator)
+            aucs = [(v["soft_label_auc"], True)] + [(fm["encoders"][e]["per_finding"][f]["expert_labels_auc"], False)
+                                                    for e in ENCODERS if f in fm["encoders"][e]["per_finding"]]
+            exact = [(raw[f]["soft_label_auc"], True)] + [(metrics.auc(c.units[e][:, j], c.d.gold_y[:, j])[0], False)
+                                                         for e in ENCODERS]
+            left_2dp = [p for p in window if all(_auc_feasible(a, p, n, 2, ties) for a, ties in aucs)]
+            left_4dp = [p for p in window if all(_auc_feasible(round(a, 4), p, n, 4, ties) for a, ties in exact)]
+            assert p_true in left_2dp and p_true in left_4dp
+            p_unique_2dp += len(left_2dp) == 1
             p_unique_4dp += len(left_4dp) == 1
-    assert tried >= 80 and with_small > tried / 2  # most findings have a cell of 1-4 here, as on the real gold
-    assert recovered_new == 0  # the fixed rule gives no small cell back
-    assert recovered_old > tried / 4  # the first version's rule did (probe4), so the attack is real
-    assert p_unique_new == 0  # 2 decimals leave every rounded positive count open
-    assert p_unique_4dp > n_findings / 2  # 4 decimals would give the exact count back
+    assert tried >= 80 and with_small > tried / 2 and left_out > 0  # as on the real gold set
+    assert recovered_fixed == 0  # no cell of 1-4 comes back, even with the exact positive count known
+    assert recovered_per_rate > 0  # d7c14bf's per-rate rule gave some back under the same attack (review r2)
+    assert recovered_first > tried / 4  # the first version's rule gave cells back (probe4): the attack is real
+    assert p_unique_2dp == 0  # 2 decimals leave every rounded positive count open
+    assert p_unique_4dp > tried / 2  # 4 decimals would pin the exact count
 
 
 # ---------------------------------------------------------------- item 4's rules
@@ -680,7 +741,7 @@ def test_n12_english_group_list_is_fixed_on_the_named_rows():
     out = n12.english_group_by_language(c, lang, n_boot=50, seed=0)
     agg._check(json.loads(json.dumps(out)))
     assert out["group"] == "ENGLISH" and out["fold"] == 2 and out["group_in_one_fold"] is True
-    assert out["findings_left_out"] == {"MCL": ["TURKISH"]}
+    assert out["list_fixed_on"] == ["ENGLISH", "SPANISH", "TURKISH"] and out["findings_left_out"] == {"MCL": ["TURKISH"]}
     find = [j for j in range(12) if j != 1]
     assert out["findings"] == [FINDINGS[j] for j in find] and "Fracture" in out["findings"]
     assert out["languages_reported"] == ["ENGLISH", "SPANISH", "TURKISH", "FRENCH"]
