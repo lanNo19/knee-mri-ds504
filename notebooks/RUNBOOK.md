@@ -292,10 +292,10 @@ N12 is descriptive. It reads existing outputs only. It fits nothing, decides not
 |---|---|---|---|
 | knee-n12 | None (CPU) | On | Outputs of knee-n0, **knee-n3-r** (not knee-n3), knee-n5, knee-n6a, knee-n6b-g and **knee-n7-b** (not knee-n7). Exactly one output per upstream step. Never knee-n6a-smoke, a knee-n9 output or an iteration-2 output |
 
-Cell 1 (commit d7c14bf holds the N12 code after review r1; the commit that added this card changes only this file):
+Cell 1 (commit 89a9058 holds the N12 code after reviews r1 and r2; the commit that moved COMMIT here changes only this file):
 
 ```python
-COMMIT = "d7c14bfad58ac99efeae75592d458184e9f1122a"
+COMMIT = "89a9058177e73f1d79a936caac3513aa7e29fd23"
 !pip install -q "knee[n0,decode,models] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"
 import knee.safe_log as sl; sl.install()
 ```
@@ -315,10 +315,10 @@ Pass criteria (summary block and agg_n12.json):
    - per_finding_table.rows.<finding>.s2_auc.<encoder> equals s2.<encoder>.per_finding.<finding> (for example ACL: convnext_tiny 0.679, dinov2_vits14 0.638).
    - gold_paired_check.encoders.<encoder>.expert_labels_on_n9_findings equals s3_gold.macro_auc.<encoder> (convnext_tiny 0.7515, dinov2_vits14 0.7317). This holds always: it uses N9's own gold studies and findings.
    - For each encoder in development.a4_calibration.encoders: ece.before equals s2.<encoder>.ece (convnext_tiny 0.256, dinov2_vits14 0.255), and any_finding_auc.before equals triage_secondary.models.<encoder>.any_finding_auc (convnext_tiny 0.765, dinov2_vits14 0.734).
-4. gold_paired_check.studies_text is "about 60" (the gold studies with a report label). gold_paired_check.gold_studies_without_report_labels is 0 or not: if not, studies_without_report_labels_left_out is true and those studies are left out of every comparison that needs the report label (expected and correct; quote the count as written).
-5. english_group_by_language.group is "ENGLISH" and fold is 0 (both found from the English reports, not hard-coded); training_studies is about 1,350. The finding list is fixed on ENGLISH, SPANISH and TURKISH (list_fixed_on); languages_reported holds those three. FRENCH and LATIN appear in languages_reported only if they meet that whole list; otherwise languages_suppressed gives the reason.
+4. gold_paired_check.studies_text is "about 60", or "about 55" when gold_studies_without_report_labels is not 0 (the gold studies with a report label). gold_paired_check.gold_studies_without_report_labels is 0 or not: if not, studies_without_report_labels_left_out is true and those studies are left out of every comparison that needs the report label (expected and correct; quote the count as written).
+5. english_group_by_language.group is "ENGLISH" and fold is 0 (both found from the English reports, not hard-coded); training_studies is about 1,350. The finding list is set by the named rows (named_rows: ENGLISH, SPANISH, TURKISH) that have 50 studies; list_fixed_on names those rows, which on the real data are all three, and languages_reported holds them. FRENCH and LATIN appear in languages_reported only if they meet that whole list; otherwise languages_suppressed gives the reason.
 6. In development.a4_calibration, each encoder is either in encoders or in skipped with its reason. In encoders: every check named in gate_must_be_true is true, none named in gate_must_not_be_false is false (null = not recorded), fold_stratified_macro_auc_unchanged is true. info.stage_a_n5_index_same never stops A4 (the weights do not use N5); if it is false, say so beside the A4 numbers. A4 is optional, so a skip is not a failure.
-7. fm5b_attenuation_check.encoders.<encoder>.report_minus_if_independent is there for each encoder. per_finding_blank and gold_label_quality.rates_blank list findings whose rates are blank by the privacy rule: expected, not a failure.
+7. fm5b_attenuation_check.encoders.<encoder>.report_minus_if_independent is there for each encoder. per_finding_blank and gold_label_quality.rates_blank list findings whose rates are blank by the privacy rule: expected, not a failure. Expect most per-finding rates to be blank: on about 60 gold studies most findings have a cell of 1-4. The soft-label AUC, item 3's Spearman and the fm5b macro do not depend on them, so FM5b stays measurable.
 
 Rules for reading and quoting N12:
 1. Nothing in agg_n12.json is a test or a decision.
@@ -334,13 +334,13 @@ Rules for reading and quoting N12:
 | gold_paired_check.encoders.<encoder>.expert_labels, report_labels | macro AUC on the gold studies with a report label, fold models pooled, against the expert labels and against the binary report labels (uncertain = negative); the same findings for both (5 positives and 5 negatives in both versions: findings, findings_left_out; findings_same_as_n9_s3 says whether they are N9's list) |
 | gold_paired_check.encoders.<encoder>.expert_labels_interval, report_labels_interval, expert_minus_report | study-bootstrap percentile intervals of the two macros, and their difference with its paired interval (FM5b) |
 | gold_*.gold_studies_without_report_labels, studies_without_report_labels_left_out | gold studies with no report label at all (rounded), and whether any were left out; they are never read as "absent" |
-| gold_label_quality.per_finding.<finding> | soft_label_auc (the label mean against the expert label, on the studies with a soft label) with its interval; ppv and npv of the binary report label and ppv_plus_npv_minus_1 (the FM5b factor). 2 decimals; a rate is null when a cell it uses holds 1-4 studies (PPV: true and false positives; NPV: true and false negatives); suppressed with under 5 expert positives or negatives |
-| gold_label_quality.rates_blank, soft_label_macro_auc | findings whose rates are blank by that rule; the mean soft-label AUC over the shown findings (N0's 0.892 used every gold study) |
+| gold_label_quality.per_finding.<finding> | soft_label_auc (the label mean against the expert label, on the studies with a soft label) with its interval; ppv and npv of the binary report label and ppv_plus_npv_minus_1 (the FM5b factor). 2 decimals; all three are null when any cell of the finding's 2x2 table holds 1-4 studies (the gold total is exact, so one shown rate would carry the other cells); suppressed with under 5 expert positives or negatives |
+| gold_label_quality.rates_blank, soft_label_macro_auc | findings whose rates are blank by that rule (no cell of 1-4 comes back; exact counts of 5 or more are not hidden); the mean soft-label AUC over the shown findings (N0's 0.892 used every gold study) |
 | fm5b_attenuation_check.encoders.<encoder>.report_labels, report_labels_if_independent, report_minus_if_independent | macro over item 1's findings: the report-label AUC, what the FM5b relation predicts from the expert-label AUC and PPV + NPV - 1, and their difference with a paired study-bootstrap interval |
 | fm5b_attenuation_check.encoders.<encoder>.per_finding.<finding> | the same per finding at 2 decimals (expert_labels_auc, report_labels_auc; the predicted value and the difference blank where per_finding_blank lists the finding) |
 | per_finding_table.rows.<finding> | s2_auc per encoder (fold-stratified, N9's numbers), training_prevalence (N0, over the training studies), label_quality (as in gold_label_quality) |
 | per_finding_table.spearman_label_quality_vs_s2_auc | per encoder: Spearman across findings between the soft label's gold AUC and the S2 AUC; no_association_band (about 0.58 for 12 findings: a smaller absolute rho fits no association); descriptive |
-| english_group_by_language.rows.<language> | macro AUC of the English group's own fold model on the group's studies of one report language (at least 50 studies), on the list fixed on ENGLISH, SPANISH and TURKISH (list_fixed_on), study-bootstrap interval |
+| english_group_by_language.rows.<language> | macro AUC of the English group's own fold model on the group's studies of one report language (at least 50 studies), on the list set by the named rows with 50 studies (list_fixed_on), study-bootstrap interval |
 | english_group_by_language.languages_suppressed, findings_left_out, training_studies | per suppressed language its reason (under 50 studies, or a finding of the list without 5 positives and 5 negatives, named); findings left out of the list, with the named rows that lack them; the fold model's training set (rounded) |
 | english_group_by_language.reference_whole_group | the same for the whole group (all its languages), on the same list |
 | development.a2_seed_ensemble.encoders.<encoder> | mean probability over N7's seed refits (seeds listed): fold-stratified macro AUC and mean of fold macros; members_mean = the same for the single seed refits |
