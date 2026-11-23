@@ -90,12 +90,37 @@ def test_wilson_interval_and_schedule_factor():
     assert (lo, hi) == pytest.approx((0.0411, 0.1500), abs=5e-4)  # the textbook Wilson interval for 8 of 100
     lo0, hi0 = n9c.wilson(0, 50)
     assert lo0 == pytest.approx(0.0, abs=1e-12) and 0 < hi0 < 0.08
+    for k, n in ((0, 1), (0, 7), (0, 50), (1, 1), (50, 50), (3, 1000)):  # never outside [0, 1]
+        a, b = n9c.wilson(k, n)
+        assert 0.0 <= a <= k / n + 1e-12 and k / n - 1e-12 <= b <= 1.0
+    assert all(np.isnan(v) for v in n9c.wilson(0, 0))  # no studies: no interval, and no ZeroDivisionError
+    # the summary's interval: 2 decimals, and none from fewer than 20 normal studies or beside a "<5" cell
+    assert n9c.specificity_interval(400, 35) == [0.89, 0.94]
+    assert n9c.specificity_interval(6, 0) is None and n9c.specificity_interval(19, 0) is None
+    assert n9c.specificity_interval(200, 3) is None and n9c.specificity_interval(20, 0) == [0.84, 1.0]
     spe = 76
     # 1-epoch warm-up, then a cosine over the 30-epoch schedule: at E = 4, 5, 6 the rate is still near its peak
     got = [heads.schedule_factor(E * spe - 1, spe) for E in (4, 5, 6)]
     assert got == pytest.approx([0.974, 0.954, 0.930], abs=3e-3)
     assert heads.schedule_factor(0, spe) == pytest.approx(1 / spe) and heads.schedule_factor(spe - 1, spe) == 1.0
     assert heads.schedule_factor(30 * spe, spe) == pytest.approx(0.0, abs=1e-12)
+
+    def old_closure(spe_sched):  # heads.fit's inline schedule before it became schedule_factor (commit d8212d5)
+        import math
+
+        total = heads.MAX_EPOCHS * spe_sched
+        warm = heads.WARMUP_EPOCHS * spe_sched
+
+        def lr_at(step):
+            if step < warm:
+                return (step + 1) / warm
+            return 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warm) / max(1, total - warm))))
+
+        return lr_at
+
+    for s in (1, 2, 7, 76, 500):
+        lr_at = old_closure(s)
+        assert all(heads.schedule_factor(i, s) == lr_at(i) for i in range(0, 32 * s + 2))  # bit for bit
 
 
 def test_refit_agreement_says_when_the_device_gap_is_like_another_seed(monkeypatch):
@@ -124,7 +149,73 @@ def test_refit_agreement_says_when_the_device_gap_is_like_another_seed(monkeypat
     assert list(like["fits"]) == ["stage_a"] + [f"n7_seed_{k}" for k in range(6)]
     far = n9c.refit_agreement(ctx(0.2), {})  # ten times further away: not seed-like
     assert far["gap_like_another_seed"] is False
-    assert far["encoders"]["dinov2_vits14"]["n7_seed0_vs_n7_seed1"] == like["encoders"]["dinov2_vits14"]["n7_seed0_vs_n7_seed1"]
+    yard = like["encoders"]["dinov2_vits14"]["n7_seed_pairs_median"]
+    assert far["encoders"]["dinov2_vits14"]["n7_seed_pairs_median"] == yard and like["seeds"] == [0, 1, 2, 3, 4, 5]
+    # the yardstick is the median over all 15 seed pairs, not seeds 0 and 1 alone
+    P = refits(None, "dinov2_vits14")
+    med = [np.median(np.abs(P[a] - P[b])) for a in range(6) for b in range(a + 1, 6)]
+    assert len(med) == 15 and yard["median"] == pytest.approx(np.median(med), abs=1e-5)
+    assert "not a test" in like["flag_is"]
+
+
+def test_primary_numbers_are_compared_at_the_decimals_supplied():
+    from knee.nb import n9
+
+    s = {"h1": {"g_lang": {"estimate": -0.0213, "lo": -0.053, "hi": 0.0105},
+                "g_vendor": {"estimate": -0.0173, "lo": -0.0563, "hi": 0.0224}},
+         "h2": {"estimate": 0.0142, "lo": -0.0061, "hi": 0.0338}, "h3": {"estimate": 0.5061, "lo": 0.4897, "hi": 0.5172}}
+    card = {"delta1_g_lang": ["-0.0213", "-0.0530", "+0.0105"], "delta1_g_vendor": ["-0.0173", "-0.056", "+0.022"],
+            "delta2": ["+0.0142", "-0.006", "+0.034"], "h3": ["0.506", "0.490", "0.517"]}
+    m = n9.primary_matches(s, card)
+    assert m["all_match"] is True and m["unknown_keys"] == [] and "error" not in m
+    assert m["numbers"]["delta1_g_vendor"] == {"estimate": True, "lo": True, "hi": True}
+    assert m["compared_at_decimals"] == {"delta1_g_lang": "4, 4, 4", "delta1_g_vendor": "4, 3, 3",
+                                         "delta2": "4, 3, 3", "h3": "3, 3, 3"}
+    agg._check(json.loads(json.dumps(m)))  # booleans and short strings only
+    # one unit of the last supplied decimal off: that number, and only that number, is false
+    off = n9.primary_matches(s, {**card, "delta1_g_lang": ["-0.0214", "-0.0530", "+0.0105"], "h3": ["0.506", "0.491", "0.517"]})
+    assert off["all_match"] is False
+    assert off["numbers"]["delta1_g_lang"] == {"estimate": False, "lo": True, "hi": True}
+    assert off["numbers"]["h3"] == {"estimate": True, "lo": False, "hi": True} and off["numbers"]["delta2"]["hi"] is True
+    # refit noise of about 0.006 is far outside every tolerance
+    assert n9.primary_matches(s, {"delta2": ["+0.0202", "-0.006", "+0.034"]})["numbers"]["delta2"]["estimate"] is False
+    # dict form, numbers, a missing block, nonsense: reported, never raised
+    assert n9.primary_matches(s, {"h3": {"estimate": 0.5061}})["numbers"]["h3"] == {"estimate": True}
+    assert n9.primary_matches({"h1": {"g_vendor": {"category": "not run"}}}, card)["all_match"] is False
+    for bad in ({"h3": ["x", None, "0.5"]}, {"nonsense": [1, 2, 3]}, {"h3": 7}, {}):
+        r = n9.primary_matches(s, bad)
+        assert r["all_match"] is False
+    assert n9.primary_matches(s, {"nonsense": [1, 2, 3]})["unknown_keys"] == ["nonsense"]
+
+
+def test_a_changed_primary_block_is_put_back_from_the_snapshot():
+    from knee.nb import n9
+
+    def summary():
+        return {"h1": {"g_lang": {"estimate": 0.01, "lo": -0.01, "hi": 0.03, "category": "inconclusive"}, "decision": "inconclusive",
+                       "per_finding_exploratory": {"acl": {"lo": 0.0, "hi": 0.1}}},
+                "h2": {"estimate": 0.02, "category": "inconclusive"}, "h3": {"estimate": 0.5, "supported": False},
+                "decisions": {"H1": "inconclusive", "H2": "inconclusive", "H3": "not supported"}, "s2": {"x": 1.0}}
+
+    s = summary()
+    snap = n9._primary_view(s)
+    # the three places where secondary blocks add keys inside H1 are not changes
+    s["h1"]["secondary"] = {"a": 0.5}
+    s["h1"]["g_lang"]["interval_within_fold_study_bootstrap"] = {"lo": 0.0}
+    s["h1"]["per_finding_exploratory_note"] = {"note": "n"}
+    s["baselines"] = {"rows": {}}
+    assert n9._restore_primary(s, snap) is False and s["h1"]["secondary"] == {"a": 0.5}
+    # a changed decision, a changed number, a removed block, an added key: each is seen and undone
+    for change in (lambda s: s["decisions"].update(H1="DINOv2 better"), lambda s: s["h2"].update(estimate=0.5),
+                   lambda s: s.pop("h3"), lambda s: s["h1"]["g_lang"].update(extra=1.0)):
+        change(s)
+        assert n9._restore_primary(s, snap) is True
+        assert n9._primary_view(s) == snap and s["decisions"]["H1"] == "inconclusive" and s["h2"]["estimate"] == 0.02
+        assert s["h1"]["secondary"] == {"a": 0.5} and s["h1"]["per_finding_exploratory_note"] == {"note": "n"}  # the additions stay
+        assert s["h1"]["g_lang"]["interval_within_fold_study_bootstrap"] == {"lo": 0.0} and s["baselines"] == {"rows": {}}
+        assert n9._restore_primary(s, snap) is False
+    s["h1"]["g_lang"] = object()  # not even comparable: put back, without raising
+    assert n9._restore_primary(s, snap) is True and n9._primary_view(s) == snap
 
 
 # ---------------------------------------------------------------- the second interval

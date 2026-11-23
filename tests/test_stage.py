@@ -302,6 +302,7 @@ def test_n6_stage_a_units_and_demo(stage_env, monkeypatch, capfd):
 # ---------------------------------------------------------------- N7 and N9
 
 def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
+    from knee import safe_log
     from knee.nb import n7, n9
     from tests.synth_stage import make_units
 
@@ -346,7 +347,30 @@ def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
     assert s9["s3_gold"]["consistent"] and s9["s4_hidden"]["consistent"]
     assert s9["anti_claim_1"]["d_pre"]["estimate"] > 0
     assert s9["decisions"]["H4"].startswith("not run")
+    assert list(s9["units_found"]) == sorted(s9["units_found"])  # a stable key order between runs
+    assert s9["secondary_mutated_primary"] is False and "primary_matches_previous" not in s9
+    block = json.loads(printed.out.split(safe_log.BEGIN)[-1].split(safe_log.END)[0])
+    desc = block["descriptive_only"]
+    assert desc["label"] == "descriptive, not a test" and block["secondary_mutated_primary"] is False
+    assert not {"same_device_gain", "gap_like_another_seed", "any_finding_auc", "threshold_overshoot"} & set(block)
+    assert set(desc) == {"label", "same_device_gain", "refit_gap", "any_finding_auc", "threshold_overshoot", "unseen_site_cost"}
+    ra = s9["refit_agreement"]["encoders"]["dinov2_vits14"]
+    assert desc["refit_gap"]["median_gap"]["dinov2_vits14"] == {
+        "n7_seed0_vs_stage_a": ra["n7_seed0_vs_stage_a"]["median"], "n7_seed_pairs_median": ra["n7_seed_pairs_median"]["median"]}
+    assert desc["unseen_site_cost"]["convnext_tiny"]["se"] is not None
+    card = _primary_card(s9)  # all four primary numbers exist here: the run agrees with itself, digit for digit
+    assert set(card) == set(n9.PRIMARY_NUMBERS) and n9.primary_matches(s9, card)["all_match"] is True
+    card["h3"][1] = "%+.4f" % (float(card["h3"][1]) + 0.0001)
+    assert n9.primary_matches(s9, card)["numbers"]["h3"] == {"estimate": True, "lo": False, "hi": True}
     _check_secondary(s9, root)
+
+
+def _primary_card(s):
+    """The primary numbers as a run card carries them: signed strings with 4 decimals."""
+    from knee.nb import n9
+
+    return {name: ["%+.4f" % n9._at(s, path)[k] for k in ("estimate", "lo", "hi")]
+            for name, path in n9.PRIMARY_NUMBERS.items() if (n9._at(s, path) or {}).get("estimate") is not None}
 
 
 def _check_secondary(s9, root):
@@ -453,7 +477,8 @@ def _check_round3(s9, root):
     assert ra["fits"]["n7_seed_3"]["device"] == "cpu"
     assert ra["fits"]["n7_seed_3"]["delta1"] == s9["seed_sensitivity"]["delta1_per_seed"]["seed_3"]
     e0 = ra["encoders"]["dinov2_vits14"]
-    assert e0["n7_seed0_vs_stage_a"]["median"] > 1.5 * e0["n7_seed0_vs_n7_seed1"]["median"] > 0
+    assert e0["n7_seed0_vs_stage_a"]["median"] > 1.5 * e0["n7_seed_pairs_median"]["median"] > 0
+    assert ra["seeds"] == [0, 1, 2, 3, 4, 5] and "not a test" in ra["flag_is"]
     assert e0["n7_seed0_vs_stage_a"]["median"] <= e0["n7_seed0_vs_stage_a"]["p99"] <= e0["n7_seed0_vs_stage_a"]["max"]
     assert max(v["n7_seed0_vs_stage_a"]["max"] for v in ra["encoders"].values()) == pytest.approx(
         s9["seed_sensitivity"]["seed0_refit_check"]["max_abs_probability_gap"], abs=1e-4)
@@ -466,11 +491,16 @@ def _check_round3(s9, root):
         assert 0.5 < v["any_finding_auc"] <= 1.0
         tr = s9["triage"]["models"][e]
         if tr["sensitivity"] is not None:
-            assert v["threshold_overshoot"] == pytest.approx(tr["sensitivity"] - 0.95, abs=6e-3)
-        if tr["specificity"] is None:
+            assert v["threshold_overshoot"] == pytest.approx(tr["sensitivity"] - 0.95, abs=0.011)
+            assert v["threshold_overshoot"] == round(v["threshold_overshoot"], 2)  # 2 decimals, like every share
+        normal = [0 if x == "<5" else x for x in (tr["confusion"]["tn"], tr["confusion"]["fp"])]
+        if tr["specificity"] is None or sum(normal) < 15:  # under 20 normal studies (counts are rounded to 5)
             assert v["specificity_interval"] is None
-        else:
+        elif v["specificity_interval"] is not None:
             assert v["specificity_interval"][0] <= tr["specificity"] <= v["specificity_interval"][1]
+    assert "binomial only" in ts["interval_scope"] and ts["interval_min_studies"] == 20
+    # the synthetic data has a handful of normal studies: an interval would give their exact count back
+    assert all(v["specificity_interval"] is None for v in ts["models"].values())
     # 4. the largest site: unseen (S2) against seen (S1), at equal and larger training size
     ls = s9["largest_site_decomposition"]
     assert ls["group"].startswith("LANG") and ls["fold"] in range(5)
@@ -482,6 +512,11 @@ def _check_round3(s9, root):
         assert v["studies"]["a"] >= v["studies"]["b"] and 0.5 < v["b_seen_equal_training_size"] <= 1
         assert v["unseen_site_cost_at_equal_training_size"] == pytest.approx(
             v["b_seen_equal_training_size"] - v["a_on_b_studies"], abs=2e-4)
+        assert 0 < v["unseen_site_cost_se"] < 0.2 and 0 < v["unseen_site_cost_se_valid_share"] <= 1
+        assert v["larger_training_set_view_paired"] == pytest.approx(
+            (v["c_seen_larger_training_size"] - v["a_on_c_studies"]) - v["unseen_site_cost_at_equal_training_size"], abs=3e-4)
+    assert ls["caveat"] == "one site, one model pair, descriptive" and ls["se_draws"] == 2000
+    assert any("not H2" in x for x in ls["caveats"])
     # 5. best-epoch spread and the schedule
     be = s9["best_epoch_spread"]["encoders"]["dinov2_vits14"]
     assert be["chosen_config"] == {"lowest": 4.0, "median": 4.5, "p90": 5.0, "share_at_or_below_6": 1.0, "share_at_cap": 0.0}
@@ -493,13 +528,22 @@ def _check_round3(s9, root):
     exact = json.loads((paths.WORKING / "private" / "n9" / "gold_count.json").read_text())
     n = exact["gold_studies_scored_by_both_main_encoders"]
     assert 50 <= n <= 58 and gu["studies"] == 5 * round(n / 5) and gu["n_draws"] == 2000
-    assert str(n) not in json.dumps(gu) or n % 5 == 0  # the summary holds only the rounded count
+    def ints(o):  # every integer anywhere in the block
+        if isinstance(o, dict):
+            return [x for v in o.values() for x in ints(v)]
+        if isinstance(o, list):
+            return [x for v in o for x in ints(v)]
+        return [o] if isinstance(o, int) and not isinstance(o, bool) else []
+
+    assert sorted(ints(gu)) == [gu["studies"], 2000]  # the summary holds only the rounded count (and the draws)
     for e in ("dinov2_vits14", "convnext_tiny"):
         assert gu["macro_auc"][e]["estimate"] == s9["s3_gold"]["macro_auc"][e] and 0 < gu["macro_auc"][e]["se"] < 0.1
     assert gu["delta1"]["estimate"] == pytest.approx(s9["s3_gold"]["delta1"], abs=2e-4) and gu["delta1"]["se"] > 0
     # 7. Delta2 without the look-alike studies (post hoc); the pairs are the ones N7's probe counted
     h2 = s9["h2_without_lookalikes"]
-    assert h2["post_hoc"] is True and h2["pairs_match_n7_probe"] is True and h2["studies_removed"] in ("<5", 5)
+    assert h2["post_hoc"] is True and h2["rounded_pair_count_matches_n7_probe"] is True and h2["studies_removed"] in ("<5", 5)
+    assert "pairs_match_n7_probe" not in h2 and "not exactly" in h2["pair_count_check"]
+    assert h2["pair_encoder"] == "dinov2_vits14" and len(h2["caveats"]) == 2 and h2["share_removed"] > 0
     assert h2["delta2_registered"]["estimate"] == s9["h2"]["estimate"]
     assert h2["delta2_without_lookalikes"]["estimate"] == pytest.approx(s9["h2"]["estimate"], abs=0.01)
     assert h2["change"] == pytest.approx(h2["delta2_without_lookalikes"]["estimate"] - s9["h2"]["estimate"], abs=2e-4)
@@ -573,9 +617,94 @@ def test_secondary_faults_never_cost_the_freeze_file_or_the_base_outputs(stage_e
     assert sdg["stage_a_device"] == "unknown" and sdg["gain_over_own_default_mixes_devices"] == "unknown"  # no run.json
     assert len(saved["refit_agreement"]["fits"]) == 3 and saved["refit_agreement"]["fits"]["stage_a"]["device"] == "unknown"
     assert set(saved["triage_secondary"]["models"]["dinov2_vits14"]) == {"any_finding_auc"}  # no thresholds: the AUC only
-    assert saved["h2_without_lookalikes"]["pairs_match_n7_probe"] is None  # the probe did not run in N7
+    assert saved["h2_without_lookalikes"]["rounded_pair_count_matches_n7_probe"] is None  # the probe did not run in N7
     assert set(saved["largest_site_decomposition"]["encoders"]) == {"dinov2_vits14", "convnext_tiny"}
     assert not [u for u in facts["uids"] if u in json.dumps(saved)]
+    assert saved["secondary_mutated_primary"] is False
+    _round3_faults(inp, tmp_path, monkeypatch, saved)
+
+
+def _round3_faults(inp, tmp_path, monkeypatch, first):
+    """Review round 3, findings 1, 2, 6, 7 and 11: nothing in the secondary code can cost or change the
+    primary results, and a rerun on the same inputs gives the same primary numbers."""
+    import copy
+    import sys
+
+    import knee.nb as nb
+    from knee.nb import n9, n9c, n9x
+
+    primary = n9._primary_view(first)
+    assert set(primary) == {"h1", "h2", "h3", "decisions"}
+
+    card = _primary_card(first)
+    assert set(card) == set(n9.PRIMARY_NUMBERS)  # Delta1 under both groupings, Delta2 and H3
+
+    # --- finding 1: n9c cannot be imported, n9x's own blocks try to write into what they were given
+    on_disk = {}
+
+    def early(c):  # the first secondary block: the primary results are on disk already
+        on_disk["first"] = json.loads((paths.WORKING / "agg_results.json").read_text())
+        c.h1["estimate"], c.h2["estimate"], c.h2["category"] = 9.0, 9.0, "supported"  # copies: no effect
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "working_r3a")
+    monkeypatch.setattr(n9x, "per_fold_delta1", early)
+    monkeypatch.delattr(nb, "n9c")
+    monkeypatch.setitem(sys.modules, "knee.nb.n9c", None)  # "from . import n9c" now raises ImportError
+    sa = n9.run(root=inp, n_boot=50, quiet=True, expect_primary=card)
+    saved = json.loads((paths.WORKING / "agg_results.json").read_text())
+    assert n9._primary_view(on_disk["first"]) == primary and "secondary_errors" not in on_disk["first"]
+    assert on_disk["first"]["decisions"] == first["decisions"] and "average_precision" not in on_disk["first"]
+    assert on_disk["first"]["primary_matches_previous"]["all_match"] is True  # known before any secondary block
+    assert "ImportError" in saved["secondary_errors"]["n9c"] or "ModuleNotFoundError" in saved["secondary_errors"]["n9c"]
+    assert "RuntimeError" in saved["secondary_errors"]["h1.secondary"] and "secondary" not in saved["h1"]
+    assert n9._primary_view(saved) == primary and saved["decisions"] == first["decisions"]  # unchanged h1, h2, h3, decisions
+    assert saved["secondary_mutated_primary"] is False and sa["decisions"] == first["decisions"]
+    assert "average_precision" in saved and "baselines" in saved  # the other n9x blocks still ran
+    assert not {"refit_agreement", "triage_secondary", "gold_uncertainty", "h2_without_lookalikes"} & set(saved)
+    pm = saved["primary_matches_previous"]
+    assert pm["all_match"] is True and set(pm["numbers"]) == set(card)
+    assert all(v is True for f in pm["numbers"].values() for v in f.values())
+    monkeypatch.undo()  # n9c is importable again; WORKING is set again below
+
+    # --- finding 1 again: add_all itself crashes
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "working_r3c")
+    monkeypatch.setattr(n9x, "add_all", lambda s, c: 1 / 0)
+    n9.run(root=inp, n_boot=50, quiet=True)
+    crashed = json.loads((paths.WORKING / "agg_results.json").read_text())
+    assert "ZeroDivisionError" in crashed["secondary_errors"]["n9x"] and n9._primary_view(crashed) == primary
+    monkeypatch.undo()
+
+    # --- finding 2: a block that reaches the live summary (the copies are switched off for this run);
+    # finding 7: a failed baselines block leaves no stub; finding 11: no look-alike pair = the registered Delta2
+    def mutate(c, s):
+        s["decisions"]["H1"] = "DINOv2 better"
+        s["h1"]["g_lang"]["estimate"] = 0.5
+        s["h2"]["category"] = "supported"
+        del s["h3"]
+        c.h2["lo"] = -9.0
+        return {"descriptive": True, "note": "n"}
+
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "working_r3b")
+    monkeypatch.setattr(n9x, "_copy", lambda x: x)
+    monkeypatch.setattr(n9x, "baselines", lambda c: 1 / 0)
+    monkeypatch.setattr(n9c, "LOOKALIKE_COSINE", 1.5)  # no pair can be above it
+    monkeypatch.setattr(n9c, "BLOCKS", [*n9c.BLOCKS, ("mutator", mutate, lambda s: s, "mutator")])
+    wrong = copy.deepcopy(card)
+    wrong["delta2"][0] = "%+.4f" % (float(card["delta2"][0]) + 0.006)  # what a refit of N7 would do
+    sb = n9.run(root=inp, n_boot=50, quiet=True, expect_primary=wrong)
+    saved = json.loads((paths.WORKING / "agg_results.json").read_text())
+    assert saved["secondary_mutated_primary"] is True and sb["secondary_mutated_primary"] is True
+    assert n9._primary_view(saved) == primary and saved["decisions"] == first["decisions"]  # put back
+    assert saved["mutator"] == {"descriptive": True, "note": "n"} and "mutator" not in saved["secondary_errors"]
+    assert saved["h1"]["per_finding_exploratory_note"]["note"] and "secondary" in saved["h1"]  # the additions stay
+    assert "baselines" not in saved and set(saved["secondary_errors"]) == {"baselines", "baselines.same_device_gain"}
+    h2 = saved["h2_without_lookalikes"]
+    assert h2["pairs"] == 0 and h2["studies_removed"] == 0 and h2["change"] == 0.0
+    assert h2["delta2_without_lookalikes"] == {k: first["h2"][k] for k in ("estimate", "lo", "hi", "half_width")}
+    pm = saved["primary_matches_previous"]
+    assert pm["all_match"] is False and pm["numbers"]["delta2"] == {"estimate": False, "lo": True, "hi": True}
+    assert all(v is True for name, f in pm["numbers"].items() if name != "delta2" for v in f.values())
 
 
 def test_chain_guard_refuses_units_from_other_s2_folds(stage_env, tmp_path, monkeypatch):

@@ -5,6 +5,8 @@ private/n7/{s1,vendor,s2seeds,default,default_fixed}_<encoder>.csv, triage_thres
 agg_n7.json, and each unit's predictions.csv, trials.csv, l1.csv, config.json. No block fits a
 model. Each runs under n9x.add_all's wrapper, so a failure costs that block only. Each block
 carries `descriptive: true` and a one-line `scope`; none changes a decision or an existing key.
+Each block gets a deep copy of the summary, and n9.run checks afterwards that H1, H2, H3 and the
+decisions are what they were (see n9._restore_primary).
 
   baselines.same_device_gain        tuned minus default, both refit by N7 on N7's device
   refit_agreement                   N7's seed-0 refit against Stage A's fit, with a seed-1 yardstick
@@ -30,6 +32,20 @@ from . import n9x
 LOOKALIKE_COSINE = 0.90
 GAP_FACTOR = 1.5  # refit_agreement: the Stage A gap may be at most this many times the seed-0-to-seed-1 gap
 TARGET_SENSITIVITY = 0.95
+MIN_N_FOR_INTERVAL = 20  # triage: no Wilson interval from fewer studies (it would give the exact count back)
+N_DRAWS = 2000  # study bootstraps for the descriptive standard errors
+
+
+def _study_draws(n: int, n_draws: int, seed: int):
+    """Study-bootstrap weights: `n_draws` times, n studies drawn with replacement (multiplicities)."""
+    rng = np.random.default_rng(seed)
+    for _ in range(n_draws):
+        yield np.bincount(rng.integers(0, n, n), minlength=n).astype(float)
+
+
+def _se(v) -> float | None:
+    ok = np.isfinite(v)
+    return core._r(v[ok].std(ddof=1)) if ok.sum() > 1 else None
 
 
 def _stage_a_device(c) -> str:
@@ -92,13 +108,21 @@ def _gap_stats(a, b) -> dict:
     return {"median": core._r(q[0], 5), "p90": core._r(q[1], 5), "p99": core._r(q[2], 5), "max": core._r(g.max(), 5)}
 
 
+def _pairs_median(P: dict, seeds: list, rows) -> dict:
+    """The yardstick: the gap statistics between every two N7 seeds, then the median over those pairs."""
+    stats = [_gap_stats(P[a][rows], P[b][rows]) for i, a in enumerate(seeds) for b in seeds[i + 1:]]
+    return {k: core._r(float(np.median([x[k] for x in stats])), 5) for k in stats[0]}
+
+
 def refit_agreement(c, s) -> dict:
     """Is N7's seed-0 refit as close to Stage A's stored fit as two seeds of N7 are to each other?
 
     Per main encoder: the absolute probability gap over all evaluation studies and findings between
-    N7 seed 0 and Stage A, and, as the yardstick, between N7 seed 0 and N7 seed 1.
+    N7 seed 0 and Stage A, and, as the yardstick, between every two N7 seeds (each statistic is the
+    median over all seed pairs: 15 pairs with six seeds).
     gap_like_another_seed = for every encoder the median and the 99th percentile of the first are at
-    most 1.5 times those of the second. The seven fits of Delta1 are listed with their device."""
+    most 1.5 times those of the yardstick. It is a rule of thumb with a factor chosen after the
+    results, not a test: read the statistics. The seven fits of Delta1 are listed with their device."""
     n7_dev, sa_dev = n9x._n7_device(c) or "unknown", _stage_a_device(c)
     preds = {e: n9x._seed_predictions(c, e) for e in (core.DINO, core.CONV)}
     seeds = sorted(sd for sd in set(preds[core.DINO]) & set(preds[core.CONV])
@@ -107,14 +131,15 @@ def refit_agreement(c, s) -> dict:
         return {"descriptive": True, "status": "not available (N7 wrote no seed 0 and seed 1 refits)"}
     out = {"descriptive": True,
            "scope": "N7's refits against Stage A's stored predictions; a check of the refit, decides nothing",
-           "factor": GAP_FACTOR, "encoders": {}}
+           "factor": GAP_FACTOR, "flag_is": "a rule of thumb (factor chosen after the results), not a test",
+           "yardstick": "each statistic's median over all pairs of N7 seeds", "seeds": seeds, "encoders": {}}
     flags = []
     for e in (core.DINO, core.CONV):
         a = _gap_stats(preds[e][0][c.ev], c.units[e][c.ev])
-        b = _gap_stats(preds[e][0][c.ev], preds[e][1][c.ev])
+        b = _pairs_median(preds[e], seeds, c.ev)
         like = bool(a["median"] <= GAP_FACTOR * b["median"] and a["p99"] <= GAP_FACTOR * b["p99"])
         flags.append(like)
-        out["encoders"][e] = {"n7_seed0_vs_stage_a": a, "n7_seed0_vs_n7_seed1": b, "gap_like_another_seed": like}
+        out["encoders"][e] = {"n7_seed0_vs_stage_a": a, "n7_seed_pairs_median": b, "gap_like_another_seed": like}
     out["gap_like_another_seed"] = all(flags)
     same = [_delta1(c, preds[core.DINO][sd], preds[core.CONV][sd]) for sd in seeds]
     out["fits"] = {"stage_a": {"delta1": c.h1["estimate"], "device": sa_dev, "role": "the decision fit"},
@@ -130,11 +155,25 @@ def refit_agreement(c, s) -> dict:
 # ---------------------------------------------------------------- 3. triage
 
 def wilson(k: int, n: int, z: float = 1.959964) -> tuple[float, float]:
-    """Wilson score interval (95%) for a share k / n."""
+    """Wilson score interval (95%) for a share k / n, inside [0, 1]; (nan, nan) when n is 0.
+
+    Binomial only: it treats the n studies as independent draws and the threshold as fixed."""
+    if n <= 0:
+        return float("nan"), float("nan")
     p = k / n
     centre = (p + z * z / (2 * n)) / (1 + z * z / n)
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
-    return float(centre - half), float(centre + half)
+    return float(min(1.0, max(0.0, centre - half))), float(min(1.0, max(0.0, centre + half)))
+
+
+def specificity_interval(tn: int, fp: int) -> list | None:
+    """Wilson interval of tn / (tn + fp) at 2 decimals. None with fewer than 20 normal studies, or
+    when a cell holds 1 to 4 studies: the interval would give the exact count back."""
+    n = tn + fp
+    if n < MIN_N_FOR_INTERVAL or any(1 <= x <= 4 for x in (tn, fp)):
+        return None
+    lo, hi = wilson(tn, n)
+    return [agg.share(lo), agg.share(hi)]
 
 
 def triage_secondary(c, s) -> dict:
@@ -142,15 +181,19 @@ def triage_secondary(c, s) -> dict:
 
     any_finding_auc: AUC of the highest of the 12 probabilities against "any finding present",
     pairs inside a test fold only, pair-weighted (as the primary metric). specificity_interval: Wilson
-    95% from the exact counts (not shown when a cell it uses holds 1 to 4 studies).
-    threshold_overshoot: achieved test sensitivity minus the 0.95 the inner threshold aimed at."""
+    95% from the exact counts, binomial only (studies independent, thresholds fixed, no site
+    clustering); null with fewer than 20 normal studies or when a cell it uses holds 1 to 4.
+    threshold_overshoot: achieved test sensitivity minus the 0.95 the inner threshold aimed at, at 2
+    decimals like every share."""
     pos = (c.Y[:, c.elig] == 1).any(axis=1)
     p = (c.n7_dir / "triage_thresholds.csv") if c.n7_dir else None
     thr = pd.read_csv(p) if p is not None and p.exists() else None
     K = c.d.n_folds("s2")
     out = {"descriptive": True,
            "scope": "any finding = max of 12 probabilities; uncertain labels count as absent; decides nothing",
-           "any_finding_prevalence": agg.share(pos[c.ev].mean()), "target_sensitivity": TARGET_SENSITIVITY, "models": {}}
+           "any_finding_prevalence": agg.share(pos[c.ev].mean()), "target_sensitivity": TARGET_SENSITIVITY,
+           "interval_scope": "binomial only: studies independent, thresholds fixed, no site clustering",
+           "interval_min_studies": MIN_N_FOR_INTERVAL, "models": {}}
     for e, P in c.units.items():
         if not c.complete(P):
             continue
@@ -164,12 +207,8 @@ def triage_secondary(c, s) -> dict:
                 cm = metrics.confusion(score[rows] >= tk, pos[rows])
                 tot = {a: tot[a] + cm[a] for a in tot}
             r = metrics.rates(tot, suppress_small=True)
-            if r["specificity"] is not None:
-                lo, hi = wilson(tot["tn"], tot["tn"] + tot["fp"])
-                row["specificity_interval"] = [agg.share(lo), agg.share(hi)]
-            else:
-                row["specificity_interval"] = None
-            row["threshold_overshoot"] = (core._r(r["sensitivity"] - TARGET_SENSITIVITY, 3)
+            row["specificity_interval"] = specificity_interval(tot["tn"], tot["fp"])
+            row["threshold_overshoot"] = (agg.share(r["sensitivity"] - TARGET_SENSITIVITY)
                                           if r["sensitivity"] is not None else None)
         out["models"][e] = row
     return out
@@ -192,8 +231,12 @@ def largest_site_decomposition(c, s) -> dict:
       b  S1 predictions, the group's studies in S1 fold k    seen site, the same training-set size and config
       c  S1 predictions, the group's studies in the other S1 folds   seen site, larger training sets
     a_on_b_studies and a_on_c_studies score the S2 predictions on exactly b's and c's studies.
-    b minus a_on_b_studies: same studies, same size, same config -> the cost of the site being unseen.
+    b minus a_on_b_studies: same studies, same size, same config -> an estimate of the cost of the
+    site being unseen. It is one site and one fitted model per side (one seed), and the two models
+    also differ in their mix of sites. Its se is a paired study bootstrap over b's studies (both
+    models on the same draw): it covers which of the group's studies were drawn, nothing else.
     c minus b: different studies and other folds' configs -> only a rough view of training-set size.
+    (c - a_on_c) - (b - a_on_b): the same view with each term paired on its own studies.
     S1 can split one patient across folds, so every "seen" number is an upper bound."""
     d, f1 = c.d, c.d.folds["s1_fold"]
     g = pd.Series(c.g).astype(str)
@@ -209,6 +252,7 @@ def largest_site_decomposition(c, s) -> dict:
     others = sorted(set(f1[train].tolist()) - {k})
     out = {"descriptive": True,
            "scope": "one site group, existing S1 and S2 predictions; separates unseen site from training size; decides nothing",
+           "caveat": "one site, one model pair, descriptive",
            "group": focus, "fold": k,
            "training_sets": {"a_s2_fold_k": size(np.isin(np.arange(d.n), d.split(k)[0])),
                              "b_s1_fold_k": size(train & (f1 != k)),
@@ -216,8 +260,12 @@ def largest_site_decomposition(c, s) -> dict:
                                  "studies": agg.count(int(np.mean([(train & (f1 != j)).sum() for j in others]))) if others else None,
                                  "group_share": agg.share(np.mean([(train & (f1 != j) & in_group).sum() / max((train & (f1 != j)).sum(), 1)
                                                                    for j in others])) if others else None}},
-           "caveats": ["b and c are different studies; c also uses the other folds' configs",
+           "caveats": ["one site, one fitted model per side, one seed; not H2",
+                       "the se is a study bootstrap on b's studies: not sites, seeds or refits",
+                       "the S1 model also differs from the S2 model in its mix of sites, not only in seeing the group",
+                       "b and c are different studies; c also uses the other folds' configs",
                        "S1 folds are random, so one patient can sit on both sides: seen-site numbers are upper bounds"],
+           "se_draws": N_DRAWS,
            "encoders": {}}
     for e, P2 in c.units.items():
         P1 = c.n7_csv(f"s1_{e}.csv")
@@ -234,7 +282,16 @@ def largest_site_decomposition(c, s) -> dict:
              "b_seen_equal_training_size": m(P1, rb, zb), "c_seen_larger_training_size": m(P1, rc, f1[rc]),
              "studies": {"a": agg.count(len(rows)), "b": agg.count(len(rb)), "c": agg.count(len(rc))}}
         v["unseen_site_cost_at_equal_training_size"] = _minus(v["b_seen_equal_training_size"], v["a_on_b_studies"])
+        cost = np.full(N_DRAWS, np.nan)
+        if len(rb) and v["unseen_site_cost_at_equal_training_size"] is not None:
+            seen, unseen, yb = P1[rb], P2[rb], c.Y[rb]
+            for i, w in enumerate(_study_draws(len(rb), N_DRAWS, c.seed)):  # both models on the same draw
+                cost[i] = metrics.macro(seen, yb, zb, c.elig, w) - metrics.macro(unseen, yb, zb, c.elig, w)
+        v["unseen_site_cost_se"] = _se(cost)
+        v["unseen_site_cost_se_valid_share"] = core._r(float(np.isfinite(cost).mean()), 3)
         v["larger_training_set_seen_site_rough"] = _minus(v["c_seen_larger_training_size"], v["b_seen_equal_training_size"])
+        seen_gain_c = _minus(v["c_seen_larger_training_size"], v["a_on_c_studies"])
+        v["larger_training_set_view_paired"] = _minus(seen_gain_c, v["unseen_site_cost_at_equal_training_size"])
         out["encoders"][e] = v
     if not out["encoders"]:
         out["status"] = "not available (no S1 predictions from N7)"
@@ -305,17 +362,12 @@ def gold_uncertainty(c, s) -> dict:
     def macro(P, w=None):
         return metrics.macro(P[gold], GY[gold], zeros, c.g_find, w)
 
-    n_draws = 2000
-    rng = np.random.default_rng(c.seed)
+    n_draws = N_DRAWS
     draws = {e: np.empty(n_draws) for e in models}
-    for b in range(n_draws):
-        w = np.bincount(rng.integers(0, len(gold), len(gold)), minlength=len(gold)).astype(float)
+    for b, w in enumerate(_study_draws(len(gold), n_draws, c.seed)):
         for e, P in models.items():
             draws[e][b] = macro(P, w)
-
-    def se(v):
-        ok = np.isfinite(v)
-        return core._r(v[ok].std(ddof=1)) if ok.sum() > 1 else None
+    se = _se
 
     out = {"descriptive": True, "scope": "gold studies only; covers which gold studies were drawn, not sites or seeds",
            "studies": agg.count(len(gold)), "exact_count_file": "private/n9/gold_count.json", "n_draws": n_draws,
@@ -337,16 +389,22 @@ def h2_without_lookalikes(c, s) -> dict:
 
     N7 wrote only counts of the pairs, not who they are. N9 has the N5 embeddings attached (StageData
     needs them), and the pairs take seconds on CPU, so they are found again here with the pilot's
-    vectors and code (stage.near_duplicates, DINOv2 study vectors, cosine above 0.90). The pair count
-    is compared with N7's probe. Membership stays in memory; only counts are reported."""
+    vectors and code (stage.near_duplicates, DINOv2 study vectors, cosine above 0.90). The pairs
+    come from one encoder's vectors (DINOv2's), which can favour one side of Delta2, and 0.90 is one
+    of the probe's three thresholds, picked after the results. N7 stored its pair count rounded to 5,
+    so the count found here can only be compared after the same rounding
+    (rounded_pair_count_matches_n7_probe: true means "within rounding", not "equal").
+    Membership stays in memory; only counts are reported."""
     out = {"descriptive": True, "post_hoc": True,
            "scope": "sensitivity of Delta2 to look-alike studies; added after results were seen; decides nothing",
-           "cosine_above": LOOKALIKE_COSINE}
+           "cosine_above": LOOKALIKE_COSINE, "pair_encoder": core.DINO,
+           "caveats": ["pairs come from one encoder's vectors (DINOv2), which can favour one side",
+                       "the threshold 0.90 is one of the probe's three and was chosen after the results"]}
     s1 = {e: c.n7_csv(f"s1_{e}.csv") for e in (core.DINO, core.CONV)}
     if any(v is None for v in s1.values()) or c.h2.get("estimate") is None:
         return {**out, "status": "not available (H2 was not run: no S1 predictions)"}
     d, f1 = c.d, c.d.folds["s1_fold"]
-    pairs = stage.near_duplicates(d.study_vectors(core.DINO), np.flatnonzero(d.usable), LOOKALIKE_COSINE, "cpu")
+    pairs = stage.near_duplicates(d.study_vectors(out["pair_encoder"]), np.flatnonzero(d.usable), LOOKALIKE_COSINE, "cpu")
     members = np.unique(np.r_[pairs["row_a"].to_numpy(int), pairs["row_b"].to_numpy(int)])
     A, B, sA, sB = c.units[core.DINO], c.units[core.CONV], s1[core.DINO], s1[core.CONV]
     ev2 = c.ev[(f1[c.ev] >= 0) & np.isfinite(sA[c.ev]).all(axis=1) & np.isfinite(sB[c.ev]).all(axis=1)]
@@ -364,7 +422,8 @@ def h2_without_lookalikes(c, s) -> dict:
     probe = (s.get("near_duplicate_probe") or {}).get(f"cosine_above_{LOOKALIKE_COSINE:.2f}") or {}
     out.update({"pair_source": "found again in N9 from the attached N5 embeddings with the pilot's code (N7 wrote counts only)",
                 "pairs": agg.count(len(pairs)),
-                "pairs_match_n7_probe": (probe.get("pairs") == agg.count(len(pairs))) if probe else None,
+                "rounded_pair_count_matches_n7_probe": (probe.get("pairs") == agg.count(len(pairs))) if probe else None,
+                "pair_count_check": "N7 stored its count rounded to 5: true = equal after that rounding, not exactly equal",
                 "studies_removed": agg.count(int(len(ev2) - len(keep))),
                 "share_removed": agg.share((len(ev2) - len(keep)) / max(len(ev2), 1)),
                 "delta2_registered": {k: c.h2.get(k) for k in ("estimate", "lo", "hi")},
@@ -389,7 +448,8 @@ def _root(s):
 
 
 BLOCKS = [
-    ("baselines.same_device_gain", same_device_gain, lambda s: s.setdefault("baselines", {}), "same_device_gain"),
+    # s["baselines"], not setdefault: when the baselines block failed its key stays absent (no stub)
+    ("baselines.same_device_gain", same_device_gain, lambda s: s["baselines"], "same_device_gain"),
     ("refit_agreement", refit_agreement, _root, "refit_agreement"),
     ("triage_secondary", triage_secondary, _root, "triage_secondary"),
     ("largest_site_decomposition", largest_site_decomposition, _root, "largest_site_decomposition"),

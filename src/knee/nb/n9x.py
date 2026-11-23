@@ -2,7 +2,9 @@
 
 Rule: nothing here changes H1, H2 or H3, the primary metric, a chosen setting or an existing
 number in agg_results.json. Every block has its own new key. A block that fails is recorded under
-"secondary_errors" (error type and place only) and the freeze file is still written.
+"secondary_errors" (error type and place only) and the freeze file is still written. n9.run
+writes the freeze file once before these blocks and again after them, hands them copies of the
+primary results, and restores those results if a block changed them anyway.
 
 Blocks and what they read:
   h1.secondary                   per-fold Delta1 and its unweighted mean (Stage A predictions)
@@ -16,6 +18,7 @@ Blocks and what they read:
 """
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -333,32 +336,49 @@ def near_duplicate_probe(c: Ctx) -> dict:
     return probe if probe else {"status": "not run (no probe in agg_n7.json)"}
 
 
-def add_all(s: dict, c: Ctx) -> None:
-    """Add every secondary block to the summary; a failing block is recorded and skipped."""
-    errors = {}
+def _copy(x):
+    """What a block is handed: a deep copy, so it cannot write into the summary."""
+    return copy.deepcopy(x)
 
-    def put(name: str, fn, target: dict, key: str) -> None:
+
+def add_all(s: dict, c: Ctx) -> None:
+    """Add every secondary block to the summary; a failing block is recorded and skipped.
+
+    Nothing here may cost the primary results: a block that raises, returns an unsafe value or has no
+    place to go is recorded under secondary_errors; so is knee.nb.n9c when it cannot be imported.
+    The n9c blocks get a deep copy of the summary. n9.run wrote the freeze file before this call and
+    checks H1, H2, H3 and the decisions after it."""
+    errors = s.setdefault("secondary_errors", {})
+
+    def put(name: str, fn, where, key: str) -> None:
         try:
-            val = fn(c)
+            val = fn()
             # the same check agg.write applies to the whole file: an unsafe value (a small count, a
             # data-like string) costs this block only, never the decisions
             agg._check(json.loads(json.dumps(val, default=agg._json_default)), path=name)
-            target[key] = val
+            where(s)[key] = val
         except Exception as e:  # noqa: BLE001 - descriptive extras must not cost the freeze file
             errors[name] = safe_log.describe(type(e), e.__traceback__)
 
-    put("h1.secondary", per_fold_delta1, s["h1"], "secondary")
-    put("interval_within_fold_study_bootstrap", study_bootstrap, s["h1"]["g_lang"],
-        "interval_within_fold_study_bootstrap")
-    put("average_precision", average_precision, s, "average_precision")
-    put("seed_sensitivity", seed_sensitivity, s, "seed_sensitivity")
-    put("triage", triage, s, "triage")
-    put("baselines", baselines, s, "baselines")
-    put("hpo_evidence", hpo, s, "hpo_evidence")
-    put("near_duplicate_probe", near_duplicate_probe, s, "near_duplicate_probe")
-    # blocks added after the results critique (knee.nb.n9c): the same wrapper, new keys only
-    from . import n9c
+    def root(s):
+        return s
 
-    for name, fn, where, key in n9c.BLOCKS:
-        put(name, lambda c, fn=fn: fn(c, s), where(s), key)
-    s["secondary_errors"] = errors
+    put("h1.secondary", lambda: per_fold_delta1(c), lambda s: s["h1"], "secondary")
+    put("interval_within_fold_study_bootstrap", lambda: study_bootstrap(c), lambda s: s["h1"]["g_lang"],
+        "interval_within_fold_study_bootstrap")
+    put("average_precision", lambda: average_precision(c), root, "average_precision")
+    put("seed_sensitivity", lambda: seed_sensitivity(c), root, "seed_sensitivity")
+    put("triage", lambda: triage(c), root, "triage")
+    put("baselines", lambda: baselines(c), root, "baselines")
+    put("hpo_evidence", lambda: hpo(c), root, "hpo_evidence")
+    put("near_duplicate_probe", lambda: near_duplicate_probe(c), root, "near_duplicate_probe")
+    # blocks added after the results critique (knee.nb.n9c): the same wrapper, new keys only
+    try:
+        from . import n9c
+
+        blocks = list(n9c.BLOCKS)
+    except Exception as e:  # noqa: BLE001 - an unimportable n9c costs its own blocks only
+        errors["n9c"] = safe_log.describe(type(e), e.__traceback__)
+        blocks = []
+    for name, fn, where, key in blocks:
+        put(name, lambda fn=fn: fn(c, _copy(s)), where, key)

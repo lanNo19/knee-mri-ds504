@@ -29,10 +29,14 @@ over G-lang groups and a delete-one-group jackknife t-interval:
 Chain guard (first step): every attached Stage A unit's test fold must equal S2 fold k of the
 attached folds.csv (knee.units says what this does and does not guarantee). The result is the
 "chain" block; a mismatch writes the file with status "chain mismatch" and fails the step.
-Secondary, descriptive blocks (knee.nb.n9x) are added after the decisions and change none of them.
+Secondary, descriptive blocks (knee.nb.n9x) are added after the decisions and change none of them:
+agg_results.json is written with the primary results before they run and again after them, they
+work on copies, and H1, H2, H3 and the decisions are compared with a snapshot afterwards
+(secondary_mutated_primary; on a difference the snapshot is put back).
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -40,7 +44,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .. import agg, intervals, metrics, paths, stage
+from .. import agg, intervals, metrics, paths, safe_log, stage
 from .. import units as unit_files
 from ..labels import FINDINGS, UID
 from . import common
@@ -59,7 +63,7 @@ def _load_units(base: Path, n: int, row_of: dict, seen: dict | None = None) -> d
         rows = df[UID].astype(str).map(row_of)
         ok = rows.notna().to_numpy()
         P[rows[ok].astype(int).to_numpy()] = df.loc[ok, FINDINGS].to_numpy(float)
-    out["_folds"] = {e: sorted(int(f) for (ee, f) in seen if ee == e) for e in {e for e, _ in seen}}
+    out["_folds"] = {e: sorted(int(f) for (ee, f) in seen if ee == e) for e in sorted({e for e, _ in seen})}
     return out
 
 
@@ -112,6 +116,103 @@ def _controls(root) -> dict:
     return out
 
 
+PRIMARY = ("h1", "h2", "h3", "decisions")
+# the only places inside the primary blocks where a secondary block may add a key
+SECONDARY_INSIDE_PRIMARY = (("h1", "secondary"), ("h1", "g_lang", "interval_within_fold_study_bootstrap"),
+                            ("h1", "per_finding_exploratory_note"))
+PRIMARY_NUMBERS = {"delta1_g_lang": ("h1", "g_lang"), "delta1_g_vendor": ("h1", "g_vendor"), "delta2": ("h2",), "h3": ("h3",)}
+MAX_DECIMALS = 4  # the freeze file holds 4 decimals
+
+
+def _at(o, path):
+    for k in path:
+        o = o.get(k) if isinstance(o, dict) else None
+    return o
+
+
+def _primary_view(s: dict) -> dict:
+    """H1, H2, H3 and the decisions as the primary analysis wrote them: a deep copy without the
+    keys secondary blocks add inside them."""
+    v = copy.deepcopy({k: s[k] for k in PRIMARY if k in s})
+    for *parents, key in SECONDARY_INSIDE_PRIMARY:
+        holder = _at(v, parents)
+        if isinstance(holder, dict):
+            holder.pop(key, None)
+    return v
+
+
+def _same(a, b) -> bool:
+    def text(o):
+        return json.dumps(o, sort_keys=True, default=agg._json_default)
+
+    return text(a) == text(b)
+
+
+def _restore_primary(s: dict, snapshot: dict) -> bool:
+    """True if a secondary block changed H1, H2, H3 or the decisions. They are then put back from the
+    snapshot taken before the blocks; the keys the blocks may add inside them are kept. Never raises."""
+    try:
+        if _same(_primary_view(s), snapshot):
+            return False
+    except Exception:  # noqa: BLE001 - a summary that cannot even be compared was changed
+        pass
+    added = {path: copy.deepcopy(_at(s, path)) for path in SECONDARY_INSIDE_PRIMARY}
+    for k in PRIMARY:
+        if k in snapshot:
+            s[k] = copy.deepcopy(snapshot[k])
+        else:
+            s.pop(k, None)
+    for path, val in added.items():
+        holder = _at(s, path[:-1])
+        if val is not None and isinstance(holder, dict):
+            holder[path[-1]] = val
+    return True
+
+
+def _decimals(x) -> int:
+    """Decimals of an expected number as it was supplied: "-0.0530" has 4, "-0.056" has 3 (a float
+    loses trailing zeros, so pass strings). At most 4, the precision of the freeze file."""
+    text = str(x).strip()
+    return min(MAX_DECIMALS, len(text.split(".")[1]) if "." in text else 0)
+
+
+def primary_matches(s: dict, expect_primary: dict) -> dict:
+    """Compare the primary numbers of this run with the ones an earlier freeze file showed.
+
+    expect_primary: {"delta1_g_lang" | "delta1_g_vendor" | "delta2" | "h3": [estimate, lo, hi]} (or a
+    dict with those three keys). Each number is compared at the number of decimals it was supplied
+    with (at most 4): it matches when the freeze file's value is within half a unit of that last
+    decimal. Result: one boolean per number and all_match. It reports; it never raises and it
+    changes nothing."""
+    out: dict = {"numbers": {}, "compared_at_decimals": {}, "unknown_keys": []}
+    try:
+        for name, exp in expect_primary.items():
+            if name not in PRIMARY_NUMBERS:
+                out["unknown_keys"].append(str(name)[:40])
+                continue
+            block = _at(s, PRIMARY_NUMBERS[name]) or {}
+            exp = exp if isinstance(exp, dict) else dict(zip(("estimate", "lo", "hi"), exp))
+            flags, decs = {}, []
+            for part in ("estimate", "lo", "hi"):
+                if part not in exp:
+                    continue
+                try:
+                    nd, want, got = _decimals(exp[part]), float(exp[part]), block.get(part)
+                    flags[part] = bool(got is not None and abs(float(got) - want) <= 0.5 * 10 ** -nd + 1e-9)
+                    decs.append(str(nd))
+                except (TypeError, ValueError):
+                    flags[part] = False
+                    decs.append("unreadable")
+            out["numbers"][name] = flags
+            out["compared_at_decimals"][name] = ", ".join(decs)
+        every = [v for f in out["numbers"].values() for v in f.values()]
+        out["all_match"] = bool(every) and all(every) and not out["unknown_keys"]
+    except Exception as e:  # noqa: BLE001 - a comparison aid must never cost the freeze file
+        out["all_match"] = False
+        out["error"] = safe_log.describe(type(e), e.__traceback__)
+    return out
+
+
 def _h2_category(lo, hi) -> str:
     c = intervals.decide(lo, hi)
     return {"B better": "supported", "A better": "opposite"}.get(c, c)
@@ -131,13 +232,42 @@ def _ece(p, y, bins: int = 10) -> float | None:
     return round(float(np.mean(vals)), 4) if vals else None
 
 
+def _descriptive(s: dict) -> dict:
+    """The round-3 numbers shown in the summary block, under one label: none of them is a test."""
+    def get(*path):
+        v = _at(s, path)
+        return v if isinstance(v, dict) else {}
+
+    try:
+        return _descriptive_values(get)
+    except Exception as e:  # noqa: BLE001 - the summary block must print whatever the secondary blocks left
+        return {"label": "descriptive, not a test", "error": safe_log.describe(type(e), e.__traceback__)}
+
+
+def _descriptive_values(get) -> dict:
+    return {"label": "descriptive, not a test",
+            "same_device_gain": {e: (v.get("seed0_minus_default") or {}).get("estimate")
+                                 for e, v in get("baselines", "same_device_gain", "encoders").items()},
+            "refit_gap": {"gap_like_another_seed": get("refit_agreement").get("gap_like_another_seed"),
+                          "median_gap": {e: {"n7_seed0_vs_stage_a": (v.get("n7_seed0_vs_stage_a") or {}).get("median"),
+                                             "n7_seed_pairs_median": (v.get("n7_seed_pairs_median") or {}).get("median")}
+                                         for e, v in get("refit_agreement", "encoders").items()}},
+            "any_finding_auc": {e: v.get("any_finding_auc") for e, v in get("triage_secondary", "models").items()},
+            "threshold_overshoot": {e: v.get("threshold_overshoot") for e, v in get("triage_secondary", "models").items()},
+            "unseen_site_cost": {e: {"estimate": v.get("unseen_site_cost_at_equal_training_size"),
+                                     "se": v.get("unseen_site_cost_se")}
+                                 for e, v in get("largest_site_decomposition", "encoders").items()}}
+
+
 def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneemri_json: str | None = None,
         n_boot: int = intervals.N_BOOT, seed: int = 0, budget_h: float = 2.0, quiet: bool = True,
-        compare_with: dict | None = None) -> dict:
+        compare_with: dict | None = None, expect_primary: dict | None = None) -> dict:
     """hidden: {"dinov2_vits14": score, "convnext_tiny": score} from the Kaggle late submissions (S4).
     kneemri_json: path or https URL (the repo's raw file) of agg_kneemri.json (S5), if KneeMRI ran.
     compare_with: the "decisions" block of an earlier freeze file (for a rerun, e.g. once N6b has
-    finished): the summary then says whether H1, H2 and H3 are the same. It changes nothing else."""
+    finished): the summary then says whether H1, H2 and H3 are the same. It changes nothing else.
+    expect_primary: the primary numbers of an earlier freeze file, for a rerun on the SAME inputs
+    (see primary_matches): the summary then says, number by number, whether they are the same."""
     s: dict = {"frozen_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     cfg = {"n_boot": n_boot, "seed": seed, "hidden": bool(hidden), "kneemri": bool(kneemri_json)}
     with common.notebook("n9", cfg, quiet=quiet, budget_h=budget_h):
@@ -372,15 +502,37 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                 s["compare_with_previous"] = {"previous": {h: compare_with.get(h) for h in ("H1", "H2", "H3")},
                                               "same_h1_h2_h3": not diff, "differs": diff}
 
-            # Secondary, descriptive blocks (new keys only; no decision or existing number changes)
-            from . import n9x
+            if expect_primary:
+                s["primary_matches_previous"] = primary_matches(s, expect_primary)
 
-            n9x.add_all(s, n9x.Ctx(d=d, ev=ev, Y=Y, units=units, elig=elig, n_boot=n_boot, seed=seed,
-                                   root=Path(root) if root else None, row_of=row_of,
-                                   floor=FA if FA is not None and np.isfinite(FA[ev]).all() else None,
-                                   gold=gold, g_find=g_find, h1=h1_lang, cat_lang=cat_lang,
-                                   n7_dir=nv.parent if nv else None, dirs=dirs, h2_find=h2_find, h2=s["h2"]))
+            # The primary results are on disk before any secondary code runs.
             agg.write("results", s)
+            snapshot, primary_only = _primary_view(s), copy.deepcopy(s)
+
+            # Secondary, descriptive blocks (new keys only; no decision or existing number changes).
+            # Nothing in them, not even an import error, may cost the file above or the summary below.
+            try:
+                from . import n9x
+
+                n9x.add_all(s, n9x.Ctx(d=d, ev=ev, Y=Y, units=units, elig=elig, n_boot=n_boot, seed=seed,
+                                       root=Path(root) if root else None, row_of=row_of,
+                                       floor=FA if FA is not None and np.isfinite(FA[ev]).all() else None,
+                                       gold=gold, g_find=g_find, h1=copy.deepcopy(h1_lang), cat_lang=cat_lang,
+                                       n7_dir=nv.parent if nv else None, dirs=dirs, h2_find=h2_find,
+                                       h2=copy.deepcopy(s["h2"])))
+            except Exception as e:  # noqa: BLE001
+                if not isinstance(s.get("secondary_errors"), dict):
+                    s["secondary_errors"] = {}
+                s["secondary_errors"]["n9x"] = safe_log.describe(type(e), e.__traceback__)
+            s["secondary_mutated_primary"] = _restore_primary(s, snapshot)
+            try:
+                agg.write("results", s)
+            except Exception as e:  # noqa: BLE001 - the secondary blocks made the file unwritable: keep the primary one
+                s.clear()
+                s.update(primary_only)
+                s["secondary_errors"] = {"final_write": safe_log.describe(type(e), e.__traceback__)}
+                s["secondary_mutated_primary"] = False
+                agg.write("results", s)
     common.summary({"decisions": s.get("decisions"), "main_complete": s.get("main_complete"),
                     "controls_ok": (s.get("controls") or {}).get("all_leakage_assertions_passed"),
                     "findings_match_pilot": s.get("findings", {}).get("matches_pilot"),
@@ -389,13 +541,9 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                     "seed0_refit": {k: ((s.get("seed_sensitivity") or {}).get("seed0_refit_check") or {}).get(k)
                                     for k in ("reproduces_stage_a", "delta1_gap", "refit_device")},
                     "compare_with_previous": s.get("compare_with_previous"),
-                    "same_device_gain": {e: (v.get("seed0_minus_default") or {}).get("estimate") for e, v in
-                                         (((s.get("baselines") or {}).get("same_device_gain") or {}).get("encoders") or {}).items()},
-                    "gap_like_another_seed": (s.get("refit_agreement") or {}).get("gap_like_another_seed"),
-                    "any_finding_auc": {e: v.get("any_finding_auc") for e, v in
-                                        ((s.get("triage_secondary") or {}).get("models") or {}).items()},
-                    "threshold_overshoot": {e: v.get("threshold_overshoot") for e, v in
-                                            ((s.get("triage_secondary") or {}).get("models") or {}).items()},
+                    "primary_matches_previous": s.get("primary_matches_previous"),
+                    "secondary_mutated_primary": s.get("secondary_mutated_primary"),
+                    "descriptive_only": _descriptive(s),
                     "sign_agrees_with_primary": ((s.get("h1") or {}).get("secondary") or {}).get("sign_agrees_with_primary"),
                     "secondary_errors": s.get("secondary_errors"),
                     "status": s.get("status")})
