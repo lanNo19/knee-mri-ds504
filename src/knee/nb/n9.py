@@ -31,8 +31,9 @@ attached folds.csv (knee.units says what this does and does not guarantee). The 
 "chain" block; a mismatch writes the file with status "chain mismatch" and fails the step.
 Secondary, descriptive blocks (knee.nb.n9x) are added after the decisions and change none of them:
 agg_results.json is written with the primary results before they run and again after them, they
-work on copies, and H1, H2, H3 and the decisions are compared with a snapshot afterwards
-(secondary_mutated_primary; on a difference the snapshot is put back).
+work on copies (each block a fresh copy of H1 and H2), and afterwards H1, H2, H3, the decisions and
+every other key written before them are compared with a copy taken then
+(secondary_mutated_primary; on a difference the copy is put back).
 """
 from __future__ import annotations
 
@@ -221,17 +222,22 @@ def primary_matches(s: dict, expect_primary: dict) -> dict:
     dict with those three keys). Each number is compared at the number of decimals it was supplied
     with (at most 4): it matches when the freeze file's value is within half a unit of that last
     decimal. Result: one boolean per number, complete_card (all four names with all three parts were
-    supplied) and all_match (complete_card and every number matches). An unknown name is only
-    marked as present (unknown_keys_present), never echoed: the file may not carry arbitrary text.
+    supplied, each as three values) and all_match (complete_card, every number matches and no unknown
+    name was passed). An unknown name is only marked as present (unknown_keys_present), never
+    echoed: the file may not carry arbitrary text.
     It reports; it never raises and it changes nothing."""
-    out: dict = {"numbers": {}, "compared_at_decimals": {}, "unknown_keys_present": False}
+    out: dict = {"numbers": {}, "compared_at_decimals": {}, "unknown_keys_present": False, "card_shape_ok": True}
     try:
         for name, exp in expect_primary.items():
             if name not in PRIMARY_NUMBERS:
                 out["unknown_keys_present"] = True
                 continue
             block = _at(s, PRIMARY_NUMBERS[name]) or {}
-            exp = exp if isinstance(exp, dict) else dict(zip(("estimate", "lo", "hi"), exp))
+            if not isinstance(exp, dict):
+                exp = list(exp)
+                if len(exp) != 3:  # [estimate, lo, hi] and nothing else; a short or long list is not a card
+                    out["card_shape_ok"] = False
+                exp = dict(zip(("estimate", "lo", "hi"), exp))
             flags, decs = {}, []
             for part in ("estimate", "lo", "hi"):
                 if part not in exp:
@@ -246,7 +252,7 @@ def primary_matches(s: dict, expect_primary: dict) -> dict:
             out["numbers"][name] = flags
             out["compared_at_decimals"][name] = ", ".join(decs)
         every = [v for f in out["numbers"].values() for v in f.values()]
-        out["complete_card"] = (set(out["numbers"]) == set(PRIMARY_NUMBERS)
+        out["complete_card"] = (set(out["numbers"]) == set(PRIMARY_NUMBERS) and out["card_shape_ok"]
                                 and all(set(f) == {"estimate", "lo", "hi"} for f in out["numbers"].values()))
         out["all_match"] = bool(every) and all(every) and out["complete_card"] and not out["unknown_keys_present"]
     except Exception as e:  # noqa: BLE001 - a comparison aid must never cost the freeze file

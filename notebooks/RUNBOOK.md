@@ -209,13 +209,13 @@ Blocks added after the results critique (23 Nov, late; knee.nb.n9c). N7 is not r
 How N9 protects the primary results from these blocks:
 1. agg_results.json is written with the primary results before any secondary block runs, and again after them. A crash or an import error in the secondary code leaves the first file in place.
 2. Every block works on copies of the primary results.
-3. After the blocks, H1, H2, H3, the decisions and every other key written before the blocks are compared with a copy taken before them. On a difference the copy is put back and secondary_mutated_primary is true. Every block also gets a fresh copy of H1 and H2, so one block cannot change what the next one reads.
+3. After the blocks, H1, H2, H3, the decisions and every other key written before the blocks are compared with a copy taken before them. On a difference the copy is put back and secondary_mutated_primary is true. Every block also gets a fresh copy of H1 and H2, so one block cannot change the H1 and H2 the next block reads.
 
 | Field | Meaning |
 |---|---|
-| secondary_mutated_primary | false = no secondary block changed h1, h2, h3, decisions or any other key written before the blocks; true = one did, the earlier values were put back, and the code needs a fix before the file is used |
+| secondary_mutated_primary | false = no secondary block changed h1, h2, h3, decisions or any other key written before the blocks; true = one did, the earlier values were put back, and the code needs a fix before the file is used; null = unknown, only possible after a failed second write (secondary_errors.final_write) |
 | secondary_errors.n9c, .n9x, .final_write | the round-3 module could not be imported (its blocks are missing), the whole secondary step crashed, or the second write failed (the file then holds the primary results only) |
-| primary_matches_previous | only with expect_primary: numbers.<name>.estimate, lo, hi are true where this run's value equals the supplied one at the supplied number of decimals (within half a unit of the last one; at most 4); complete_card = all four names with estimate, lo and hi were supplied; all_match = complete_card and every one is true; unknown_keys_present = a name outside the four was passed (its text is not written); compared_at_decimals says the precision used. Names: delta1_g_lang, delta1_g_vendor, delta2, h3. It reports only; it never fails the step |
+| primary_matches_previous | only with expect_primary: numbers.<name>.estimate, lo, hi are true where this run's value equals the supplied one at the supplied number of decimals (within half a unit of the last one; at most 4); complete_card = all four names were supplied, each as exactly three values (estimate, lo, hi); all_match = complete_card, every one is true and no unknown name was passed; unknown_keys_present = a name outside the four was passed (its text is not written); compared_at_decimals says the precision used. Names: delta1_g_lang, delta1_g_vendor, delta2, h3. It reports only; it never fails the step |
 
 | Field | Meaning |
 |---|---|

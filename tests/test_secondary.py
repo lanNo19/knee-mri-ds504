@@ -156,6 +156,14 @@ def test_refit_agreement_says_when_the_device_gap_is_like_another_seed(monkeypat
     med = [np.median(np.abs(P[a] - P[b])) for a in range(6) for b in range(a + 1, 6)]
     assert len(med) == 15 and yard["median"] == pytest.approx(np.median(med), abs=1e-5)
     assert "not a test" in like["flag_is"]
+    # review r3, M4: the yardstick needs seed 0 and at least one other seed, not seed 1 in particular
+    monkeypatch.setattr(n9x, "_seed_predictions", lambda c, e: {sd: v for sd, v in refits(c, e).items() if sd in (0, 2, 3)})
+    some = n9c.refit_agreement(ctx(0.02), {})
+    assert some["seeds"] == [0, 2, 3] and "gap_like_another_seed" in some and len(some["fits"]) == 4
+    monkeypatch.setattr(n9x, "_seed_predictions", lambda c, e: {sd: v for sd, v in refits(c, e).items() if sd in (1, 2)})
+    assert n9c.refit_agreement(ctx(0.02), {})["status"].startswith("not available")
+    monkeypatch.setattr(n9x, "_seed_predictions", lambda c, e: {0: refits(c, e)[0]})
+    assert n9c.refit_agreement(ctx(0.02), {})["status"].startswith("not available")
 
 
 def test_primary_numbers_are_compared_at_the_decimals_supplied():
@@ -192,6 +200,10 @@ def test_primary_numbers_are_compared_at_the_decimals_supplied():
     assert r["complete_card"] is False and r["all_match"] is False and all(v for f in r["numbers"].values() for v in f.values())
     r = n9.primary_matches(s, {**card, "h3": ["0.506", "0.490"]})
     assert r["complete_card"] is False and r["all_match"] is False
+    # review r3, M5: a list is [estimate, lo, hi] and nothing more; a fourth value is not silently dropped
+    r = n9.primary_matches(s, {**card, "h3": ["0.506", "0.490", "0.517", "0.999"]})
+    assert r["card_shape_ok"] is False and r["complete_card"] is False and r["all_match"] is False
+    assert n9.primary_matches(s, card)["card_shape_ok"] is True
     # review r2, N2: an unknown name is marked, never echoed; a UID-like one cannot make the file unwritable
     uid_like = "1.2.840.113619.2.55.3"
     r = n9.primary_matches(s, {**card, uid_like: ["0", "0", "0"]})
