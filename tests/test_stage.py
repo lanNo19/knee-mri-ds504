@@ -455,7 +455,7 @@ def _check_round3(s9, root):
     e0 = ra["encoders"]["dinov2_vits14"]
     assert e0["n7_seed0_vs_stage_a"]["median"] > 1.5 * e0["n7_seed0_vs_n7_seed1"]["median"] > 0
     assert e0["n7_seed0_vs_stage_a"]["median"] <= e0["n7_seed0_vs_stage_a"]["p99"] <= e0["n7_seed0_vs_stage_a"]["max"]
-    assert e0["n7_seed0_vs_stage_a"]["max"] == pytest.approx(
+    assert max(v["n7_seed0_vs_stage_a"]["max"] for v in ra["encoders"].values()) == pytest.approx(
         s9["seed_sensitivity"]["seed0_refit_check"]["max_abs_probability_gap"], abs=1e-4)
     assert ra["delta1_low_high_n7_fits"][0] <= ra["delta1_low_high_n7_fits"][1] and ra["delta1_sd_n7_fits"] > 0
     assert ra["delta1_low_high_all_fits"][1] == pytest.approx(gl["estimate"], abs=1e-4)  # Stage A's is the largest here
@@ -567,6 +567,14 @@ def test_secondary_faults_never_cost_the_freeze_file_or_the_base_outputs(stage_e
     assert saved["baselines"]["same_studies_and_folds_for_every_row"] is False
     assert "tuned_vit_s16" in saved["baselines"]["incomplete_rows"]
     assert saved["seed_sensitivity"]["seeds"] == [0, 1] and "seed0_refit_check" in saved["seed_sensitivity"]
+    # the blocks added after the results critique say what N7's files cannot support, and invent nothing
+    sdg = saved["baselines"]["same_device_gain"]
+    assert sdg["encoders"] == {} and set(sdg["not_available"]) == {"dinov2_vits14", "convnext_tiny", "vit_s16"}  # no default refits
+    assert sdg["stage_a_device"] == "unknown" and sdg["gain_over_own_default_mixes_devices"] == "unknown"  # no run.json
+    assert len(saved["refit_agreement"]["fits"]) == 3 and saved["refit_agreement"]["fits"]["stage_a"]["device"] == "unknown"
+    assert set(saved["triage_secondary"]["models"]["dinov2_vits14"]) == {"any_finding_auc"}  # no thresholds: the AUC only
+    assert saved["h2_without_lookalikes"]["pairs_match_n7_probe"] is None  # the probe did not run in N7
+    assert set(saved["largest_site_decomposition"]["encoders"]) == {"dinov2_vits14", "convnext_tiny"}
     assert not [u for u in facts["uids"] if u in json.dumps(saved)]
 
 

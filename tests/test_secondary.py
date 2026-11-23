@@ -98,6 +98,35 @@ def test_wilson_interval_and_schedule_factor():
     assert heads.schedule_factor(30 * spe, spe) == pytest.approx(0.0, abs=1e-12)
 
 
+def test_refit_agreement_says_when_the_device_gap_is_like_another_seed(monkeypatch):
+    from types import SimpleNamespace
+
+    from knee.nb import n9c, n9x
+
+    rng = np.random.default_rng(7)
+    n = 400
+    base = {e: rng.random((n, 12)) for e in ("dinov2_vits14", "convnext_tiny")}
+
+    def refits(c, e):  # six N7 seeds: the same fit plus seed-sized noise
+        r = np.random.default_rng(len(e))
+        return {sd: np.clip(base[e] + r.normal(0, 0.02, (n, 12)), 0, 1) for sd in range(6)}
+
+    monkeypatch.setattr(n9x, "_seed_predictions", refits)
+    monkeypatch.setattr(n9x, "_n7_device", lambda c: "cpu")
+
+    def ctx(stage_a_noise):
+        units = {e: np.clip(base[e] + rng.normal(0, stage_a_noise, (n, 12)), 0, 1) for e in base}
+        return SimpleNamespace(units=units, ev=np.arange(n), dirs={}, h1={"estimate": 0.01},
+                               complete=lambda P: True, macro=lambda P, w=None: float(P.mean()))
+
+    like = n9c.refit_agreement(ctx(0.02), {})  # Stage A differs from N7 seed 0 as two seeds do
+    assert like["gap_like_another_seed"] is True and like["fits"]["stage_a"]["device"] == "unknown"
+    assert list(like["fits"]) == ["stage_a"] + [f"n7_seed_{k}" for k in range(6)]
+    far = n9c.refit_agreement(ctx(0.2), {})  # ten times further away: not seed-like
+    assert far["gap_like_another_seed"] is False
+    assert far["encoders"]["dinov2_vits14"]["n7_seed0_vs_n7_seed1"] == like["encoders"]["dinov2_vits14"]["n7_seed0_vs_n7_seed1"]
+
+
 # ---------------------------------------------------------------- the second interval
 
 def test_within_fold_bootstrap_sees_noise_the_group_interval_cannot():
