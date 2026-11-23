@@ -286,7 +286,7 @@ If a fix needs the details, Ablay (not Claude) reads them, in his own browser:
 
 ## Error analysis N12 (plan r2)
 
-N12 is descriptive. It reads existing outputs only. It fits nothing, decides nothing and switches nothing on (plan r2, section 4 and R8). Start it only after Ablay has signed off readings r3 (R1). Never attach its output to N7, N9, N10 or N13.
+N12 is descriptive. It reads existing outputs only. It fits nothing, decides nothing and switches nothing on (plan r2, section 4 and R8). It may run before Ablay signs off readings r3, but nothing it writes (summary block, agg_n12.json, run.json) is opened before that sign-off (R1, as agreed with Ablay on 24 Nov at 00:23). Read only a version run at 89a9058 or later: check run.json's commit first. knee-n12 version 1 ran at d7c14bf, whose per-rate rule leaks small cells (review r2, R2-B1); it is never read. Never attach its output to N7, N9, N10 or N13.
 
 | Notebook | Accelerator | Internet | Inputs |
 |---|---|---|---|
