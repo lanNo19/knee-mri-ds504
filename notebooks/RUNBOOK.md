@@ -283,3 +283,63 @@ If a fix needs the details, Ablay (not Claude) reads them, in his own browser:
 1. The failed version's private/<step>_error.log holds the step's hidden output and the full traceback.
 2. Or, in an interactive session only he watches, he reruns cell 2 with `quiet=False` and then runs `sl.show_last()`.
 3. He describes the problem to Claude in words, without values.
+
+## Error analysis N12 (plan r2)
+
+N12 is descriptive. It reads existing outputs only. It fits nothing, decides nothing and switches nothing on (plan r2, section 4 and R8). Start it only after Ablay has signed off readings r3 (R1). Never attach its output to N7, N9, N10 or N13.
+
+| Notebook | Accelerator | Internet | Inputs |
+|---|---|---|---|
+| knee-n12 | None (CPU) | On | Outputs of knee-n0, **knee-n3-r** (not knee-n3), knee-n5, knee-n6a, knee-n6b-g and **knee-n7-b** (not knee-n7). Exactly one output per upstream step. Never knee-n6a-smoke, a knee-n9 output or an iteration-2 output |
+
+Cell 1 (commit c37f9e2 holds the final N12 code; the commit that added this card changes only this file):
+
+```python
+COMMIT = "c37f9e2e18af296130928fe1d9ee373faad9d2a6"
+!pip install -q "knee[n0,decode,models] @ git+https://github.com/lanNo19/knee-mri-ds504@{COMMIT}"
+import knee.safe_log as sl; sl.install()
+```
+
+Cell 2:
+
+```python
+from knee.nb import n12; n12.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+```
+
+Expected time: 5-15 min. Most of it is the pip install. The study bootstraps (2,000 draws each) take about 1-3 min on CPU.
+
+Pass criteria (summary block and agg_n12.json):
+1. STEP n12: OK. status "ok", errors empty, chain_ok true, main_complete true. A chain mismatch fails the step, as in N9.
+2. Every block is present with descriptive true and added_after_results true: gold_paired_check, gold_label_quality, per_finding_table, english_group_by_language, and development with a2_seed_ensemble, a3_encoder_ensemble and a4_calibration. Each development block carries the label "development: these studies were test studies in iteration 1; likely optimistic".
+3. N12 must read the same data as N9. Check these numbers against knee-n9-b's agg_results.json. Any difference = stop and report both files.
+   - per_finding_table.rows.<finding>.s2_auc.<encoder> equals s2.<encoder>.per_finding.<finding> (for example ACL: convnext_tiny 0.679, dinov2_vits14 0.638).
+   - If gold_paired_check.findings_same_as_n9_s3 is true: gold_paired_check.encoders.<encoder>.expert_labels equals s3_gold.macro_auc.<encoder> (convnext_tiny 0.7515, dinov2_vits14 0.7317).
+   - For each encoder in development.a4_calibration.encoders: ece.before equals s2.<encoder>.ece (0.256 / 0.255 at 3 decimals), and any_finding_auc.before equals triage_secondary.models.<encoder>.any_finding_auc (0.765 / 0.734 at 3 decimals).
+4. gold_paired_check.studies_text is "about 60".
+5. english_group_by_language.group is "ENGLISH" and fold is 0 (both found from the English reports, not hard-coded). languages_reported holds ENGLISH, SPANISH and TURKISH. Read findings_left_out: a small row such as LATIN can take a rare finding out of every row.
+6. In development.a4_calibration, each encoder is either in encoders (fold_stratified_macro_auc_unchanged true, every check true) or in skipped with its reason. A4 is optional, so a skip is not a failure.
+
+Rules for reading and quoting N12:
+1. Nothing in agg_n12.json is a test or a decision.
+2. The development numbers (A2, A3, A4) keep their label. They are never shown as a gain over iteration 1 and never go in a slide title (R6).
+3. Per-finding numbers: show all 12 or none.
+4. Name the metric beside every number (FM10). Fold-stratified S2 numbers are mostly the English group.
+
+| Field | Meaning |
+|---|---|
+| gold_paired_check.encoders.<encoder>.expert_labels, report_labels | macro AUC on N9's gold studies (fold models pooled, as s3_gold) against the expert labels and against the binary report labels (uncertain = negative); the same findings for both (5 positives and 5 negatives in both versions: findings, findings_left_out) |
+| gold_paired_check.encoders.<encoder>.expert_labels_interval, report_labels_interval | study-bootstrap percentile intervals of the two macros |
+| gold_paired_check.encoders.<encoder>.expert_minus_report | the difference with its paired study-bootstrap interval (FM5b); the same draws for both label versions |
+| gold_paired_check.findings_same_as_n9_s3 | true = the finding list equals N9's gold findings, so expert_labels is N9's S3 number |
+| gold_label_quality.per_finding.<finding> | soft_label_auc (the label mean against the expert label) with its interval, ppv and npv of the binary report label, ppv_plus_npv_minus_1 (the FM5b factor); suppressed with under 5 expert positives or negatives; ppv or npv null when fewer than 5 gold studies have that report label |
+| gold_label_quality.soft_label_macro_auc | mean over the shown findings; N0's 0.892 used every gold study, these are N9's gold studies |
+| per_finding_table.rows.<finding> | s2_auc per encoder (fold-stratified, N9's numbers), training_prevalence (N0), label_quality (as in gold_label_quality) |
+| per_finding_table.spearman_label_quality_vs_s2_auc | per encoder: Spearman across findings between the soft label's gold AUC and the S2 AUC; descriptive; findings_used lists the findings |
+| english_group_by_language.rows.<language> | macro AUC of the English group's own fold model on the group's studies of one report language (at least 50 studies), one fixed finding list for all rows, study-bootstrap interval |
+| english_group_by_language.languages_suppressed, findings_left_out | languages under 50 studies; findings left out of every row, with the rows that lack 5 positives or 5 negatives |
+| english_group_by_language.reference_whole_group | the same for the whole group (all its languages), on the same finding list |
+| development.a2_seed_ensemble.encoders.<encoder> | mean probability over N7's seed refits (seeds listed): fold-stratified macro AUC and mean of fold macros |
+| development.a3_encoder_ensemble | equal-weight mean of the three encoders' Stage A probabilities: the same two metrics; not evidence about H1 |
+| development.a4_calibration.encoders.<encoder> | ECE and any-finding AUC (max of 12) before and after subtracting log(positive weight) from each logit; checks; log_positive_weight_mean_over_folds |
+| development.a4_calibration.skipped.<encoder> | why the positive weights could not be confirmed for that encoder, with the checks |
+| not_run | the analyses plan r2 leaves out, each with its reason |
