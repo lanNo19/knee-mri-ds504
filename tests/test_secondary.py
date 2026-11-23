@@ -82,6 +82,22 @@ def test_threshold_confusion_and_rates():
     assert np.isnan(metrics.threshold_at_sensitivity(s, np.zeros(1000, bool)))
 
 
+def test_wilson_interval_and_schedule_factor():
+    from knee import heads
+    from knee.nb import n9c
+
+    lo, hi = n9c.wilson(8, 100)
+    assert (lo, hi) == pytest.approx((0.0411, 0.1500), abs=5e-4)  # the textbook Wilson interval for 8 of 100
+    lo0, hi0 = n9c.wilson(0, 50)
+    assert lo0 == pytest.approx(0.0, abs=1e-12) and 0 < hi0 < 0.08
+    spe = 76
+    # 1-epoch warm-up, then a cosine over the 30-epoch schedule: at E = 4, 5, 6 the rate is still near its peak
+    got = [heads.schedule_factor(E * spe - 1, spe) for E in (4, 5, 6)]
+    assert got == pytest.approx([0.974, 0.954, 0.930], abs=3e-3)
+    assert heads.schedule_factor(0, spe) == pytest.approx(1 / spe) and heads.schedule_factor(spe - 1, spe) == 1.0
+    assert heads.schedule_factor(30 * spe, spe) == pytest.approx(0.0, abs=1e-12)
+
+
 # ---------------------------------------------------------------- the second interval
 
 def test_within_fold_bootstrap_sees_noise_the_group_interval_cannot():

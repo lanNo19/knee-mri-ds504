@@ -232,6 +232,17 @@ def predict(bank: Bank, model, idx, cfg: Config, stats: dict, use_flip: bool = T
     return out
 
 
+def schedule_factor(step: int, steps_per_epoch: int) -> float:
+    """The learning rate at optimiser step `step` (from 0) as a fraction of its peak: linear warm-up
+    over WARMUP_EPOCHS, then a cosine to 0 at the end of the MAX_EPOCHS schedule. fit() uses exactly
+    this, so a refit stopped at E epochs ends at schedule_factor(E * steps_per_epoch - 1, ...)."""
+    total = MAX_EPOCHS * steps_per_epoch
+    warm = WARMUP_EPOCHS * steps_per_epoch
+    if step < warm:
+        return (step + 1) / warm
+    return 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warm) / max(1, total - warm))))
+
+
 def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs: int | None = None,
         seed: int = 0, stats: dict | None = None, forbidden=None, max_epochs: int = MAX_EPOCHS,
         patience: int | None = PATIENCE, on_epoch=None, steps: int | None = None,
@@ -267,13 +278,9 @@ def fit(bank: Bank, cfg: Config, train_idx, val_idx=None, findings=None, epochs:
     bs = max(1, int(cfg.batch_size))
     steps_per_epoch = math.ceil(n / bs)
     spe_sched = int(schedule_steps_per_epoch) if schedule_steps_per_epoch else steps_per_epoch
-    total = MAX_EPOCHS * spe_sched
-    warm = WARMUP_EPOCHS * spe_sched
 
     def lr_at(step):
-        if step < warm:
-            return (step + 1) / warm
-        return 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warm) / max(1, total - warm))))
+        return schedule_factor(step, spe_sched)
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     yb = bank.binary[train_idx]

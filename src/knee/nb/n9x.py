@@ -50,6 +50,8 @@ class Ctx:
     cat_lang: str  # its category
     n7_dir: Path | None
     dirs: dict = field(default_factory=dict)  # Stage A unit folders
+    h2_find: list = field(default_factory=list)  # H2's findings
+    h2: dict = field(default_factory=dict)  # the H2 block as decided
 
     @property
     def f2(self):
@@ -354,4 +356,9 @@ def add_all(s: dict, c: Ctx) -> None:
     put("baselines", baselines, s, "baselines")
     put("hpo_evidence", hpo, s, "hpo_evidence")
     put("near_duplicate_probe", near_duplicate_probe, s, "near_duplicate_probe")
+    # blocks added after the results critique (knee.nb.n9c): the same wrapper, new keys only
+    from . import n9c
+
+    for name, fn, where, key in n9c.BLOCKS:
+        put(name, lambda c, fn=fn: fn(c, s), where(s), key)
     s["secondary_errors"] = errors

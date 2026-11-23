@@ -50,6 +50,7 @@ import knee.safe_log as sl; sl.install()
 | knee-n10, knee-n10-convnext | GPU T4 x2 | **Off** | Competition; the bundle dataset; outputs of knee-n0 and knee-n6a |
 | knee-bundle | None (CPU) | On | None (public wheels and checkpoints only; with Ablay's OK its output becomes a private versioned dataset) |
 | knee-n9 | None (CPU) | On | Outputs of knee-n0, **knee-n3-r** (not knee-n3), knee-n5, knee-n6p, knee-n6a, knee-n6b (and a unit rerun such as knee-n6a-r), knee-n7 and knee-n8. Never knee-n6a-smoke. Exactly one output per upstream step. While knee-n6b is still queued or running: leave it out |
+| knee-n9-b | None (CPU) | On | The same inputs as knee-n9 (knee-n0, knee-n3-r, knee-n5, knee-n6p, knee-n6a, knee-n7, knee-n8; knee-n6b once it has finished, then with knee-n7-b in place of knee-n7). A new notebook, so knee-n9's freeze file stays as it is |
 | knee-montage | None (CPU) | On | Outputs of the three N4 notebooks; after the pilot also knee-n6p (Claude starts it, never opens it) |
 
 Keep the editor on accelerator None while editing; switch to GPU T4 x2 only for the
@@ -76,6 +77,7 @@ lixin73/rsna-knee-llm-report-labels-sol56. Ablay records each one's version and 
 | knee-n6b | `from knee.nb import n6; n6.run("n6b", encoders=("vit_s16",), demo=True, backstop_utc="2026-11-24T03:00:00Z")` | 1-2 h | as N6a; demo.curves has the three arms |
 | knee-n7 | `from knee.nb import n7; n7.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | GPU 40-100 min; CPU 45-75 min for two encoders (15 min with `extras=False`) | chain.s2_folds_match_units true (false = the step fails: wrong N3 or unit attached); missing_units empty for every encoder; extras_ok true and extras_errors empty (a failed extra costs only its own block); leakage_assertion_passed true; the consensus configs go to the repo as configs/consensus.json (for KneeMRI S5) |
 | knee-n9 | `from knee.nb import n9; n9.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` or, with S4, `from knee.nb import n9; n9.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, hidden={"dinov2_vits14": <score>, "convnext_tiny": <score>})` (leave out hidden if S4 did not run) | 15-30 min | chain.s2_folds_match_units true (false = the step fails and no decision is written); main_complete and findings_match_pilot true; secondary_errors empty; agg_results.json is the freeze file; decisions.H1-H4 are read from it, never recomputed by hand |
+| knee-n9-b | `from knee.nb import n9; n9.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, compare_with={"H1": "inconclusive", "H2": "inconclusive", "H3": "not supported"})` (add `hidden={...}` if S4 ran) | 20-35 min | as knee-n9; compare_with_previous.same_h1_h2_h3 true (false = stop and report both files); the compare_with strings are tonight's decisions.H1-H3 exactly as agg_results.json of knee-n9 wrote them |
 | knee-n10-canary | offline cell 1, then `from knee.nb import n10; n10.run(canary=True)` | 1-3 h on the hidden test | the commit run on the public test files passes; submitted after Ablay's OK; scored = at most 1% of hidden studies failed to decode, a scoring error = more than 1% (deliberate) |
 | knee-n10, knee-n10-convnext | offline cell 1, then `from knee.nb import n10; n10.run("dinov2_vits14")` (knee-n10-convnext: `from knee.nb import n10; n10.run("convnext_tiny")`) | 2-5 h on the hidden test | submission.layout wide; folds lists every S2 fold from N3; failed_share at most 0.01; then ask Ablay before submitting (at most 5 a day) |
 | knee-bundle | `from knee.nb import bundle; bundle.run()` | 5-10 min | wheels_ok and checkpoints_ok true; then ask Ablay before saving the output as a private versioned dataset |
@@ -198,6 +200,47 @@ New fields in agg_results.json (the summary block shows chain, seed_sensitive, s
 | hpo_evidence.units_without_own_search | units tuned in simplified mode; they are left out of the evidence |
 | near_duplicate_probe | copied from agg_n7.json |
 | secondary_errors | empty when every secondary block ran; else the block name with the error type and place |
+
+Blocks added after the results critique (23 Nov, late; knee.nb.n9c). N7 is not rerun: each block reads only files N7 and Stage A already wrote. Each has descriptive true and a one-line scope. The summary block also shows same_device_gain, gap_like_another_seed, any_finding_auc and threshold_overshoot.
+
+| Field | Meaning |
+|---|---|
+| baselines.same_device_gain.device, stage_a_device | where N7's refits ran, and where Stage A's units were fit (from Stage A's run.json; "unknown" if not recorded) |
+| baselines.same_device_gain.gain_over_own_default_mixes_devices | true = the older gain_over_own_default subtracts fits from two devices; quote the same-device gain instead |
+| baselines.same_device_gain.gain_over_own_default_note | one sentence saying what the older gain is |
+| baselines.same_device_gain.encoders.<encoder>.seed0_minus_default | tuned (N7 refit, seed 0) minus default head (N7 refit, seed 0), paired, with the registered group-level interval |
+| baselines.same_device_gain.encoders.<encoder>.mean_of_seeds_minus_default | mean S2 macro AUC of the tuned refits over seeds 0-5, minus the default's (the default has one seed) |
+| baselines.same_device_gain.encoders.<encoder>.tuned_seed_sd | SD of the tuned S2 macro AUC over those seeds: the yardstick for the gain |
+| baselines.same_device_gain.not_available | encoders without seed refits from N7 (the control encoder) |
+| refit_agreement.encoders.<encoder>.n7_seed0_vs_stage_a | absolute probability gap between N7's seed-0 refit and Stage A's stored predictions: median, p90, p99, max |
+| refit_agreement.encoders.<encoder>.n7_seed0_vs_n7_seed1 | the yardstick: the same statistics between two seeds of N7 |
+| refit_agreement.gap_like_another_seed | true = for both encoders the median and p99 of the first are at most 1.5 times the second's: the device gap behaves like one more seed |
+| refit_agreement.fits | Delta1 of the seven fits (Stage A's decision fit and N7 seeds 0-5), each with its device |
+| refit_agreement.delta1_low_high_all_fits, delta1_low_high_n7_fits, delta1_sd_n7_fits, sign_same_all_fits | range over the seven fits; range and SD over N7's six same-device fits; whether all seven have one sign |
+| triage_secondary.any_finding_prevalence | share of evaluation studies with at least one finding |
+| triage_secondary.models.<encoder>.any_finding_auc | AUC of the max-of-12 score against "any finding", pairs inside a test fold, pair-weighted |
+| triage_secondary.models.<encoder>.specificity_interval | Wilson 95% interval of the triage specificity from exact counts; null when a cell it uses holds 1 to 4 studies |
+| triage_secondary.models.<encoder>.threshold_overshoot | achieved test sensitivity minus the 0.95 target (positive = the inner threshold was too low for the new site) |
+| largest_site_decomposition.group, fold | the largest site group and its S2 fold k |
+| largest_site_decomposition.training_sets | size (rounded) and the group's share of the training set for a (S2 fold k), b (S1 fold k: the same size) and c (the other S1 folds, mean) |
+| largest_site_decomposition.encoders.<encoder>.a_unseen | S2 macro AUC on the group's studies (its models never saw the group) |
+| largest_site_decomposition.encoders.<encoder>.b_seen_equal_training_size | S1 macro AUC on the group's studies in S1 fold k (same training-set size and config as a, but the group is in training) |
+| largest_site_decomposition.encoders.<encoder>.c_seen_larger_training_size | S1 macro AUC on the group's studies in the other S1 folds (larger training sets) |
+| largest_site_decomposition.encoders.<encoder>.a_on_b_studies, a_on_c_studies | the S2 predictions scored on exactly b's and c's studies |
+| largest_site_decomposition.encoders.<encoder>.unseen_site_cost_at_equal_training_size | b minus a_on_b_studies: same studies, size and config, so this is the cost of the site being unseen (an upper bound) |
+| largest_site_decomposition.encoders.<encoder>.larger_training_set_seen_site_rough | c minus b: different studies and configs, so only a rough view of training-set size |
+| largest_site_decomposition.caveats | the two limits of this view |
+| best_epoch_spread.encoders.<encoder>.chosen_config | inner best epochs of each unit's best trial: lowest, median, p90, share at or below 6, share at the 30-epoch cap |
+| best_epoch_spread.encoders.<encoder>.all_trials | the same over every completed trial |
+| best_epoch_spread.encoders.<encoder>.refit_epochs, median_E | each unit's E, and their median |
+| best_epoch_spread.encoders.<encoder>.lr_fraction_of_peak_at_median_E | learning rate at the end of epoch E as a fraction of its peak (from heads.schedule_factor); near 1 = the cosine had barely started |
+| best_epoch_spread.encoders.<encoder>.warmup_share_of_training | the 1-epoch warm-up as a share of E |
+| gold_uncertainty.macro_auc.<encoder> | gold macro AUC (estimate), its bootstrap standard error (se), and the fold_stratified version (pairs inside one fold model) |
+| gold_uncertainty.delta1 | gold Delta1 with its paired bootstrap standard error |
+| gold_uncertainty.studies, exact_count_file | the rounded gold count; the exact one is only in private/n9/gold_count.json (Ablay reads it) |
+| h2_without_lookalikes | post hoc (post_hoc true): Delta2 again without every study in a look-alike pair above cosine 0.90; pairs, studies_removed, share_removed, delta2_registered, delta2_without_lookalikes, change |
+| h2_without_lookalikes.pair_source, pairs_match_n7_probe | the pairs are found again in N9 with the pilot's code (N7 wrote counts only); true = their count equals N7's probe |
+| h1.per_finding_exploratory_note | the 12 per-finding intervals are unadjusted: intervals_excluding_zero ("k of 12") and the rule "all 12 or none" |
 
 New fields in other summaries:
 

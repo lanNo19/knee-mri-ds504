@@ -379,7 +379,7 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                                    root=Path(root) if root else None, row_of=row_of,
                                    floor=FA if FA is not None and np.isfinite(FA[ev]).all() else None,
                                    gold=gold, g_find=g_find, h1=h1_lang, cat_lang=cat_lang,
-                                   n7_dir=nv.parent if nv else None, dirs=dirs))
+                                   n7_dir=nv.parent if nv else None, dirs=dirs, h2_find=h2_find, h2=s["h2"]))
             agg.write("results", s)
     common.summary({"decisions": s.get("decisions"), "main_complete": s.get("main_complete"),
                     "controls_ok": (s.get("controls") or {}).get("all_leakage_assertions_passed"),
@@ -389,6 +389,13 @@ def run(root=None, expect: dict | None = None, hidden: dict | None = None, kneem
                     "seed0_refit": {k: ((s.get("seed_sensitivity") or {}).get("seed0_refit_check") or {}).get(k)
                                     for k in ("reproduces_stage_a", "delta1_gap", "refit_device")},
                     "compare_with_previous": s.get("compare_with_previous"),
+                    "same_device_gain": {e: (v.get("seed0_minus_default") or {}).get("estimate") for e, v in
+                                         (((s.get("baselines") or {}).get("same_device_gain") or {}).get("encoders") or {}).items()},
+                    "gap_like_another_seed": (s.get("refit_agreement") or {}).get("gap_like_another_seed"),
+                    "any_finding_auc": {e: v.get("any_finding_auc") for e, v in
+                                        ((s.get("triage_secondary") or {}).get("models") or {}).items()},
+                    "threshold_overshoot": {e: v.get("threshold_overshoot") for e, v in
+                                            ((s.get("triage_secondary") or {}).get("models") or {}).items()},
                     "sign_agrees_with_primary": ((s.get("h1") or {}).get("secondary") or {}).get("sign_agrees_with_primary"),
                     "secondary_errors": s.get("secondary_errors"),
                     "status": s.get("status")})

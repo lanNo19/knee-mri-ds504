@@ -331,6 +331,8 @@ def test_n7_consensus_and_n9_decisions(stage_env, monkeypatch, capfd):
                                                "pairs_both_training", "across_s2_folds", "across_vendor_folds",
                                                "across_s1_folds"}
     assert not [u for u in facts["uids"] if u in (paths.WORKING / "agg_n7.json").read_text()]
+    # Stage A's run.json says where its units were fit (a T4 here; N7 above ran on CPU)
+    (root / "input" / "n6a" / "run.json").write_text(json.dumps({"commit": "synthetic000", "gpus": ["Tesla T4", "Tesla T4"]}))
     monkeypatch.setattr(paths, "WORKING", root / "working_n9")
     s9 = n9.run(root=root / "input", n_boot=200, hidden={"dinov2_vits14": 0.9, "convnext_tiny": 0.85}, quiet=True)
     printed = capfd.readouterr()
@@ -416,9 +418,95 @@ def _check_secondary(s9, root):
     assert len(hp["profiles"]["convnext_tiny"]["lr"]["mean_centred"]) == 6
     # H. the probe is copied from N7
     assert s9["near_duplicate_probe"]["cosine_above_0.98"]["pairs"] == "<5"
+    _check_round3(s9, root)
     # the freeze file itself
     saved = json.loads((paths.WORKING / "agg_results.json").read_text())
     assert saved["baselines"]["rows"].keys() == rows.keys() and saved["chain"] == ch
+
+
+def _check_round3(s9, root):
+    """The blocks added after the results critique: descriptive, from files N7 and Stage A already wrote."""
+    gl = s9["h1"]["g_lang"]
+    for key in ("refit_agreement", "triage_secondary", "largest_site_decomposition", "best_epoch_spread",
+                "gold_uncertainty", "h2_without_lookalikes"):
+        assert s9[key]["descriptive"] is True and len(s9[key]["scope"]) > 10, key
+    # 1. same-device gain: both sides are N7's refits; the old gain is untouched and flagged as mixed
+    g = s9["baselines"]["same_device_gain"]
+    assert g["device"] == "cpu" and g["stage_a_device"] == "cuda" and g["gain_over_own_default_mixes_devices"] is True
+    assert set(g["encoders"]) == {"dinov2_vits14", "convnext_tiny"} and set(g["not_available"]) == {"vit_s16"}
+    rows = s9["baselines"]["rows"]
+    seeds = s9["seed_sensitivity"]["macro_auc_per_seed"]
+    for e, v in g["encoders"].items():
+        d0 = rows[f"b2_default_{e}"]["s2_macro_auc"]["estimate"]
+        assert v["seeds"] == [0, 1, 2, 3, 4, 5] and v["seed0_minus_default"]["lo"] <= v["seed0_minus_default"]["estimate"]
+        per = [seeds[e][f"seed_{k}"] for k in range(1, 6)]  # seeds 1-5 as N9 already reports them
+        t0 = v["seed0_minus_default"]["estimate"] + d0
+        assert v["mean_of_seeds_minus_default"] == pytest.approx(np.mean([t0, *per]) - d0, abs=3e-4)
+        assert v["tuned_seed_sd"] == pytest.approx(np.std([t0, *per], ddof=1), abs=3e-4)
+        # the older, mixed-device gain is still Stage A's fit minus the default, untouched
+        assert rows[f"tuned_{e}"]["gain_over_own_default"]["estimate"] == pytest.approx(
+            rows[f"tuned_{e}"]["s2_macro_auc"]["estimate"] - d0, abs=2e-4)
+    # 2. refit agreement: synthetic units are not refits, so the gap is far from seed-like, and it is said
+    ra = s9["refit_agreement"]
+    assert ra["gap_like_another_seed"] is False and len(ra["fits"]) == 7
+    assert ra["fits"]["stage_a"] == {"delta1": gl["estimate"], "device": "cuda", "role": "the decision fit"}
+    assert ra["fits"]["n7_seed_3"]["device"] == "cpu"
+    assert ra["fits"]["n7_seed_3"]["delta1"] == s9["seed_sensitivity"]["delta1_per_seed"]["seed_3"]
+    e0 = ra["encoders"]["dinov2_vits14"]
+    assert e0["n7_seed0_vs_stage_a"]["median"] > 1.5 * e0["n7_seed0_vs_n7_seed1"]["median"] > 0
+    assert e0["n7_seed0_vs_stage_a"]["median"] <= e0["n7_seed0_vs_stage_a"]["p99"] <= e0["n7_seed0_vs_stage_a"]["max"]
+    assert e0["n7_seed0_vs_stage_a"]["max"] == pytest.approx(
+        s9["seed_sensitivity"]["seed0_refit_check"]["max_abs_probability_gap"], abs=1e-4)
+    assert ra["delta1_low_high_n7_fits"][0] <= ra["delta1_low_high_n7_fits"][1] and ra["delta1_sd_n7_fits"] > 0
+    assert ra["delta1_low_high_all_fits"][1] == pytest.approx(gl["estimate"], abs=1e-4)  # Stage A's is the largest here
+    # 3. triage: the score's own AUC, a specificity interval, the overshoot
+    ts = s9["triage_secondary"]
+    assert 0.9 < ts["any_finding_prevalence"] <= 1.0 and ts["target_sensitivity"] == 0.95
+    for e, v in ts["models"].items():
+        assert 0.5 < v["any_finding_auc"] <= 1.0
+        tr = s9["triage"]["models"][e]
+        if tr["sensitivity"] is not None:
+            assert v["threshold_overshoot"] == pytest.approx(tr["sensitivity"] - 0.95, abs=6e-3)
+        if tr["specificity"] is None:
+            assert v["specificity_interval"] is None
+        else:
+            assert v["specificity_interval"][0] <= tr["specificity"] <= v["specificity_interval"][1]
+    # 4. the largest site: unseen (S2) against seen (S1), at equal and larger training size
+    ls = s9["largest_site_decomposition"]
+    assert ls["group"].startswith("LANG") and ls["fold"] in range(5)
+    tsz = ls["training_sets"]
+    assert tsz["a_s2_fold_k"]["group_share"] == 0.0 and tsz["b_s1_fold_k"]["group_share"] > 0.05  # unseen against seen
+    assert abs(tsz["a_s2_fold_k"]["studies"] - tsz["b_s1_fold_k"]["studies"]) <= 15  # the same size (usable studies, rounded)
+    for e in ("dinov2_vits14", "convnext_tiny", "vit_s16"):
+        v = ls["encoders"][e]
+        assert v["studies"]["a"] >= v["studies"]["b"] and 0.5 < v["b_seen_equal_training_size"] <= 1
+        assert v["unseen_site_cost_at_equal_training_size"] == pytest.approx(
+            v["b_seen_equal_training_size"] - v["a_on_b_studies"], abs=2e-4)
+    # 5. best-epoch spread and the schedule
+    be = s9["best_epoch_spread"]["encoders"]["dinov2_vits14"]
+    assert be["chosen_config"] == {"lowest": 4.0, "median": 4.5, "p90": 5.0, "share_at_or_below_6": 1.0, "share_at_cap": 0.0}
+    assert be["refit_epochs"] == {"E": [6] * 5} and be["median_E"] == 6.0
+    assert be["lr_fraction_of_peak_at_median_E"] == pytest.approx(0.93, abs=0.005) and be["warmup_share_of_training"] == 0.17
+    assert s9["best_epoch_spread"]["scheduled_epochs"] == 30
+    # 6. gold: a standard error, and the exact count only in a private file
+    gu = s9["gold_uncertainty"]
+    exact = json.loads((paths.WORKING / "private" / "n9" / "gold_count.json").read_text())
+    n = exact["gold_studies_scored_by_both_main_encoders"]
+    assert 50 <= n <= 58 and gu["studies"] == 5 * round(n / 5) and gu["n_draws"] == 2000
+    assert str(n) not in json.dumps(gu) or n % 5 == 0  # the summary holds only the rounded count
+    for e in ("dinov2_vits14", "convnext_tiny"):
+        assert gu["macro_auc"][e]["estimate"] == s9["s3_gold"]["macro_auc"][e] and 0 < gu["macro_auc"][e]["se"] < 0.1
+    assert gu["delta1"]["estimate"] == pytest.approx(s9["s3_gold"]["delta1"], abs=2e-4) and gu["delta1"]["se"] > 0
+    # 7. Delta2 without the look-alike studies (post hoc); the pairs are the ones N7's probe counted
+    h2 = s9["h2_without_lookalikes"]
+    assert h2["post_hoc"] is True and h2["pairs_match_n7_probe"] is True and h2["studies_removed"] in ("<5", 5)
+    assert h2["delta2_registered"]["estimate"] == s9["h2"]["estimate"]
+    assert h2["delta2_without_lookalikes"]["estimate"] == pytest.approx(s9["h2"]["estimate"], abs=0.01)
+    assert h2["change"] == pytest.approx(h2["delta2_without_lookalikes"]["estimate"] - s9["h2"]["estimate"], abs=2e-4)
+    # 8. the per-finding note
+    note = s9["h1"]["per_finding_exploratory_note"]
+    k = sum(1 for v in s9["h1"]["per_finding_exploratory"].values() if v["lo"] > 0 or v["hi"] < 0)
+    assert note["intervals_excluding_zero"] == f"{k} of 12" and "single" in note["note"]
 
 
 def test_secondary_faults_never_cost_the_freeze_file_or_the_base_outputs(stage_env, tmp_path, monkeypatch):
