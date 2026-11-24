@@ -589,4 +589,30 @@ Rules for reading N11:
 1. The decision is the record's keep per encoder, from inner validation only (R4). Limits said with it (record.limits).
 2. Every dev number carries the development label (R6): grey, never in a title, never as a gain over iteration 1, never on slide 12. They are reported whatever the decision (R10). A development Delta1 is not a new H1 result.
 3. The graph for the instructor: units.<unit>.inner.to_the_end.<2e-05 and the survivor>.curve (training and validation, 12 points; the training curve has dropout on, the validation curve has it off). Fold 0 on the slide, all folds in the appendix.
-4. If kept for an encoder: the S4 submission needs N10 with tails (private/n11_<session>/<encoder>_f<fold>/b_lite_seed_0.pt) and Ablay's OK (plan 12.4). N10 reads only these .pt files; the per-study files (labels, UIDs) in the same folders are not read there.
+4. If kept for an encoder: the S4 submission needs N10 with tails (private/n11_<session>/<encoder>_f<fold>/b_lite_seed_0.pt) and Ablay's OK (plan 12.4). N10 reads these .pt files, each unit's state.json and each session's run.json (aggregates only); the per-study files (labels, UIDs) in the same folders are not read there. Card: "N10 with N11's B-lite models" below.
+
+## N10 with N11's B-lite models (iteration 3; only if the decision keeps the change; Ablay presses Submit)
+
+Code knee.nb.n10 (tails="n11"), tests tests/test_n10_tails.py. The submitted model for one encoder is the mean of five fold models. A fold model is the shared frozen trunk, the fold's fine-tuned tail and the fold's head, from N11's final fits. Per study the trunk runs once and the five tails run on its output (a study of unresolved laterality gets one more, mirrored, trunk pass). The forward is N11's own code (fp16 on the GPU, flip averaging, z-scores with the fold's Stage A statistics). knee-n10, knee-n10-convnext and knee-n10-canary are unchanged.
+
+| Notebook | Accelerator | Internet | Inputs | Cell 2 | Expected time |
+|---|---|---|---|---|---|
+| knee-n10-blite | GPU T4 x2 | **Off** | Competition; the bundle dataset; outputs of knee-n0, knee-n6a, knee-n11-a and knee-n11-b (and knee-n11-c, knee-n11-d if they ran). Never a unit rerun of Stage A, never knee-n11-smoke's output alone | offline cell 1, then `from knee.nb import n10; n10.run("dinov2_vits14", tails="n11")` | 3-6 h on the hidden test |
+| knee-n10-convnext-blite | GPU T4 x2 | **Off** | the same | offline cell 1, then `from knee.nb import n10; n10.run("convnext_tiny", tails="n11")` | 3-6 h on the hidden test |
+
+Before the run:
+1. The bundle dataset must be a new version built at a commit that holds this code (the bundle's wheel is what runs; 47fdcbf has no tails). bundle_commit in agg_n10.json shows which one ran.
+2. knee-n6a stays attached. N11 saves the tail and the head, not the fold's z-score statistics or head config. N10 reads both from knee-n6a's unit, as N11 did.
+3. Only one GPU is used by this path.
+
+The step refuses to run (STEP n10: FAILED, before any decoding, no submission.csv) unless all of these hold for the encoder: exactly folds 0-4; every unit complete (frozen0 valid, inner work and final fits complete); each b_lite_seed_0.pt is the file its state.json records; one known commit over the sessions; one schedule; one learning-rate rule (rung1_tie and passes of the sessions, and every final fit at its unit's chosen rate); no session with test overrides; knee-n6a's config of the fold equals the one N11 logged.
+
+Check in agg_n10.json before asking Ablay to submit:
+1. mode "b-lite". folds [0, 1, 2, 3, 4]. failed_share 0 (the step itself allows at most 0.01). submission.layout wide.
+2. b_lite.n11_commit = the commit of the N11 sessions. b_lite.schedule = the sessions' schedule.
+3. Per fold, b_lite.units.fold_k.weights_file_sha16 equals units.<encoder>_f<k>.files_sha16["b_lite_seed_0.pt"] in agg_n11_<session>.json (the same string is in the decision record's prediction_files_sha16). This one hash covers the tail and the head: N11 saves both in one file.
+4. Per fold, tail_sha16 and head_sha16 are present and differ between folds. They are hashes of the loaded tensors. N11's outputs hold no separate tail or head hash, so these two are a record of what was submitted, not a comparison.
+5. b_lite.units.fold_k.encoder_lr equals units.<unit>.inner.chosen_lr of the N11 summary.
+6. b_lite.amp_fp16 true, equal to amp_fp16_in_training of every fold.
+7. b_lite.trunk_passes_per_study between 1.0 and 2.0 (1.0 + the share of studies with unresolved laterality).
+8. series_tiers (all three N10 modes): per plane, how many test studies got a fluid-sensitive fat-suppressed series, a fluid-sensitive one, any other series, or none. Rounded counts. Compare the shares with training (N0).

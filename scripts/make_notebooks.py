@@ -52,6 +52,10 @@ NOTEBOOKS = {
     "n10-canary": (False, True, False, ["n0"], 32400),
     "n10": (True, True, False, ["n0", "n6a"], 32400),
     "n10-convnext": (True, True, False, ["n0", "n6a"], 32400),
+    # N10 with N11's B-lite fold models (only if N11's decision keeps the change): both sessions' outputs
+    # (and knee-n11-c, knee-n11-d if they ran) beside knee-n6a, whose units hold the z-score statistics
+    "n10-blite": (True, True, False, ["n0", "n6a", "n11-a", "n11-b"], 32400),
+    "n10-convnext-blite": (True, True, False, ["n0", "n6a", "n11-a", "n11-b"], 32400),
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
     # N12 (plan r2, error analysis; RUNBOOK "Error analysis N12"): CPU, descriptive, existing outputs only
     "n12": (False, False, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 3600),
@@ -121,6 +125,10 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return 'from knee.nb import n10; n10.run("dinov2_vits14")'
     if name == "n10-convnext":
         return 'from knee.nb import n10; n10.run("convnext_tiny")'
+    if name == "n10-blite":
+        return 'from knee.nb import n10; n10.run("dinov2_vits14", tails="n11")'
+    if name == "n10-convnext-blite":
+        return 'from knee.nb import n10; n10.run("convnext_tiny", tails="n11")'
     if name == "n12":
         return f"from knee.nb import n12; n12.run(expect={EXPECT})"
     if name == "n14":
@@ -150,7 +158,7 @@ CELL1_OFFLINE = (
     ' "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)\n'
     "import knee.safe_log as sl; sl.install()"
 )
-OFFLINE = ("n10", "n10-convnext", "n10-canary")
+OFFLINE = ("n10", "n10-convnext", "n10-canary", "n10-blite", "n10-convnext-blite")
 
 
 def cell1(commit: str, offline: bool = False) -> str:
