@@ -309,6 +309,7 @@ def test_session_units_order_and_outputs(e2e):
 
     s, d = e2e.s, e2e.d
     assert s["status"] == "ok", s.get("errors")
+    assert s["cache_copy"]["where"] == "local copy" and s["cache_copy"]["sampled_studies_equal"] is True
     assert s["session"] == "a" and s["schedule"] == "full" and set(s["units"]) == {f"{e}_f{k}" for e in MAIN for k in (0, 1)}
     assert json.loads((e2e.work / "run.json").read_text())["config"]["schedule"] == "full"
     # order inside a session: frozen0 for every fold, then all inner work, then the final fits
@@ -476,6 +477,17 @@ def test_smoke_reads_no_score(inputs, tmp_path, monkeypatch):
                                          "checkpoint_round_trip": True, "run_json_lock": True}
         assert not set(b) & {"frozen0", "inner", "final"}
         assert b["units_loaded"] == [f"{b['encoder']}_f{k}" for k in range(5)]  # every fold's Stage A unit loads
+        tb = sm["time_breakdown"]  # where the time of a micro-batch goes
+        assert set(tb["seconds"]) == {"read", "to_gpu", "trunk", "tail_and_backward", "optimiser"}
+        assert sum(tb["share"].values()) == pytest.approx(1.0, abs=0.01) and tb["slices_per_s"] > 0
+        assert 0 <= sm["read_share"] <= 1 and sm["read_seconds"] >= 0
+    assert s["cache_copy"]["where"] == "local copy" and s["cache_copy"]["copy_seconds"] >= 0
+    assert "local_dir" not in s["cache_copy"]  # and the copy is gone when the step ends
+    import glob
+    import os
+    import tempfile
+
+    assert not glob.glob(os.path.join(tempfile.gettempdir(), f"knee_n11_cache_{os.getpid()}"))
     assert set(s["environment"]) >= {"torch", "python", "device_name"}
     assert set(s["validation_table"]) == {f"fold_{k}" for k in range(5)}  # the table is checked for every fold
     assert set(s["validation_table"]["fold_3"]["inner_validation_groups"]) == {"LANG4", "LANG0"}
@@ -539,6 +551,42 @@ def test_a_failed_or_late_unit_ends_the_step_partial(inputs, tmp_path, monkeypat
     assert s["status"] == "partial" and s["out_of_time"] is True and s["units_complete"] == []
     assert all(b["inner"]["complete"] for b in s["units"].values())  # the finished inner work is kept and listed
     assert s["errors"][u0].startswith("OutOfTime at")
+
+
+def test_local_cache_copy_bytes_equal_and_fallback(inputs, tmp_path):
+    from knee.nb import n11
+
+    src = {p: inputs / f"n4-{p}" / "private" / f"n4_{p}" / f"cache_{p}.u8" for p in PLANES}
+    shape = tuple(json.loads((src["axial"].parent / "cache_axial_manifest.json").read_text())["shape"])
+    paths_, info = n11.localise_caches(inputs, tmp_path / "local", margin=0)
+    assert info["where"] == "local copy" and info["sampled_studies_equal"] and info["same_size"] and info["copy_mb_per_s"] > 0
+    assert info["sha256_equals_manifest"] is None  # these manifests carry no hash
+    for p in PLANES:
+        assert Path(paths_[p]).parent.parent == tmp_path / "local" and Path(paths_[p]).read_bytes() == src[p].read_bytes()
+    # whole-study block reads give the memmap's bytes, in the order asked for
+    mm = np.memmap(src["axial"], dtype=np.uint8, mode="r", shape=shape)
+    rows = np.array([7, 3, 3, shape[0] - 1, 0])
+    for path in (paths_["axial"], src["axial"]):
+        got = n11.BlockCache(path, shape)[rows]
+        assert got.dtype == np.uint8 and got.flags["C_CONTIGUOUS"] and np.array_equal(got, mm[rows])
+    with pytest.raises(IndexError):
+        n11.BlockCache(src["axial"], shape)[[shape[0]]]
+    # no room: the source files are read, and the report says so
+    for kw in ({"local_dir": tmp_path / "none", "margin": 1 << 60}, {"local_dir": False}):
+        paths_, info = n11.localise_caches(inputs, **kw)
+        assert info["where"] == "source" and paths_ == {p: str(src[p]) for p in PLANES} and "note" in info
+    assert not list((tmp_path / "none").glob("*"))
+    # a copy whose hash differs from the manifest's is not used
+    inp = tmp_path / "input"
+    shutil.copytree(inputs, inp)
+    man = inp / "n4-axial" / "private" / "n4_axial" / "cache_axial_manifest.json"
+    import hashlib
+
+    good = hashlib.sha256(src["axial"].read_bytes()).hexdigest()
+    for sha, where in ((good, "local copy"), ("0" * 64, "source")):
+        man.write_text(json.dumps({**json.loads(man.read_text()), "sha256": sha}))
+        _, info = n11.localise_caches(inp, tmp_path / "l2", margin=0)
+        assert info["where"] == where and info.get("sha256_equals_manifest") is (True if where == "local copy" else None)
 
 
 def test_an_interrupt_is_not_swallowed(inputs, tmp_path, monkeypatch):

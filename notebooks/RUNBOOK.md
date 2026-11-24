@@ -505,7 +505,8 @@ Pass criteria (summary block and agg_n11_smoke.json):
 5. environment (torch, python, CUDA, image) equals knee-n5's run.json versions. If not, stop.
 6. validation_table lists all five folds with the plan's groups (names and rounded sizes). "FAILED - AssertionError" at inner_split = the groups differ from the plan's table: correct the table in the plan first, then the code.
 7. suggested_schedule is "full" or "halved" (the slower encoder under 300 slices/s = halved). Write this value into cell 2 of BOTH sessions. steady_slices_per_s is reported only. Hand projection for session a, per encoder (review r2, MS2; forward assumed at 1.5 x the training speed, not measured): 300 slices/s = 12-15 h on the full schedule (about 9 h halved); 400 = 9.3-11.4 h; 450 = 8.3-10.1 h; 500 = 7.4-9.1 h. The registered rule says "full" at 300 or more. Which schedule to use at 300-450 slices/s is Ablay's decision, taken before the sessions start and written here. A session that passes its soft stop ends "partial" and loses only its unfinished units.
-8. units_loaded lists all five folds for each encoder (every fold's Stage A unit loads).
+8. cache_copy.where is "local copy" (the three caches are copied once to local disk and checked against the source; copy_seconds and copy_mb_per_s say how fast). "source" = no room or a failed copy: the input files are read in whole-study blocks; say so. time_breakdown per encoder (read, to_gpu, trunk, tail_and_backward, optimiser) and read_share show where the time goes: a read share above about 0.2 means the data path is still the limit.
+9. units_loaded lists all five folds for each encoder (every fold's Stage A unit loads).
 
 ### 2. knee-n11-a and knee-n11-b
 

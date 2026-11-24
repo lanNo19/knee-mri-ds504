@@ -305,29 +305,83 @@ def _factory(task: dict):
 
 # ---------------------------------------------------------------- feature sources
 
+class BlockCache:
+    """One plane's uint8 cache [studies, S, H, W], read one whole study per read call (pread).
+
+    Why not index the memmap: a random study read through a memory map arrives as hundreds of page faults,
+    each a round trip on a network-backed input disk (the first smoke run: 80 slices/s for both encoders,
+    about 4 MB/s). One pread per study is one request of S x H x W bytes."""
+
+    def __init__(self, path, shape):
+        self.path, self.shape = str(path), tuple(int(x) for x in shape)
+        self.row_bytes = int(np.prod(self.shape[1:]))
+        self._fd = None
+
+    def __getitem__(self, rows) -> np.ndarray:
+        if self._fd is None:
+            self._fd = os.open(self.path, os.O_RDONLY)
+        rows = np.atleast_1d(np.asarray(rows)).astype(np.int64)
+        out = np.empty((len(rows), *self.shape[1:]), np.uint8)
+        for i, r in enumerate(rows):
+            if not 0 <= r < self.shape[0]:
+                raise IndexError("cache row out of range")
+            view = memoryview(out[i]).cast("B")
+            done = 0
+            while done < self.row_bytes:
+                n = os.preadv(self._fd, [view[done:]], int(r) * self.row_bytes + done)
+                if n <= 0:
+                    raise OSError("short read from a cache file")
+                done += n
+        return out
+
+    def __del__(self):
+        try:
+            if self._fd is not None:
+                os.close(self._fd)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class EncSource:
     """Slice features from the caches through the split encoder: the B-lite forward code.
 
     rows -> one float32 tensor [m, S, D] per plane. The trunk always runs under no_grad; the tail runs
-    with a graph only when grad is true. flipped: coronal and axial slices mirrored left-right (as N5)."""
+    with a graph only when grad is true. flipped: coronal and axial slices mirrored left-right (as N5).
+    The uint8 slices go to the GPU as they are; the float conversion and normalisation happen there."""
 
     def __init__(self, enc: Split, caches: dict, planes, amp: bool):
         self.enc, self.caches, self.planes, self.amp = enc, caches, tuple(planes), bool(amp)
+        self.read_s = 0.0  # seconds spent reading the caches (host side)
 
-    def __call__(self, rows, grad: bool = False, flipped: bool = False):
+    def read(self, rows) -> list:
+        """One uint8 array [m, S, H, W] per plane, whole studies."""
+        t0 = time.time()
+        out = [np.ascontiguousarray(self.caches[p][rows]) for p in self.planes]
+        self.read_s += time.time() - t0
+        return out
+
+    def to_device(self, arrays, flipped: bool = False):
+        """(uint8 tensor [planes x m x S, H, W] on the device, m, S)."""
         import torch
 
-        rows = np.asarray(rows)
         dev = self.enc.device
         parts = []
-        for p in self.planes:
-            a = torch.from_numpy(np.ascontiguousarray(self.caches[p][rows])).to(dev)
+        for p, a in zip(self.planes, arrays):
+            a = torch.from_numpy(a).to(dev)
             parts.append(a.flip(-1) if flipped and p in FLIP_PLANES else a)
         m, S = parts[0].shape[:2]
-        x = torch.cat(parts).reshape(len(self.planes) * m * S, *parts[0].shape[2:])
-        with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=self.amp):
-            with torch.no_grad():
-                h = self.enc.trunk(self.enc.prep(x))
+        return torch.cat(parts).reshape(len(self.planes) * m * S, *parts[0].shape[2:]), m, S
+
+    def trunk(self, x):
+        import torch
+
+        with torch.autocast(device_type=self.enc.device.type, dtype=torch.float16, enabled=self.amp), torch.no_grad():
+            return self.enc.trunk(self.enc.prep(x))
+
+    def tail(self, h, m: int, S: int, grad: bool):
+        import torch
+
+        with torch.autocast(device_type=self.enc.device.type, dtype=torch.float16, enabled=self.amp):
             if grad:
                 f = self.enc.tail(h)
             else:
@@ -335,6 +389,89 @@ class EncSource:
                     f = self.enc.tail(h)
         f = f.float().reshape(len(self.planes), m, S, -1)
         return [f[i] for i in range(len(self.planes))]
+
+    def __call__(self, rows, grad: bool = False, flipped: bool = False):
+        x, m, S = self.to_device(self.read(np.asarray(rows)), flipped)
+        return self.tail(self.trunk(x), m, S, grad)
+
+
+def localise_caches(root=None, local_dir=None, margin: int = 2 << 30, chunk: int = 32 << 20) -> tuple[dict, dict]:
+    """Copy the three plane caches once, sequentially, from the input disk to local disk.
+
+    Returns ({plane: path to read from}, a report). The target is the first of local_dir, $KNEE_LOCAL_CACHE,
+    /kaggle/temp and the temp folder with room for the files plus `margin`. The copy is checked: the same
+    size, the manifest's sha256 when it has one (hashed while copying), and 16 sampled studies equal to the
+    source. No room, a failed copy or a failed check: the source files are read instead (in whole-study
+    blocks), and the report says so. local_dir False switches the copy off."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = Path(root) if root else None
+    src, mans = {}, {}
+    for p in heads.PLANES:
+        mp_ = paths.find_file(f"cache_{p}_manifest.json", root)
+        if mp_ is None:
+            raise FileNotFoundError("cache not attached")
+        mans[p] = json.loads(mp_.read_text())
+        src[p] = mp_.parent / mans[p]["file"]
+    same = {p: str(v) for p, v in src.items()}
+    total = sum(v.stat().st_size for v in src.values())
+    info = {"gb": round(total / 2 ** 30, 2), "where": "source", "reads": "one pread per study"}
+    if local_dir is False:
+        return same, {**info, "note": "the local copy was switched off"}
+    target = None
+    for cand in ([local_dir] if local_dir else [os.environ.get("KNEE_LOCAL_CACHE"), "/kaggle/temp", tempfile.gettempdir()]):
+        if not cand:
+            continue
+        try:
+            d = Path(cand) / f"knee_n11_cache_{os.getpid()}"
+            d.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(d).free >= total + int(margin):
+                target = d
+                break
+            shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            continue
+    if target is None:
+        return same, {**info, "note": "no local folder with enough free space: the source files are read"}
+
+    def copy(p):
+        h = hashlib.sha256()
+        with open(src[p], "rb", buffering=0) as fi, open(target / src[p].name, "wb", buffering=0) as fo:
+            while True:
+                b = fi.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+                fo.write(b)
+        return h.hexdigest()
+
+    t0 = time.time()
+    try:
+        with ThreadPoolExecutor(max_workers=len(src)) as ex:
+            digests = dict(zip(src, ex.map(copy, list(src))))
+        ok, sha_ok = True, {}
+        for p in src:
+            dst = target / src[p].name
+            ok = ok and dst.stat().st_size == src[p].stat().st_size
+            if mans[p].get("sha256"):
+                sha_ok[p] = digests[p] == mans[p]["sha256"]
+                ok = ok and sha_ok[p]
+            shape = tuple(mans[p]["shape"])
+            rows = np.unique(np.linspace(0, shape[0] - 1, min(16, shape[0])).round().astype(int))
+            ok = ok and np.array_equal(BlockCache(dst, shape)[rows], BlockCache(src[p], shape)[rows])
+    except OSError:
+        ok, sha_ok = False, {}
+    secs = time.time() - t0
+    if not ok:
+        shutil.rmtree(target, ignore_errors=True)
+        return same, {**info, "note": "the local copy failed or did not equal the source: the source files are read",
+                      "copy_seconds": round(secs, 1)}
+    return ({p: str(target / src[p].name) for p in src},
+            {**info, "where": "local copy", "local_dir": str(target), "copy_seconds": round(secs, 1),
+             "copy_mb_per_s": round(total / 2 ** 20 / max(secs, 1e-6), 1),
+             "sha256_equals_manifest": all(sha_ok.values()) if sha_ok else None, "sampled_studies_equal": True,
+             "same_size": True})
 
 
 class FeatSource:
@@ -682,7 +819,9 @@ def _shared(task: dict):
         mm, _, st, up, _ = n5._load_plane(p, root)
         if st[UID].astype(str).tolist() != d.uids.tolist():
             raise AssertionError("cache rows differ from N5's index")
-        sh.caches[p], sh.upstream_n4[p] = mm, up
+        # the same bytes, read in whole-study blocks, from the local copy when the parent made one
+        sh.caches[p] = BlockCache((task.get("cache_paths") or {}).get(p) or mm.filename, mm.shape)
+        sh.upstream_n4[p] = up
     sh.S = int(sh.caches[heads.PLANES[0]].shape[1])
     sh.bank = d.bank(sh.name, str(dev))
     sh.dim = int(sh.bank.x[heads.PLANES[0]].shape[-1])
@@ -1023,6 +1162,57 @@ def pick_micro(c) -> int:
     return c.micro if fits else 1
 
 
+def _breakdown(c, r, n: int = 20) -> dict:
+    """Where the time of a b-lite micro-batch goes: n more micro-batches of random training studies after
+    the timed run, with a device synchronisation after each stage (so the timed run itself is not slowed).
+    Stages: reading the caches, host-to-GPU transfer, the frozen trunk, the tail forward with the head, the
+    loss and the backward pass, and the optimiser step (once per effective batch)."""
+    import torch
+    import torch.nn.functional as F
+
+    dev, src = c.device, c.src
+    T = {"read": 0.0, "to_gpu": 0.0, "trunk": 0.0, "tail_and_backward": 0.0, "optimiser": 0.0}
+    per_step = max(1, int(c.cfg.batch_size) // c.micro)
+    rng = np.random.default_rng(0)
+    r.head.train()
+    r.opt.zero_grad(set_to_none=True)
+    slices = 0
+    for i in range(n):
+        mb = rng.choice(c.tr, size=c.micro, replace=False)
+        mt = torch.as_tensor(mb, device=dev)
+        _sync(dev)
+        t0 = time.time()
+        arrays = src.read(mb)
+        t1 = time.time()
+        x, m, S = src.to_device(arrays)
+        _sync(dev)
+        t2 = time.time()
+        h = src.trunk(x)
+        _sync(dev)
+        t3 = time.time()
+        zs = _z(c, src.tail(h, m, S, True))
+        w = c.bank.w[mt]
+        ls = F.binary_cross_entropy_with_logits(r.head(zs), c.bank.y[mt], weight=w, pos_weight=r.pw, reduction="sum")
+        r.scaler.scale(ls / w.sum().clamp_min(1.0)).backward()
+        _sync(dev)
+        t4 = time.time()
+        if (i + 1) % per_step == 0:
+            r.scaler.step(r.opt)
+            r.scaler.update()
+            r.opt.zero_grad(set_to_none=True)
+            _sync(dev)
+        t5 = time.time()
+        for k, v in zip(T, (t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4)):
+            T[k] += v
+        slices += x.shape[0]
+    r.opt.zero_grad(set_to_none=True)
+    total = sum(T.values())
+    return {"micro_batches": agg.count(n), "seconds": {k: round(v, 3) for k, v in T.items()},
+            "share": {k: round(v / max(total, 1e-9), 3) for k, v in T.items()},
+            "slices_per_s": round(slices / max(total, 1e-9), 1),
+            "note": "random training studies, a synchronisation after each stage; after the timed run"}
+
+
 def _smoke(c, st: dict) -> None:
     """The smoke run (12.1 item 10): 200 micro-batches of the b-lite loop on fold 0's training studies:
     slices/s and peak memory. Then, on 8 training studies, the code that otherwise first runs hours into a
@@ -1034,14 +1224,17 @@ def _smoke(c, st: dict) -> None:
     r = new_run(c, c.src, c.head_state, c.tr, REGISTERED_LR, 0)
     r.clock = []
     run_to(c, r, TWELFTHS, limit=("micro", int(c.task.get("smoke_micro") or SMOKE_MICRO)))
+    read_s = c.src.read_s
     last = r.clock[-101:]  # the last 100 micro-batches: without cold disk reads and cuDNN autotune
     steady = ((last[-1][1] - last[0][1]) / max(last[-1][0] - last[0][0], 1e-6)) if len(last) >= 2 else None
     st["smoke"] = {"micro_batches": agg.count(len(r.clock)), "slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1),
                    "steady_slices_per_s": round(steady, 1) if steady is not None else None,
                    "steady_note": "the last 100 micro-batches; reported only, the rule uses slices_per_s",
                    "seconds": round(r.train_s, 1), "peak_memory_gb": _peak_gb(c.device),
+                   "read_seconds": round(read_s, 1), "read_share": round(read_s / max(r.train_s, 1e-6), 3),
                    "micro_batch_slices": c.micro * c.S * len(c.planes), "reads_no_score": True,
                    "skipped_step_share": round(r.skipped / max(r.step, 1), 4)}
+    st["smoke"]["time_breakdown"] = _breakdown(c, r)
     rows = c.tr[:8]
     feat, _ = _features(c, rows, rows)
     h = new_run(c, feat, c.head_state, c.tr[:max(24, 3 * int(c.cfg.batch_size))], 0.0, 0, with_encoder=False, epochs=12)
@@ -1354,6 +1547,7 @@ def _summary(s: dict) -> dict:
             "units_complete": s.get("units_complete"), "units_missing": s.get("units_missing"),
             "out_of_time": s.get("out_of_time"),
             "schedule": s.get("schedule"), "suggested_schedule": s.get("suggested_schedule"),
+            "cache_copy": s.get("cache_copy"),
             "environment": s.get("environment"), "folds": s.get("folds"),
             "validation_table": s.get("validation_table"),
             "note": "no test-fold metric of a trained model is computed here; frozen0's check equals an iteration-1 number",
@@ -1364,7 +1558,7 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
         encoders: tuple[str, ...] = MAIN, smoke: bool = False, budget_h: float = 10.5, quiet: bool = True,
         devices=None, processes: bool | None = None, rung1_tie: bool = True, head_only_seeds=HEAD_ONLY_SEEDS,
         val_table: dict | None = None, val_range=VAL_RANGE, passes: int = PASSES, encoder_factory=None,
-        eval_studies: int = 4, smoke_micro: int = SMOKE_MICRO) -> dict:
+        eval_studies: int = 4, smoke_micro: int = SMOKE_MICRO, local_cache=None, local_margin: int = 2 << 30) -> dict:
     """One GPU session of Stage B-lite (see the module docstring). expect: the upstream hash prefixes of the card.
 
     smoke=True: the smoke run (step n11_smoke; fold 0; 200 micro-batches per encoder; no score). Its summary
@@ -1378,7 +1572,12 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
     The cut order's items that live here (defaults = nothing cut): head_only_seeds (the final head-only
       seeds; (0,) cuts seeds 1-4) and rung1_tie (False: a tied pair at rung 0 does not continue as a pair).
     budget_h: the watchdog stops the step at 1.1 x (Kaggle's limit is 12 h).
-    val_table, val_range, passes, encoder_factory, eval_studies, smoke_micro, devices, processes: for tests."""
+    local_cache: None = the three caches are first copied once to local disk (/kaggle/temp or the temp folder,
+      if there is room; checked against the source) and read from there; False = read the input files; a
+      path = copy there. Either way the caches are read one whole study per read call. The copy is deleted
+      when the step ends. cache_copy in the summary says what happened and how fast.
+    val_table, val_range, passes, encoder_factory, eval_studies, smoke_micro, devices, processes, local_margin:
+      for tests."""
     from . import n13
 
     encs = tuple(encoders)
@@ -1433,6 +1632,8 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
         else:
             jobs = [(e, devs[i % len(devs)], folds) for i, e in enumerate(encs)]
         s["processes"] = [f"{e} on {dv.split(':')[0]}: folds {', '.join(str(k) for k in fs)}" for e, dv, fs in jobs]
+        base["cache_paths"], s["cache_copy"] = localise_caches(root, local_cache, local_margin)
+        local_dir = s["cache_copy"].pop("local_dir", None)
         try:
             results = _map([{**base, "encoder": e, "device": dv, "folds": list(fs)} for e, dv, fs in jobs],
                            parallel and len(jobs) >= 2)
@@ -1446,6 +1647,9 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
                 except Exception:  # noqa: BLE001
                     pass
             raise
+        finally:
+            if local_dir:
+                shutil.rmtree(local_dir, ignore_errors=True)
         on_disk = {_unit(e, k): _load_state(_unit_dir(working, step, e, k)) for e in encs for k in folds}
         bad = {u: err for r in results if not r.get("ok") for u, err in (r.get("errors") or {}).items()}
         if any(r.get("invalid") for r in results) or _invalid_flag(working, step).exists():
