@@ -424,6 +424,8 @@ def localise_caches(root=None, local_dir=None, margin: int = 2 << 30, chunk: int
         if not cand:
             continue
         try:
+            for old in Path(cand).glob("knee_n11_cache_*"):  # a copy left by a killed run would keep the space
+                shutil.rmtree(old, ignore_errors=True)
             d = Path(cand) / f"knee_n11_cache_{os.getpid()}"
             d.mkdir(parents=True, exist_ok=True)
             if shutil.disk_usage(d).free >= total + int(margin):
@@ -996,6 +998,8 @@ def run_to(c, r, twelfth: int, limit: tuple | None = None) -> None:
             r.history.append(rec)
             r.k += 1
             _zero_acc(c, r)
+            if r.k < TWELFTHS:  # a late fit stops within one twelfth (not after the last: that fit is finished)
+                _abort_if_invalid(c)
 
 
 def _validate(c, r) -> dict:

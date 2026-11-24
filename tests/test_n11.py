@@ -649,6 +649,33 @@ def test_rung_resume_inside_an_epoch_equals_an_uninterrupted_run(ctx, tmp_path):
         n11.load_checkpoint(ctx, other, tmp_path / "ck.pt")
 
 
+def test_soft_stop_ends_a_late_fit_within_one_twelfth(ctx, tmp_path):
+    import time
+
+    from knee.nb import n11
+
+    rows = ctx.itr[:60]
+    late = {**ctx.task, "soft_stop": time.time() - 1}
+    c = copy.copy(ctx)
+    c.task = late
+    r = n11.new_run(c, c.src, c.head_state, rows, 2e-5, 0, epochs=3)
+    with pytest.raises(n11.OutOfTime):  # checked at the end of the first twelfth, not only before the fit
+        n11.run_to(c, r, 12)
+    assert r.k == 1 and len(r.history) == 1 and r.step == r.marks[0]
+    c.task = {**ctx.task, "soft_stop": None}
+    r = n11.new_run(c, c.src, c.head_state, rows, 2e-5, 0, epochs=3)
+    n11.run_to(c, r, 11)
+    c.task = late
+    n11.run_to(c, r, 12)  # the last twelfth ends the fit: no stop after it
+    assert r.k == 12 and r.step == r.total
+    # a stale copy of a killed run is removed before the target is chosen
+    stale = tmp_path / "loc" / "knee_n11_cache_999999"
+    stale.mkdir(parents=True)
+    (stale / "cache_axial.u8").write_bytes(b"x" * 10)
+    _, info = n11.localise_caches(ctx.root, tmp_path / "loc", margin=0)
+    assert info["where"] == "local copy" and not stale.exists()
+
+
 def test_head_only_with_encoder_rate_0_and_groups(ctx):
     from knee.nb import n11
 
@@ -1097,11 +1124,11 @@ def test_n11_cli_entries_match_the_runbook_card():
     spec.loader.exec_module(mk)
     card = (root / "notebooks" / "RUNBOOK.md").read_text().split("## Stage B-lite N11 (iteration 3, all five folds)")[1]
     gpu_inputs = [f"u/knee-{u}" for u in ("n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a")]
-    for name in ("n11-smoke", "n11-a", "n11-b", "n11-c"):
+    for name in ("n11-smoke", "n11-a", "n11-b", "n11-c", "n11-d"):
         assert mk.cell2(name).split("schedule=")[0] in card and f"expect={mk.EXPECT}" in mk.cell2(name)
         meta = mk.metadata("u", name)
         assert meta["enable_gpu"] is True and meta["enable_internet"] is True and meta["kernel_sources"] == gpu_inputs
-    assert 'session="c"' in mk.cell2("n11-c") and 'session="a"' in mk.cell2("n11-a") and 'session="b"' in mk.cell2("n11-b") and "smoke=True" in mk.cell2("n11-smoke")
+    assert 'session="d"' in mk.cell2("n11-d") and 'session="c"' in mk.cell2("n11-c") and 'session="a"' in mk.cell2("n11-a") and 'session="b"' in mk.cell2("n11-b") and "smoke=True" in mk.cell2("n11-smoke")
     assert mk.metadata("u", "n11-decide")["kernel_sources"] == ["u/knee-n11-a", "u/knee-n11-b"]
     assert mk.metadata("u", "n11-dev")["kernel_sources"] == ["u/knee-n11-a", "u/knee-n11-b", "u/knee-n11-decide"]
     for name in ("n11-decide", "n11-dev"):

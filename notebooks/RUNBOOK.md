@@ -481,9 +481,9 @@ Order: 1. knee-n11-smoke. 2. knee-n11-a and knee-n11-b at the same time. 3. knee
 
 | Notebook | Accelerator | Internet | Inputs |
 |---|---|---|---|
-| knee-n11-smoke, knee-n11-a, knee-n11-b (and knee-n11-c after a partial session) | GPU T4 x2 | On (pip, and the encoder weights as in N5) | Outputs of knee-n0, **knee-n3-r**, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a. Exactly one output per upstream step. Never knee-n3, knee-n6a-smoke, a unit rerun or an iteration-2 output (the code refuses a unit that is not knee-n6a's). No competition data |
-| knee-n11-decide | None (CPU) | On | Outputs of knee-n11-a and knee-n11-b (and knee-n11-c if it ran). Nothing else |
-| knee-n11-dev | None (CPU) | On | Outputs of knee-n11-a, knee-n11-b (and knee-n11-c if it ran) and knee-n11-decide. Nothing else |
+| knee-n11-smoke, knee-n11-a, knee-n11-b (and knee-n11-c, knee-n11-d after a partial session) | GPU T4 x2 | On (pip, and the encoder weights as in N5) | Outputs of knee-n0, **knee-n3-r**, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a. Exactly one output per upstream step. Never knee-n3, knee-n6a-smoke, a unit rerun or an iteration-2 output (the code refuses a unit that is not knee-n6a's). No competition data |
+| knee-n11-decide | None (CPU) | On | Outputs of knee-n11-a and knee-n11-b (and knee-n11-c, knee-n11-d if they ran). Nothing else |
+| knee-n11-dev | None (CPU) | On | Outputs of knee-n11-a, knee-n11-b (and knee-n11-c, knee-n11-d if they ran) and knee-n11-decide. Nothing else |
 
 Create the three GPU notebooks as forks of knee-n5 and keep "Pin to original environment": check (b) compares fp16 features with N5's, and decide() refuses two sessions with different environments. Create knee-n11-decide and knee-n11-dev as forks of one of them.
 
@@ -529,7 +529,7 @@ Expected time (estimate, not measured): session a 6.5-8 h, session b 4.5-5.5 h a
 Inside a session: frozen0 checks of every fold, then all inner work of every fold, then the final fits of every fold. The notebook computes no test-fold metric of a trained model.
 
 Pass criteria per session (summary block, agg_n11_a.json or agg_n11_b.json, run.json):
-1. STEP n11_a (n11_b): OK. status "ok", errors empty. status "partial" (a unit failed, or the session passed its 10.5 h soft stop: out_of_time true) = the units in units_complete are good; rerun the units in units_missing in knee-n11-c. "FAILED - InvalidRun" = frozen0 check (b) failed for a unit: the run is invalid, nothing else is read, log it. "FAILED - AssertionError" at inner_split = the printed groups differ from the plan's table: stop and correct the table in the plan first. After status "failed": Ablay reads private/n11_<session>/<encoder>_f<fold>/error.log in his own browser; the agg still lists every inner run that finished.
+1. STEP n11_a (n11_b): OK. status "ok", errors empty. status "partial" (a unit failed, or the session passed its 10.5 h soft stop: out_of_time true) = the units in units_complete are good; rerun the units in units_missing in knee-n11-c (and knee-n11-d for a second call). "FAILED - InvalidRun" = frozen0 check (b) failed for a unit: the run is invalid, nothing else is read, log it. "FAILED - AssertionError" at inner_split = the printed groups differ from the plan's table: stop and correct the table in the plan first. After status "failed": Ablay reads private/n11_<session>/<encoder>_f<fold>/error.log in his own browser; the agg still lists every inner run that finished.
 2. All units present: 3 folds x 2 encoders in a, 2 x 2 in b. Each with frozen0_valid true, inner_complete true, final_complete true.
 3. Validation table, per unit: test_groups and inner_validation_groups are the plan's (12.1 item 3: fold 0 English / Croatian; 1 Croatian / Greek; 2 Greek / German; 3 Bosnian+German / Bulgarian+Dutch; 4 Bulgarian+Dutch / Greek), sizes 250-500 (the code refuses anything else).
 4. frozen0 per unit: check_b.abs_difference at most 0.0005; max_abs_probability_gap and check_a.min_cosine reported.
@@ -540,12 +540,18 @@ Pass criteria per session (summary block, agg_n11_a.json or agg_n11_b.json, run.
 
 Cut order (plan 12.5; arguments, recorded in cuts): the B-lite S4 submission; the side AUC (`n11.dev(side_auc=False)`); `head_only_seeds=(0,)`; `rung1_tie=False`. Never cut: any fold, the inner head-only arm, the null seed, the 2e-5 run, the frozen0 checks, the training-and-validation graph.
 
-### 2b. knee-n11-c (only after a session ended "partial")
+### 2b. knee-n11-c and knee-n11-d (only after a session ended "partial")
 
-Rerun each unit of units_missing whole, with the same schedule and the same commit. One call per encoder; edit folds and encoders:
+Rerun units whole, with the same schedule and the same commit. Name only units from units_missing: a rerun of a unit that is already complete is refused later ("equally far"). One notebook per call: the first call is knee-n11-c with session="c", a second call (the other encoder, or other folds) is knee-n11-d with session="d". Never two calls with one session name: the second would delete the first call's folder. Edit folds and encoders:
 
 ```python
 from knee.nb import n11; n11.run(session="c", folds=(0,), encoders=("convnext_tiny",), expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule="full")
+```
+
+knee-n11-d:
+
+```python
+from knee.nb import n11; n11.run(session="d", folds=(0,), encoders=("convnext_tiny",), expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule="full")
 ```
 
 Pass criteria: as a session, for the units it names. decide and dev take, per unit, the folder that got further (final fits complete, else inner work complete); two folders that got equally far are refused.
