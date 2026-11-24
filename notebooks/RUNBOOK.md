@@ -442,3 +442,33 @@ Rules for reading and quoting N12:
 | development.a4_calibration.encoders.<encoder> | ECE and any-finding AUC (max of 12) before and after subtracting log(positive weight) from each logit; checks (the gate) and info (never gates); log_positive_weight_mean_over_folds |
 | development.a4_calibration.skipped.<encoder> | why A4 is not computed for that encoder (not attached, incomplete predictions, or a failed check), with the checks |
 | not_run | the analyses plan r2 leaves out, each with its reason |
+
+## Error analysis N14 (error hunt, 24 Nov)
+
+N14 is error analysis (n14_spec_r3.md in the planning folder). It reads existing outputs and fits only C1's three all-data heads. Its numbers keep nothing and switch nothing on (R8): the next change is chosen from the failure-mode report that uses them, written into the plan before it runs (R3) and kept or dropped on inner validation only (R4). Ablay set this order on 24 Nov at 11:15. Never attach its output to N7, N9, N10 or N13.
+
+| Notebook | Accelerator | Internet | Inputs |
+|---|---|---|---|
+| knee-n14 | None (CPU) | On | The competition data (C5 reads one DICOM header per chosen series), and the outputs of knee-n0, **knee-n3-r**, knee-n5, knee-n6a, knee-n6b-g and **knee-n7-b**. Exactly one output per upstream step. Never knee-n6a-smoke, knee-n3, knee-n7 or an iteration-2 output |
+
+Cell 1: COMMIT = the commit named in the planning log for N14 (the N14 code after its review).
+
+Cell 2:
+
+```python
+from knee.nb import n14; n14.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+```
+
+Expected time: 20-45 min on CPU (pip 3-5 min; C1's three refits 5-15 min; C5's header pass 5-10 min; bootstraps a few min).
+
+Pass criteria (summary block and agg_n14.json):
+1. STEP n14: OK. status "ok", errors empty, chain_ok true, main_complete true. A chain mismatch fails the step.
+2. All six blocks present with descriptive true and added_after_results true: c1_gold_all_data (label "development: ..."), c2_side_discrimination, c3_sagittal_attention, c4_fallback_contrast, c5_centre_crop, c6_s1_level.
+3. Same data as N9 (knee-n9-b's agg_results.json, 4 decimals): c1_gold_all_data.encoders.<encoder>.s2_pooled equals s3_gold.macro_auc.<encoder> (convnext_tiny 0.7515, dinov2_vits14 0.7317); s2_fold_stratified equals the gold fold-stratified values (convnext_tiny 0.7272, dinov2_vits14 0.7099); c6_s1_level.encoders.<encoder>.s2_mean_of_fold_macros equals s2.<encoder>.mean_of_fold_macros (convnext_tiny 0.7502, dinov2_vits14 0.7422) when same_studies_as_evaluation_set is true. A difference = stop and report both.
+4. c1: E per encoder is N7's consensus E (dinov2_vits14 4, convnext_tiny 5, vit_s16 10); gold_per_s2_fold, lookalikes_removed and training_studies present.
+5. c3: skipped_units empty (every main unit is gated over all planes, and max_abs_gap_vs_predictions is at most 0.001 for each: the rebuilt head reproduces the unit's predictions); otherwise say which and why.
+6. c5: series_read about 4,405 per plane; unread 0 or small.
+
+Rules for reading N14:
+1. Every number is descriptive. C1 carries the development label (R6): never a gain over iteration 1, never in a slide title.
+2. Each block's reading follows the rule written in n14_spec_r3.md before the run; quote the rule with the number.
