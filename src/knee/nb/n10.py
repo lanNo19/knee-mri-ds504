@@ -31,6 +31,11 @@ session's run.json. knee-n6a stays attached: N11 saves neither the fold's z-scor
 nor its head config, so both are read from knee-n6a's unit, as N11 itself reads them.
 Per batch of studies the trunk runs once and the five tails run on its output; the forward is
 N11's own (n11.EncSource, n11.predict: fp16 on a GPU, flip averaging, eval mode).
+
+check_tails (its own notebook, before a b-lite submission): replays one fold's b-lite model on the
+first studies of N11's saved test-fold predictions, from the N4 caches and the bundle checkpoint,
+and reports the gap as aggregates. It ties the bundle's trunk, knee-n6a's statistics and the
+loaded tail and head to what N11 ran.
 """
 from __future__ import annotations
 
@@ -139,7 +144,11 @@ def tail_units(encoder: str, root: Path | None = None) -> dict:
     one N11 logged. Returns {"units": {fold: {...}}, "commit", "schedule", "lr_rule"}."""
     from . import n11
 
-    found = {k: ud for (e, k), ud in n11.find_units(root).items() if e == encoder}
+    try:
+        every = n11.find_units(root)
+    except ValueError as e:  # two folders of one unit that got equally far
+        raise TailError(f"b-lite: {e}") from None
+    found = {k: ud for (e, k), ud in every.items() if e == encoder}
     if sorted(found) != list(range(N_FOLDS)):
         raise TailError(f"b-lite needs exactly folds 0-4 of {encoder}; attached: {sorted(found)}")
     units, commits, schedules, rules = {}, set(), set(), set()
@@ -147,6 +156,8 @@ def tail_units(encoder: str, root: Path | None = None) -> dict:
         b = n11._load_state(ud)
         fin, inner = b.get("final") or {}, b.get("inner") or {}
         wp = ud / BLITE_FILE
+        if b.get("encoder") != encoder or b.get("fold") is None or int(b["fold"]) != k:
+            raise TailError(f"b-lite: the state of fold {k} names another encoder or fold than its folder")
         if not (fin.get("complete") and inner.get("complete") and (b.get("frozen0") or {}).get("valid")):
             raise TailError(f"b-lite: the unit of fold {k} is not complete")
         if not wp.exists() or common.sha16(wp) != (b.get("files_sha16") or {}).get(BLITE_FILE):
@@ -239,7 +250,7 @@ def predict_tails(enc, tails: dict, caches: dict, rows, flip_row, eval_studies: 
     from . import n11
 
     dev, amp = enc.device, enc.device.type == "cuda"  # fp16 on a GPU, as n11._shared
-    names = [n for n, _ in enc.tail_named_parameters()]
+    names = [n_ for n_, _ in enc.tail_named_parameters()]
     folds, info = [], {}
     for k, u in sorted(tails["units"].items()):
         ck = torch.load(u["weights"], map_location="cpu")
@@ -247,6 +258,8 @@ def predict_tails(enc, tails: dict, caches: dict, rows, flip_row, eval_studies: 
             raise TailError(f"b-lite: the weights file of fold {k} belongs to another unit")
         if tuple(ck.get("tail_prefixes") or ()) != tuple(enc.tail_prefixes) or sorted(ck["tail"]) != sorted(names):
             raise TailError(f"b-lite: the tail of fold {k} is not this encoder's trainable tail")
+        if any(tuple(ck["tail"][n_].shape) != tuple(p_.shape) for n_, p_ in enc.tail_named_parameters()):
+            raise TailError(f"b-lite: a tail tensor of fold {k} has another shape than the encoder's")
         cfg = u["config"]
         planes = heads.PLANE_SETS[cfg.planes]
         raw = torch.load(u["stats"], map_location="cpu")
@@ -271,6 +284,116 @@ def predict_tails(enc, tails: dict, caches: dict, rows, flip_row, eval_studies: 
     if enc.model.training:
         raise AssertionError("the encoder must stay in eval mode")
     return out, {"per_fold": info, "trunk_slices": trunk.slices, "amp_fp16": amp, "planes": list(used)}
+
+
+def trunk_sha16(enc) -> str:
+    """A content hash of everything in the encoder that is not its trainable tail (the frozen trunk)."""
+    return _state_sha16({k: v for k, v in enc.model.state_dict().items() if not k.startswith(tuple(enc.tail_prefixes))})
+
+
+def _checkpoint(encoder: str, bdir: Path, man: dict) -> Path:
+    ckpt = bdir / "checkpoints" / f"{encoder}.pth"
+    want = man.get("files_sha256", {}).get(ckpt.name)
+    if want is None or not ckpt.exists() or _sha256(ckpt) != want:
+        raise ValueError("checkpoint does not match the bundle manifest")
+    return ckpt
+
+
+def _split(encoder: str, dev: str, ckpt: Path, encoder_factory=None):
+    """The split encoder of the b-lite path: timm's model with the bundle checkpoint (no download)."""
+    import torch
+
+    from . import n11
+
+    if encoder_factory is not None:
+        return encoder_factory(encoder, dev)
+    enc = n11.TimmSplit(encoder, dev, pretrained=False)
+    enc.model.load_state_dict(torch.load(ckpt, map_location=dev))
+    return enc
+
+
+CHECK_MAX_GAP = 0.01
+CHECK_MEAN_GAP = 0.001
+CHECK_NOTE = ("two fp16 runs differ by about 5e-4 relative in the features (N11's note): a few 1e-3 in probability "
+              "at most. A wrong trunk, tail, head or statistics file moves it by far more than 0.01")
+
+
+def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, root=None, quiet: bool = True,
+                budget_h: float = 1.0, encoder_factory=None, eval_studies: int = 4) -> dict:
+    """Replay one fold's b-lite model against N11's saved predictions (GPU or CPU; internet off).
+
+    Inputs attached: the bundle, the three N4 caches, knee-n6a and the N11 sessions' outputs. The first `n`
+    studies of the fold's pred_b_lite.csv (N11's final-fit predictions of its scored test studies; the
+    file must have the hash its state records) go through predict_tails with the bundle checkpoint: the
+    same batches of 4 studies and the same flip rule as N11 (the file's own "resolved" column). Written to
+    agg_n10_tails_check.json: the largest and the mean absolute probability gap, the rounded number of
+    studies and `passed` (largest gap <= 0.01 and mean gap <= 0.001). Only the UID, "resolved" and the 12
+    probability columns of the file are read; no label column, no metric, no per-study output. The UIDs
+    are used in memory to find the cache rows and are never printed or written."""
+    step = "n10_tails_check"
+    s: dict = {"encoder": encoder, "fold": int(fold)}
+    cfg = {"encoder": encoder, "fold": int(fold), "n": int(n), "eval_studies": int(eval_studies),
+           "test_overrides": encoder_factory is not None}
+    with common.notebook(step, cfg, quiet=quiet, budget_h=budget_h):
+        import torch
+
+        from . import n11
+
+        t0 = time.time()
+        rootp = Path(root) if root else None
+        bdir, man = _bundle(rootp)
+        s["bundle_commit"] = (man.get("commit") or "")[:12] or None
+        tl = tail_units(encoder, rootp)
+        if int(fold) not in tl["units"]:
+            raise TailError("check: no such fold")
+        u = tl["units"][int(fold)]
+        pp = u["dir"] / "pred_b_lite.csv"
+        state = n11._load_state(u["dir"])
+        if not pp.exists() or common.sha16(pp) != (state.get("files_sha16") or {}).get(pp.name):
+            raise TailError("check: the fold's pred_b_lite.csv is missing or not the file its state records")
+        ref = pd.read_csv(pp, usecols=[UID, "resolved", *FINDINGS]).astype({UID: str}).head(int(n))
+        caches, row_of = {}, None
+        for p in PLANES:
+            mp = paths.find_file(f"cache_{p}_manifest.json", rootp)
+            if mp is None:
+                raise FileNotFoundError("cache not attached")
+            cm = json.loads(mp.read_text())
+            caches[p] = n11.BlockCache(mp.parent / cm["file"], cm["shape"])
+            per = pd.read_csv(mp.parent / f"cache_{p}_studies.csv").astype({UID: str})
+            rows_p = per[per["ok"].astype(bool)].set_index(UID)["row"]
+            rr = ref[UID].map(rows_p)
+            if rr.isna().any():
+                raise TailError("check: a study of the prediction file is not in a cache")
+            if row_of is not None and not np.array_equal(row_of, rr.to_numpy(int)):
+                raise TailError("check: the three caches list the studies in different rows")
+            row_of = rr.to_numpy(int)
+        if not len(ref):
+            raise TailError("check: the prediction file holds no study")
+        flip_row = np.full(caches[PLANES[0]].shape[0], -1)
+        flip_row[row_of[~ref["resolved"].astype(bool).to_numpy()]] = 0
+        dev = n5._devices(None)[0]
+        enc = _split(encoder, dev, _checkpoint(encoder, bdir, man), encoder_factory)
+        enc.check()
+        if dev.startswith("cuda"):
+            torch.backends.cudnn.benchmark = True  # as n11._shared
+        P, info = predict_tails(enc, {"units": {int(fold): u}}, caches, row_of, flip_row, eval_studies)
+        gap = np.abs(P[0].astype(float) - ref[FINDINGS].to_numpy(float))
+        mx, mean = float(gap.max()), float(gap.mean())
+        s.update({"studies": agg.count(len(ref)), "max_abs_probability_gap": round(mx, 5),
+                  "mean_abs_probability_gap": round(mean, 6),
+                  "tolerance": {"max_abs_probability_gap": CHECK_MAX_GAP, "mean_abs_probability_gap": CHECK_MEAN_GAP,
+                                "why": CHECK_NOTE},
+                  "passed": bool(np.isfinite(gap).all() and mx <= CHECK_MAX_GAP and mean <= CHECK_MEAN_GAP),
+                  "trunk_sha16": trunk_sha16(enc), "n11_commit": tl["commit"][:12],
+                  "weights_file_sha16": u["weights_file_sha16"], "stage_a_stats_sha16": u["stats_sha16"],
+                  "prediction_file_sha16": common.sha16(pp), **info["per_fold"][int(fold)],
+                  "amp_fp16": info["amp_fp16"], "amp_fp16_in_training": u["amp_fp16_in_training"],
+                  "device": "cuda" if dev.startswith("cuda") else "cpu",
+                  "reads": "UID, resolved and the 12 probabilities of pred_b_lite.csv; no label, no metric",
+                  "seconds": round(time.time() - t0, 1)})
+        agg.write(step, s)
+    common.summary(s)
+    return s
 
 
 def write_submission(sample: pd.DataFrame, uids: np.ndarray, P: np.ndarray, out: Path,
@@ -329,15 +452,13 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
         tl = tail_units(encoder, rootp) if tails else None  # refused here, before any decoding
         units = {} if canary or tails else _units(encoder, rootp)
         if not canary:  # a wrong bundle fails in seconds, before hours of decoding
-            ckpt = bdir / "checkpoints" / f"{encoder}.pth"
-            want = man.get("files_sha256", {}).get(ckpt.name)
-            if want is None or not ckpt.exists() or _sha256(ckpt) != want:
-                raise ValueError("checkpoint does not match the bundle manifest")
+            ckpt = _checkpoint(encoder, bdir, man)
         s["mode"] = "canary" if canary else "b-lite" if tails else "heads"
         if tails:
             s["folds"] = sorted(tl["units"])
             s["b_lite"] = {"n11_commit": tl["commit"][:12], "schedule": tl["schedule"], "lr_rule": tl["lr_rule"],
                            "stage_a_unit": "knee-n6a (z-score statistics and head config)",
+                           "test_overrides": encoder_factory is not None,
                            "units": {f"fold_{k}": {"encoder_lr": u["encoder_lr"], "session": u["session"],
                                                    "weights_file_sha16": u["weights_file_sha16"],
                                                    "stage_a_stats_sha16": u["stats_sha16"],
@@ -352,7 +473,10 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
         st, _, hdr_err = study_table.build(comp, "test", workers=workers)
         st.to_csv(work / "study_table.csv", index=False)
         n = len(st)
-        s["series_tiers"] = series_tiers(st)
+        try:  # a summary field only: it must never stop a submission
+            s["series_tiers"] = series_tiers(st)
+        except Exception:  # noqa: BLE001
+            s["series_tiers"] = None
         decode_until = t0 + 0.5 * budget_h * 3600
         ok, cache_sum = {}, {}
         for i, p in enumerate(PLANES):
@@ -379,12 +503,9 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
             from . import n11
 
             dev = n5._devices(None)[0]
-            if encoder_factory is not None:
-                enc = encoder_factory(encoder, dev)
-            else:
-                enc = n11.TimmSplit(encoder, dev, pretrained=False)
-                enc.model.load_state_dict(torch.load(ckpt, map_location=dev))
+            enc = _split(encoder, dev, ckpt, encoder_factory)
             s["b_lite"]["trainable_tail"] = enc.check()["parameters"]
+            s["b_lite"]["trunk_sha16"] = trunk_sha16(enc)  # before any tail is loaded; the tail is left out anyway
             caches = {}
             for p in PLANES:
                 cd = work / f"cache_{p}"

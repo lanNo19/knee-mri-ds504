@@ -62,6 +62,62 @@ def test_without_tails_the_submission_bytes_equal_the_registered_code(comp_env):
     assert (paths.WORKING / "submission.csv").read_bytes() == b_old
 
 
+def test_without_tails_the_bytes_are_equal_in_a_harder_case(comp_env, monkeypatch):  # noqa: F811
+    """Two studies of unresolved laterality, one study without an axial series (prevalence row) and one
+    listed study with no series at all (prevalence row), with the limit on failed studies raised."""
+    from knee.nb import n10
+    from tests import n10_reference as old
+
+    comp = paths.INPUT / paths.COMPETITION
+    ser = pd.read_csv(comp / "test_series.csv")
+    uids = sorted(ser[UID].astype(str).unique())
+    ax = ser["Anatomical_Plane"].astype(str).str.lower().str.startswith("ax")
+    ser = ser[~((ser[UID].astype(str) == uids[2]) & ax) & (ser[UID].astype(str) != uids[5])]
+    ser.to_csv(comp / "test_series.csv", index=False)
+    real = study_table.build
+
+    def build(*a, **kw):
+        st, ch, err = real(*a, **kw)
+        st.loc[[0, 3], "laterality"] = None
+        return st, ch, err
+
+    monkeypatch.setattr(study_table, "build", build)
+    s_old = old.run(workers=2, quiet=True, max_failed_share=0.5)
+    b_old = (paths.WORKING / "submission.csv").read_bytes()
+    (paths.WORKING / "submission.csv").unlink()
+    s_new = n10.run(workers=2, quiet=True, max_failed_share=0.5)
+    assert (paths.WORKING / "submission.csv").read_bytes() == b_old
+    assert all(s_new[k] == s_old[k] for k in s_old if k != "seconds")
+    sub = pd.read_csv(paths.WORKING / "submission.csv").astype({UID: str}).set_index(UID)
+    assert len(sub) == len(uids) and np.allclose(sub.loc[[uids[2], uids[5]], FINDINGS].to_numpy(), 0.2)
+    assert not np.allclose(sub.loc[uids[0], FINDINGS].to_numpy(), 0.2)
+    assert s_new["series_tiers"]["axial"]["no_series"] == "<5"
+    # at the registered limit both stop on purpose
+    for mod in (old, n10):
+        (paths.WORKING / "submission.csv").unlink(missing_ok=True)
+        with pytest.raises(safe_log.StepFailed):
+            mod.run(workers=2, quiet=True)
+        assert not (paths.WORKING / "submission.csv").exists()
+
+
+def test_a_failing_tier_count_never_stops_a_submission(comp_env, monkeypatch):  # noqa: F811
+    from knee.nb import n10
+    from tests import n10_reference as old
+
+    old.run(canary=True, workers=2, quiet=True)
+    b_old = (paths.WORKING / "submission.csv").read_bytes()
+    (paths.WORKING / "submission.csv").unlink()
+
+    def boom(st):
+        raise KeyError("sagittal_tier")
+
+    monkeypatch.setattr(n10, "series_tiers", boom)
+    s = n10.run(canary=True, workers=2, quiet=True)
+    assert (paths.WORKING / "submission.csv").read_bytes() == b_old
+    assert s["series_tiers"] is None
+    assert json.loads((paths.WORKING / "agg_n10.json").read_text())["series_tiers"] is None
+
+
 def test_tails_argument_is_checked():
     from knee.nb import n10
 
@@ -269,7 +325,14 @@ def test_blite_submission_equals_a_plain_computation(blite_env, capfd):
     assert s["mode"] == "b-lite" and s["folds"] == [0, 1, 2, 3, 4] and s["failed_share"] == 0.0
     assert b["n11_commit"] == COMMIT[:12] and b["schedule"] == "full" and b["lr_rule"] == {"rung1_tie": True, "passes": 16200}
     assert b["trunk_passes_per_study"] == round((n + 2) / n, 2) and b["amp_fp16"] is False
-    assert "heads_sha16" not in s
+    assert "heads_sha16" not in s and b["test_overrides"] is True
+    assert b["trunk_sha16"] == n10.trunk_sha16(fake_factory(ENC)) and len(b["trunk_sha16"]) == 16
+    moved = fake_factory(ENC)
+    moved.load_tail_state(_tail_of(0))
+    assert n10.trunk_sha16(moved) == b["trunk_sha16"]  # the tail is not part of it
+    with torch.no_grad():
+        moved.model["mid"].bias.add_(1e-3)
+    assert n10.trunk_sha16(moved) != b["trunk_sha16"]  # any trunk weight is
     for k in range(5):
         u = b["units"][f"fold_{k}"]
         state = json.loads(next(blite_env["inp"].glob(f"knee-n11-*/private/*/{ENC}_f{k}/state.json")).read_text())
@@ -363,6 +426,22 @@ def test_refused_missing_fold(n11_files):
         n10.tail_units(ENC, n11_files)
     with pytest.raises(n10.TailError, match="exactly folds 0-4"):  # the other encoder has no unit at all
         n10.tail_units("convnext_tiny", n11_files)
+
+
+def test_refused_state_of_another_unit_and_duplicate_units(n11_files):
+    from knee.nb import n10
+
+    _edit_state(n11_files, 1, lambda st: st.update({"fold": 2}))
+    with pytest.raises(n10.TailError, match="fold 1 names another encoder or fold"):
+        n10.tail_units(ENC, n11_files)
+    _edit_state(n11_files, 1, lambda st: st.update({"fold": 1, "encoder": "convnext_tiny"}))
+    with pytest.raises(n10.TailError, match="fold 1 names another encoder or fold"):
+        n10.tail_units(ENC, n11_files)
+    _edit_state(n11_files, 1, lambda st: st.update({"encoder": ENC}))
+    n10.tail_units(ENC, n11_files)
+    _write_n11(n11_files, sessions={"c": (4,)})  # fold 4 complete in session b and in session c
+    with pytest.raises(n10.TailError, match="equally far"):
+        n10.tail_units(ENC, n11_files)
 
 
 def test_refused_mixed_or_unknown_commit(n11_files):
@@ -466,6 +545,141 @@ def test_a_tail_of_another_encoder_or_fold_is_refused(n11_files):
     torch.save({**ck, "tail_prefixes": ["block.", "norm."]}, p)
     with pytest.raises(n10.TailError, match="trainable tail"):
         n10.predict_tails(enc, t, caches, np.arange(2), np.array([-1, 0]))
+    torch.save({**ck, "tail": {k: (v[:1] if v.ndim == 1 else v) for k, v in ck["tail"].items()}}, p)
+    with pytest.raises(n10.TailError, match="another shape"):  # copy_ would broadcast a 1-element tensor
+        n10.predict_tails(enc, t, caches, np.arange(2), np.array([-1, 0]))
+
+
+# ---------------------------------------------------------------- the replay check against N11's predictions
+
+CHECK_ROWS = [7, 2, 5, 0, 9, 3]  # fold 0's scored test studies, as cache rows, in the prediction file's order
+CHECK_RESOLVED = [True, False, True, True, False, True]
+
+
+@pytest.fixture()
+def check_env(tmp_path, monkeypatch):
+    """The bundle, three N4-like caches, knee-n6a, the N11 outputs and fold 0's pred_b_lite.csv, computed
+    here with the plain forward (the whole fake encoder with fold 0's tail)."""
+    from tests.synth import uid
+
+    inp = tmp_path / "input"
+    _write_n6a(inp)
+    _write_n11(inp)
+    ck = inp / "knee-bundle" / "private" / "bundle" / "checkpoints"
+    ck.mkdir(parents=True)
+    (ck / f"{ENC}.pth").write_bytes(b"not read: the test passes its own encoder")
+    sha = hashlib.sha256((ck / f"{ENC}.pth").read_bytes()).hexdigest()
+    (ck.parent / "manifest.json").write_text(json.dumps({"commit": "abcdef1234567890", "files_sha256": {f"{ENC}.pth": sha}}))
+    n, S = 10, 2
+    uids = [uid(i) for i in range(n)]
+    rng = np.random.default_rng(5)
+    x = {}
+    for p in PLANES:
+        d = inp / f"knee-n4-{p}" / "private" / f"n4_{p}"
+        d.mkdir(parents=True)
+        x[p] = rng.integers(0, 256, size=(n, S, 32, 32), dtype=np.uint8)
+        x[p].tofile(d / f"cache_{p}.u8")
+        (d / f"cache_{p}_manifest.json").write_text(json.dumps({"plane": p, "shape": list(x[p].shape), "dtype": "uint8",
+                                                               "file": f"cache_{p}.u8"}))
+        pd.DataFrame({UID: uids, "row": range(n), "ok": True}).to_csv(d / f"cache_{p}_studies.csv", index=False)
+    ud = inp / "knee-n11-a" / "private" / "n11_a" / f"{ENC}_f0"
+    w = torch.load(ud / "b_lite_seed_0.pt")
+    model = fake_factory(ENC).model
+    model.load_state_dict(w["tail"], strict=False)
+    cfg = heads.config_from(_cfg_of(0))
+    head = heads.make_head(cfg, D, 3)
+    head.load_state_dict(w["head"])
+    head.eval()
+    stats = torch.load(inp / "knee-n6a" / "private" / "n6a" / "units" / f"{ENC}_f0" / "stats.pt")
+    P = np.zeros((len(CHECK_ROWS), 12))
+    with torch.no_grad():
+        for j, (i, res) in enumerate(zip(CHECK_ROWS, CHECK_RESOLVED)):
+            def prob(flip):
+                zs = []
+                for p in PLANES:
+                    u8 = torch.from_numpy(x[p][i])
+                    u8 = u8.flip(-1) if flip and p in ("coronal", "axial") else u8
+                    zs.append(((_plain_features(model, u8) - stats[p][0]) / stats[p][1]).reshape(1, S, D))
+                return torch.sigmoid(head(zs))[0].numpy().astype(float)
+
+            P[j] = prob(False) if res else (prob(False) + prob(True)) / 2
+    df = pd.DataFrame(P.astype(np.float32), columns=FINDINGS)
+    for f in FINDINGS:
+        df[f"y_{f}"] = 0.0
+    df.insert(0, "resolved", CHECK_RESOLVED)
+    df.insert(0, "s2_fold", 0)
+    df.insert(0, UID, [uids[i] for i in CHECK_ROWS])
+    df.to_csv(ud / "pred_b_lite.csv", index=False)
+    _edit_state(inp, 0, lambda st: st["files_sha16"].update(
+        {"pred_b_lite.csv": hashlib.sha256((ud / "pred_b_lite.csv").read_bytes()).hexdigest()[:16]}))
+    monkeypatch.setattr(paths, "INPUT", inp)
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "working")
+    monkeypatch.delenv("KNEE_DATA_ROOT", raising=False)
+    return {"inp": inp, "uids": uids, "unit": ud}
+
+
+def test_check_tails_replays_n11s_predictions_and_writes_aggregates_only(check_env, capfd):
+    from knee.nb import n10
+
+    s = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    printed = capfd.readouterr()
+    text = printed.out + printed.err + (paths.WORKING / "agg_n10_tails_check.json").read_text()
+    assert not [u for u in check_env["uids"] if u in text] and not agg.UID_RE.search(text)
+    assert s["passed"] is True and s["max_abs_probability_gap"] < 1e-5 and s["mean_abs_probability_gap"] < 1e-5
+    assert s["studies"] == 5 and s["fold"] == 0 and s["trunk_sha16"] == n10.trunk_sha16(fake_factory(ENC))
+    out = json.loads((paths.WORKING / "agg_n10_tails_check.json").read_text())
+    agg._check(out)
+    assert set(out) == {"encoder", "fold", "bundle_commit", "studies", "max_abs_probability_gap", "mean_abs_probability_gap",
+                        "tolerance", "passed", "trunk_sha16", "n11_commit", "weights_file_sha16", "stage_a_stats_sha16",
+                        "prediction_file_sha16", "tail_sha16", "head_sha16", "amp_fp16", "amp_fp16_in_training", "device",
+                        "reads", "seconds"}
+    assert set(p.name for p in paths.WORKING.iterdir() if p.is_file()) <= {"agg_n10_tails_check.json", "run.json"}
+    assert not list(paths.WORKING.rglob("*.csv"))
+    # the first n studies only
+    s = n10.check_tails(ENC, fold=0, n=4, encoder_factory=fake_factory)
+    assert s["passed"] is True and s["studies"] == "<5"
+
+
+def test_check_tails_fails_on_other_statistics_another_flip_rule_or_a_changed_file(check_env):
+    from knee.nb import n10
+
+    # another version of knee-n6a's statistics (same config): the gap shows it
+    sp = check_env["inp"] / "knee-n6a" / "private" / "n6a" / "units" / f"{ENC}_f0" / "stats.pt"
+    good = sp.read_bytes()
+    st = torch.load(sp)
+    torch.save({p: (mu + 0.5, sd) for p, (mu, sd) in st.items()}, sp)
+    s = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    assert s["passed"] is False and s["max_abs_probability_gap"] > 0.01
+    sp.write_bytes(good)
+    # another trunk
+    def other(name, device="cpu"):
+        e = fake_factory(name, device)
+        with torch.no_grad():
+            e.model["mid"].weight.mul_(1.3)
+        return e
+
+    s2 = n10.check_tails(ENC, fold=0, n=200, encoder_factory=other)
+    assert s2["passed"] is False and s2["trunk_sha16"] != n10.trunk_sha16(fake_factory(ENC))
+    # the prediction file is not the one the state records
+    pp = check_env["unit"] / "pred_b_lite.csv"
+    df = pd.read_csv(pp)
+    df.loc[0, "resolved"] = not bool(df.loc[0, "resolved"])
+    df.to_csv(pp, index=False)
+    with pytest.raises(safe_log.StepFailed):
+        n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    # ... and with its hash recorded, the other flip rule for one study is a gap
+    _edit_state(check_env["inp"], 0, lambda st: st["files_sha16"].update(
+        {"pred_b_lite.csv": hashlib.sha256(pp.read_bytes()).hexdigest()[:16]}))
+    s3 = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    assert s3["max_abs_probability_gap"] > 1e-4
+    # a study that is in no cache
+    for p in PLANES:
+        c = check_env["inp"] / f"knee-n4-{p}" / "private" / f"n4_{p}" / f"cache_{p}_studies.csv"
+        per = pd.read_csv(c)
+        per.loc[7, "ok"] = False
+        per.to_csv(c, index=False)
+    with pytest.raises(safe_log.StepFailed):
+        n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
 
 
 @pytest.mark.parametrize("name", ["dinov2_vits14", "convnext_tiny"])
@@ -535,6 +749,13 @@ def test_blite_notebook_entries_match_the_runbook_card():
         assert meta["dataset_sources"] == ["u/knee-bundle"] and meta["competition_sources"] == [mk.COMPETITION]
         assert mk.cell1("x", offline=name in mk.OFFLINE) == mk.CELL1_OFFLINE
         assert mk.NOTEBOOKS[name] == mk.NOTEBOOKS["n10"][:3] + (["n0", "n6a", "n11-a", "n11-b"], mk.NOTEBOOKS["n10"][4])
+    name = "n10-tails-check"
+    assert mk.cell2(name) == 'from knee.nb import n10; n10.check_tails("dinov2_vits14", fold=0, n=200)' and mk.cell2(name) in card
+    meta = mk.metadata("u", name, bundle="u/knee-bundle")
+    assert meta["enable_gpu"] is True and meta["enable_internet"] is False and meta["competition_sources"] == []
+    assert meta["kernel_sources"] == [f"u/knee-{x}" for x in ("n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n6a",
+                                                              "n11-a", "n11-b")]
+    assert meta["dataset_sources"] == ["u/knee-bundle"] and name in mk.OFFLINE
     for name in ("n10", "n10-convnext", "n10-canary"):  # the registered entries are unchanged
         assert "tails" not in mk.cell2(name)
     assert mk.NOTEBOOKS["n10"] == (True, True, False, ["n0", "n6a"], 32400)

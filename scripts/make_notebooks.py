@@ -56,6 +56,9 @@ NOTEBOOKS = {
     # (and knee-n11-c, knee-n11-d if they ran) beside knee-n6a, whose units hold the z-score statistics
     "n10-blite": (True, True, False, ["n0", "n6a", "n11-a", "n11-b"], 32400),
     "n10-convnext-blite": (True, True, False, ["n0", "n6a", "n11-a", "n11-b"], 32400),
+    # the replay check before a b-lite submission (internet off: the bundle's wheel and checkpoint). Read: the
+    # N4 caches, knee-n6a, the N11 outputs. knee-n0 and knee-n3-r are attached by the card's list, not read
+    "n10-tails-check": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n6a", "n11-a", "n11-b"], 3600),
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
     # N12 (plan r2, error analysis; RUNBOOK "Error analysis N12"): CPU, descriptive, existing outputs only
     "n12": (False, False, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 3600),
@@ -129,6 +132,8 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return 'from knee.nb import n10; n10.run("dinov2_vits14", tails="n11")'
     if name == "n10-convnext-blite":
         return 'from knee.nb import n10; n10.run("convnext_tiny", tails="n11")'
+    if name == "n10-tails-check":
+        return 'from knee.nb import n10; n10.check_tails("dinov2_vits14", fold=0, n=200)'
     if name == "n12":
         return f"from knee.nb import n12; n12.run(expect={EXPECT})"
     if name == "n14":
@@ -158,7 +163,7 @@ CELL1_OFFLINE = (
     ' "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)\n'
     "import knee.safe_log as sl; sl.install()"
 )
-OFFLINE = ("n10", "n10-convnext", "n10-canary", "n10-blite", "n10-convnext-blite")
+OFFLINE = ("n10", "n10-convnext", "n10-canary", "n10-blite", "n10-convnext-blite", "n10-tails-check")
 
 
 def cell1(commit: str, offline: bool = False) -> str:

@@ -602,8 +602,17 @@ Code knee.nb.n10 (tails="n11"), tests tests/test_n10_tails.py. The submitted mod
 
 Before the run:
 1. The bundle dataset must be a new version built at a commit that holds this code (the bundle's wheel is what runs; 47fdcbf has no tails). bundle_commit in agg_n10.json shows which one ran.
-2. knee-n6a stays attached. N11 saves the tail and the head, not the fold's z-score statistics or head config. N10 reads both from knee-n6a's unit, as N11 did.
-3. Only one GPU is used by this path.
+2. knee-n6a stays attached. N11 saves the tail and the head, not the fold's z-score statistics or head config. N10 reads both from knee-n6a's unit, as N11 did. Attach the same version of knee-n6a that knee-n11-a had attached (open knee-n11-a, Input, and read the version). N11 logged no hash of stats.pt, so the code cannot check this; the replay check below does.
+
+The replay check (run it first; it must pass for the encoder that will be submitted):
+
+| Notebook | Accelerator | Internet | Inputs | Cell 2 | Expected time | Pass |
+|---|---|---|---|---|---|---|
+| knee-n10-tails-check | GPU T4 x2 | **Off** | The bundle dataset (the version the submission will use); outputs of knee-n0, knee-n3-r, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n6a, knee-n11-a and knee-n11-b (and knee-n11-c, knee-n11-d if they ran). No competition data | offline cell 1, then `from knee.nb import n10; n10.check_tails("dinov2_vits14", fold=0, n=200)` (ConvNeXt-T: `"convnext_tiny"`; another fold: fold=k) | 5-10 min | agg_n10_tails_check.json: passed true (max_abs_probability_gap at most 0.01 and mean_abs_probability_gap at most 0.001); studies 200; amp_fp16 true. Keep trunk_sha16 |
+
+What the check does: it runs the fold's b-lite model (bundle checkpoint, the fold's tail and head, knee-n6a's statistics) on the first 200 studies of N11's own pred_b_lite.csv for that fold, from the N4 caches, and compares the probabilities. It reads the UID, "resolved" and the 12 probability columns of that private file. It reads no label, computes no metric and writes aggregates only. A fail means the trunk, the knee-n6a version, the tail or the head is not what N11 ran: stop and report.
+
+Only one GPU is used by the b-lite path.
 
 The step refuses to run (STEP n10: FAILED, before any decoding, no submission.csv) unless all of these hold for the encoder: exactly folds 0-4; every unit complete (frozen0 valid, inner work and final fits complete); each b_lite_seed_0.pt is the file its state.json records; one known commit over the sessions; one schedule; one learning-rate rule (rung1_tie and passes of the sessions, and every final fit at its unit's chosen rate); no session with test overrides; knee-n6a's config of the fold equals the one N11 logged.
 
@@ -613,6 +622,7 @@ Check in agg_n10.json before asking Ablay to submit:
 3. Per fold, b_lite.units.fold_k.weights_file_sha16 equals units.<encoder>_f<k>.files_sha16["b_lite_seed_0.pt"] in agg_n11_<session>.json (the same string is in the decision record's prediction_files_sha16). This one hash covers the tail and the head: N11 saves both in one file.
 4. Per fold, tail_sha16 and head_sha16 are present and differ between folds. They are hashes of the loaded tensors. N11's outputs hold no separate tail or head hash, so these two are a record of what was submitted, not a comparison.
 5. b_lite.units.fold_k.encoder_lr equals units.<unit>.inner.chosen_lr of the N11 summary.
-6. b_lite.amp_fp16 true, equal to amp_fp16_in_training of every fold.
+6. b_lite.amp_fp16 true, equal to amp_fp16_in_training of every fold. b_lite.test_overrides false.
 7. b_lite.trunk_passes_per_study between 1.0 and 2.0 (1.0 + the share of studies with unresolved laterality).
-8. series_tiers (all three N10 modes): per plane, how many test studies got a fluid-sensitive fat-suppressed series, a fluid-sensitive one, any other series, or none. Rounded counts. Compare the shares with training (N0).
+8. series_tiers (all three N10 modes): per plane, how many test studies got a fluid-sensitive fat-suppressed series, a fluid-sensitive one, any other series, or none. Rounded counts. Compare the shares with training (N0). null = the count itself failed; the submission is not affected.
+9. b_lite.trunk_sha16 equals trunk_sha16 of the passed knee-n10-tails-check run for the same encoder (the same frozen trunk was submitted as was checked).
