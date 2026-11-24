@@ -39,6 +39,7 @@ STRUCTURAL = {
     "min_support_per_language", "margin_mm", "inner_folds", "E", "epoch", "epochs",
     "seeds", "n_bins", "n_trials",
     "patience", "schedule_epochs",  # training settings (iteration 2), never counts of studies
+    "folds_up",  # number of outer folds in which an arm is higher (keep rules), never a count of studies
 }
 UID_RE = re.compile(r"\d+(\.\d+){4,}")
 MAX_STR = 200

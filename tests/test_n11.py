@@ -501,6 +501,45 @@ def test_one_encoder_two_processes_split_the_folds(inputs, tmp_path, monkeypatch
         _run(inputs, session="b", schedule=None)  # the schedule is an argument, set from the smoke run
 
 
+def test_a_failed_or_late_unit_ends_the_step_partial(inputs, tmp_path, monkeypatch, capfd):
+    """One unit fails: the step ends OK with status "partial", the other units finish and are listed.
+    The soft stop raises OutOfTime before a fit, never inside one."""
+    import time
+
+    from knee import paths
+    from knee.nb import n11
+
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "w")
+    real = n11._inner
+
+    def inner(c, st, feat):
+        if c.fold == 1:
+            raise RuntimeError("synthetic failure of one unit")
+        real(c, st, feat)
+
+    monkeypatch.setattr(n11, "_inner", inner)
+    s = _run(inputs, session="a", folds=(0, 1), encoders=(MAIN[1],), head_only_seeds=(0,))
+    assert "STEP n11_a: OK" in capfd.readouterr().out
+    u0, u1 = f"{MAIN[1]}_f0", f"{MAIN[1]}_f1"
+    assert s["status"] == "partial" and s["units_complete"] == [u0] and s["units_missing"] == [u1]
+    assert s["errors"][u1].startswith("RuntimeError at") and s["out_of_time"] is False
+    assert s["units"][u0]["final"]["complete"] is True and s["units"][u1]["frozen0"]["valid"] is True
+    a = json.loads((tmp_path / "w" / "agg_n11_a.json").read_text())
+    assert a["status"] == "partial" and set(a["units"]) == {u0, u1}
+    # the soft stop
+    c = SimpleNamespace(working=tmp_path / "w", step="n11_a", task={"soft_stop": time.time() - 1})
+    with pytest.raises(n11.OutOfTime):
+        n11._abort_if_invalid(c)
+    c.task = {"soft_stop": time.time() + 60}
+    n11._abort_if_invalid(c)
+    monkeypatch.setattr(n11, "_inner", real)
+    monkeypatch.setattr(n11, "_final", lambda c, st, feat: (_ for _ in ()).throw(n11.OutOfTime("late")))
+    s = _run(inputs, session="a", folds=(0, 1), encoders=(MAIN[1],), head_only_seeds=(0,))
+    assert s["status"] == "partial" and s["out_of_time"] is True and s["units_complete"] == []
+    assert all(b["inner"]["complete"] for b in s["units"].values())  # the finished inner work is kept and listed
+    assert s["errors"][u0].startswith("OutOfTime at")
+
+
 def test_an_interrupt_is_not_swallowed(inputs, tmp_path, monkeypatch):
     from knee.nb import n11
 
@@ -751,7 +790,8 @@ def test_decide_on_hand_made_inner_files(tmp_path, monkeypatch):
     assert len(greek) == 4 and all(np.array_equal(greek[0], w) for w in greek)  # 2 folds x 2 arms, one draw
 
 
-def test_decide_rule_cases(tmp_path):
+def test_decide_rule_cases(tmp_path, monkeypatch):
+    from knee import paths
     from knee.nb import n11
 
     # baseline choice: the starting head is the better baseline when head-only training hurts
@@ -764,6 +804,10 @@ def test_decide_rule_cases(tmp_path):
     rec = n11.decision(n11.find_units(tmp_path / "b"), n_boot=40)
     for r in rec["encoders"].values():
         assert r["folds_up"] == 3 and r["conditions"]["b_at_least_4_of_5_folds_up"] is False and r["keep"] is False
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "wd")  # end to end through agg.write with folds_up 3
+    rec = n11.decide(root=tmp_path / "b", n_boot=40, quiet=True)
+    assert rec["status"] == "decided" and all(r["folds_up"] == 3 for r in rec["encoders"].values())
+    assert json.loads((tmp_path / "wd" / "agg_n11_decide.json").read_text())["sha256"] == rec["sha256"]
     # the threshold: a noisy null seed raises it above a small gain
     _sessions(tmp_path / "c", strength={"b_lite": 0.95, "head_only_seed_100": 0.3})
     rec = n11.decision(n11.find_units(tmp_path / "c"), n_boot=40)

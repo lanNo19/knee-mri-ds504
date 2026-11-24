@@ -109,6 +109,10 @@ class InvalidRun(RuntimeError):
     """frozen0 check (b) failed: the run is invalid and nothing else is read."""
 
 
+class OutOfTime(RuntimeError):
+    """The session's soft stop (budget_h) has passed: no new fit starts, and the step ends "partial"."""
+
+
 class N11Error(RuntimeError):
     """An encoder's task failed (the safe description is in the summary's errors)."""
 
@@ -593,7 +597,8 @@ def _map(tasks: list, parallel: bool) -> list:
             except (KeyboardInterrupt, SystemExit):  # the watchdog or a manual stop: never swallowed
                 raise
             except BaseException as e:  # noqa: BLE001 - a crashed worker
-                out.append({"ok": False, "encoder": t["encoder"], "error": safe_log.describe(type(e), e.__traceback__)})
+                out.append({"ok": False, "encoder": t["encoder"],
+                            "errors": {_unit(t["encoder"], (t.get("folds") or [0])[0]): safe_log.describe(type(e), e.__traceback__)}})
     return out
 
 
@@ -964,6 +969,9 @@ def _invalid_flag(working, step: str) -> Path:
 def _abort_if_invalid(c) -> None:
     if _invalid_flag(c.working, c.step).exists():
         raise InvalidRun("frozen0 check (b) failed for a unit: nothing else is read")
+    soft = c.task.get("soft_stop")
+    if soft and time.time() > float(soft):  # called before every fit: a late session ends "partial", not FAILED
+        raise OutOfTime("the session's budget is used up: no new fit starts")
 
 
 def _base_block(c) -> dict:
@@ -1200,11 +1208,13 @@ def _final(c, st: dict, feat: FeatSource) -> None:
            "note": "predictions only: no test-fold metric of a trained model is computed in this notebook"}
     st["final"] = fin
     for k in c.task.get("head_only_seeds") or HEAD_ONLY_SEEDS:
+        _abort_if_invalid(c)
         r = new_run(c, feat, c.head_state, c.tr, 0.0, k, with_encoder=False)
         run_to(c, r, TWELFTHS)
         _save_pred(c, f"head_only_seed_{k}", predict_test(c, feat, r.head, trained=True, lr=lr), st)
         fin["head_only"][f"seed_{k}"] = _fit_summary(r)
     _save_state(c.dir, st)
+    _abort_if_invalid(c)
     r = new_run(c, c.src, c.head_state, c.tr, lr, 0)
     run_to(c, r, TWELFTHS)
     _save_pred(c, "b_lite", predict_test(c, c.src, r.head, trained=True, lr=lr), st)  # once, at the end
@@ -1262,16 +1272,34 @@ def _task(task: dict) -> dict:
             f.flip = {p: v.to(sh.device) for p, v in h.flip.items()}
             return f
 
+        errors: dict = {}
+
+        def unit_step(fn, k) -> None:
+            """One unit's block. A unit's own failure costs only that unit (the other folds go on); an invalid
+            run, the soft stop and an interrupt end the process."""
+            try:
+                c = _context(sh, k)
+                fn(c, states[k], feat_of(k))
+                if fn is _final:
+                    states[k]["leakage_assertion_passed"] = True
+                    _save_state(c.dir, states[k])
+            except (InvalidRun, OutOfTime, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:  # noqa: BLE001 - only the type and the location are kept
+                errors[_unit(enc, k)] = safe_log.describe(type(e), e.__traceback__)
+                try:
+                    (_unit_dir(working, step, enc, k) / "error.log").write_text(
+                        "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                except Exception:  # noqa: BLE001
+                    pass
+
         for cur in folds:  # 2. all inner work for every fold
-            c = _context(sh, cur)
-            _inner(c, states[cur], feat_of(cur))
+            unit_step(_inner, cur)
         for cur in folds:  # 3. then the final fits of every fold
-            c = _context(sh, cur)
-            _final(c, states[cur], feat_of(cur))
-            states[cur]["leakage_assertion_passed"] = True
-            _save_state(c.dir, states[cur])
+            if _unit(enc, cur) not in errors:
+                unit_step(_final, cur)
             feats.pop(cur, None)
-        return {"ok": True, "encoder": enc, "states": states}
+        return {"ok": not errors, "encoder": enc, "states": states, "errors": errors}
     except BaseException as e:  # noqa: BLE001 - only the type and the location leave the process
         try:
             (_unit_dir(working, step, enc, cur) / "error.log").write_text(
@@ -1280,8 +1308,9 @@ def _task(task: dict) -> dict:
             pass
         if isinstance(e, (KeyboardInterrupt, SystemExit)):  # the watchdog or a manual stop ends the whole step
             raise
-        return {"ok": False, "encoder": enc, "fold": cur, "invalid": isinstance(e, InvalidRun),
-                "error": safe_log.describe(type(e), e.__traceback__)}
+        return {"ok": False, "encoder": enc, "invalid": isinstance(e, InvalidRun),
+                "out_of_time": isinstance(e, OutOfTime),
+                "errors": {_unit(enc, cur): safe_log.describe(type(e), e.__traceback__)}}
     finally:
         try:
             import gc
@@ -1317,6 +1346,8 @@ def _unit_summary(b: dict) -> dict:
 
 def _summary(s: dict) -> dict:
     return {"status": s.get("status"), "errors": s.get("errors"), "session": s.get("session"),
+            "units_complete": s.get("units_complete"), "units_missing": s.get("units_missing"),
+            "out_of_time": s.get("out_of_time"),
             "schedule": s.get("schedule"), "suggested_schedule": s.get("suggested_schedule"),
             "environment": s.get("environment"), "folds": s.get("folds"),
             "validation_table": s.get("validation_table"),
@@ -1390,7 +1421,8 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
                 "session": session, "schedule": schedule, "factory": encoder_factory, "val_table": val_table,
                 "val_range": list(val_range) if val_range else None, "passes": int(passes),
                 "eval_studies": eval_studies, "rung1_tie": rung1_tie, "head_only_seeds": list(hos),
-                "smoke_micro": smoke_micro, "environment": env, "phase": "smoke" if smoke else "session"}
+                "smoke_micro": smoke_micro, "environment": env, "phase": "smoke" if smoke else "session",
+                "soft_stop": None if smoke else t0 + budget_h * 3600}
         if len(encs) == 1 and len(devs) >= 2 and len(folds) >= 2 and not smoke:  # one encoder: the GPUs split the folds
             jobs = [(encs[0], devs[i], folds[i::2]) for i in range(2)]
         else:
@@ -1399,7 +1431,7 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
         results = _map([{**base, "encoder": e, "device": dv, "folds": list(fs)} for e, dv, fs in jobs],
                        parallel and len(jobs) >= 2)
         on_disk = {_unit(e, k): _load_state(_unit_dir(working, step, e, k)) for e in encs for k in folds}
-        bad = {_unit(r["encoder"], r.get("fold", folds[0])): r.get("error") for r in results if not r.get("ok")}
+        bad = {u: err for r in results if not r.get("ok") for u, err in (r.get("errors") or {}).items()}
         if any(r.get("invalid") for r in results) or _invalid_flag(working, step).exists():
             s["units"] = {u: {"frozen0": b.get("frozen0")} for u, b in on_disk.items() if b.get("frozen0")}
             s["status"] = "invalid: frozen0 check (b) failed for a unit; nothing else is read"
@@ -1410,7 +1442,7 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
             s["units"] = {_unit(r["encoder"], k): b for r in results if r.get("ok") for k, b in r["states"].items()}
         else:
             s["units"] = {u: b for u, b in on_disk.items() if b}  # every inner run that finished is reported (R10)
-        if bad:
+        if bad and smoke:
             s["errors"] = bad
             s["status"] = "failed"
             agg.write(step, s)
@@ -1422,7 +1454,18 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
             s["rule"] = "the slower encoder under 300 slices/s over 200 micro-batches: every fold gets the halved schedule"
             s["status"] = "ok (smoke: no score was read)"
         else:
-            s["status"] = "ok"
+            # a failed or late unit must not turn the notebook FAILED (its output might then not attach):
+            # the step ends OK with status "partial"; the missing units are rerun whole in session c
+            done = sorted(u for u, b in s["units"].items() if (b.get("final") or {}).get("complete"))
+            want_units = [_unit(e, k) for e in encs for k in folds]
+            s["units_complete"] = done
+            s["units_missing"] = [u for u in want_units if u not in done]
+            s["out_of_time"] = any(r.get("out_of_time") for r in results)
+            if bad or s["units_missing"]:
+                s["errors"] = bad
+                s["status"] = "partial"
+            else:
+                s["status"] = "ok"
         s["seconds"] = round(time.time() - t0, 1)
         agg.write(step, s)
     try:
