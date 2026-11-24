@@ -45,6 +45,13 @@ def _write_heads(inp: Path) -> None:
             r = heads.fit(bank, cfg, tr, epochs=2, stats=stats, forbidden=np.concatenate([te, d.gold_rows()]), seed=0)
             torch.save(r.model.state_dict(), ud / "head.pt")
             torch.save({p: (mu.cpu(), sd.cpu()) for p, (mu, sd) in stats.items()}, ud / "stats.pt")
+            rows_out = np.concatenate([te, d.gold_rows(k)])
+            P = heads.predict(bank, r.model, rows_out, cfg, stats)
+            pred = pd.DataFrame(P, columns=FINDINGS)
+            pred.insert(0, "is_gold", d.is_gold[rows_out])
+            pred.insert(0, "s2_fold", k)
+            pred.insert(0, UID, d.uids[rows_out])
+            pred.to_csv(ud / "predictions.csv", index=False)
 
 
 @pytest.fixture(scope="module")
@@ -100,9 +107,11 @@ def env(tmp_path_factory):
     cor_iop = [1, 0, 0, 0, 0, -1]
     ax_iop = [1, 0, 0, 0, 1, 0]
     planted = 0
-    for i in np.flatnonzero(usable)[:60]:
+    sag_iop_t = [0, 0, -1, 0, 1, 0]  # columns run inferior, rows run posterior: stored transposed
+    for n_i, i in enumerate(np.flatnonzero(usable)[:60]):
         uid = folds[UID].iloc[i]
-        for p, iop, shape in (("sagittal", sag_iop, (64, 48)), ("coronal", cor_iop, (64, 64)), ("axial", ax_iop, (48, 64))):
+        sag = (sag_iop_t, (48, 64)) if n_i < 10 else (sag_iop, (64, 48))
+        for p, iop, shape in (("sagittal", sag[0], sag[1]), ("coronal", cor_iop, (64, 64)), ("axial", ax_iop, (48, 64))):
             ser = st.loc[st[UID] == uid, f"{p}_series"].iloc[0]
             write_dicom(images / uid / ser / "0001.dcm", np.zeros(shape), (0, 0, 0), iop, 1,
                         ("SIEMENS", "X", 1.5), "R", spacing=(0.5, 0.5))
@@ -185,6 +194,10 @@ def test_n14_blocks_flags_and_recomputation(env, monkeypatch, capfd):
         assert c1["encoders"][e]["s2_fold_stratified"] == pytest.approx(fs, abs=6e-5)
         v = c1["encoders"][e]["all_data_minus_s2_pooled"]
         assert v["estimate"] == pytest.approx(c1["encoders"][e]["all_data"] - c1["encoders"][e]["s2_pooled"], abs=2e-4)
+        v2 = c1["encoders"][e]["all_data_minus_s2_fold_stratified"]
+        assert v2["estimate"] == pytest.approx(c1["encoders"][e]["all_data_fold_stratified"]
+                                               - c1["encoders"][e]["s2_fold_stratified"], abs=2e-4)
+        assert v["lo"] <= v["estimate"] <= v["hi"] or v["valid_share"] < 1
     assert c1["reading"] in ("the protocol explains a large part of the gold miss",
                              "the protocol does not explain the gold miss",
                              "the protocol explains part of the gold miss")
@@ -213,6 +226,8 @@ def test_n14_blocks_flags_and_recomputation(env, monkeypatch, capfd):
     # C3: non-gated units skipped; each mean profile is a distribution over the slices
     c3 = s["c3_sagittal_attention"]
     assert set(c3["skipped_units"]) == {f"{e}_f{k}" for e in MAIN for k in (1, 3)}
+    gaps = c3["max_abs_gap_vs_predictions"]
+    assert set(gaps) == {f"{e}_f{k}" for e in MAIN for k in (0, 2, 4)} and all(g <= 1e-3 for g in gaps.values())
     for e in MAIN:
         for f in ("ACL", "Medial Meniscus", "Lateral Meniscus"):
             prof = c3["encoders"][e][f]["profile_positives"]
@@ -238,6 +253,11 @@ def test_n14_blocks_flags_and_recomputation(env, monkeypatch, capfd):
             b = np.mean([_strat_auc(units[e][fb_rows, j], Y[fb_rows, j], strata[fb_rows]) for j in js])
             assert c4["encoders"][e]["all_fluid_fatsat"] == pytest.approx(a, abs=6e-5)
             assert c4["encoders"][e]["fallback"] == pytest.approx(b, abs=6e-5)
+            fs_all = ev[all_fs[ev]]
+            a2 = np.mean([_strat_auc(units[e][fs_all, j], Y[fs_all, j], f2[fs_all]) for j in js])
+            b2 = np.mean([_strat_auc(units[e][fb_rows, j], Y[fb_rows, j], f2[fb_rows]) for j in js])
+            assert c4["encoders"][e]["fold_stratified_all_groups"]["all_fluid_fatsat"] == pytest.approx(a2, abs=6e-5)
+            assert c4["encoders"][e]["fold_stratified_all_groups"]["fallback"] == pytest.approx(b2, abs=6e-5)
 
     # C5: the planted geometry (60 studies with headers; the rest unread)
     c5 = s["c5_centre_crop"]["planes"]
@@ -259,6 +279,7 @@ def test_n14_blocks_flags_and_recomputation(env, monkeypatch, capfd):
         s1v = np.mean([np.mean([_auc(Y[rows][f1[rows] == k, j], S1[rows][f1[rows] == k, j]) for j in range(12)])
                        for k in range(5)])
         assert c6[e]["s1_mean_of_fold_macros"] == pytest.approx(s1v, abs=6e-5)
+        assert c6[e]["same_studies_as_evaluation_set"] is bool(len(rows) == len(ev))
 
 
 def test_n14_a_failing_block_costs_only_itself(env, monkeypatch):
@@ -285,3 +306,13 @@ def test_n14_chain_mismatch_fails_the_step(env, monkeypatch, tmp_path, capfd):
     with pytest.raises(safe_log.StepFailed):
         _run(env, monkeypatch, root=inp, blocks=("c2",))
     assert "STEP n14: FAILED - ChainError" in capfd.readouterr().out
+
+
+def test_n14_band_rule():
+    from knee.nb.n14 import _band
+
+    assert _band([0.6, 0.62], 0.65, 0.75) == "lost"
+    assert _band([0.7, 0.74], 0.65, 0.75) == "partial"
+    assert _band([0.75, 0.9], 0.65, 0.75) == "present"
+    assert _band([0.6, 0.8], 0.65, 0.75) == "mixed"
+    assert _band([0.6, None], 0.65, 0.75) == "not available"

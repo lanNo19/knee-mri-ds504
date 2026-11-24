@@ -464,9 +464,9 @@ Expected time: 20-45 min on CPU (pip 3-5 min; C1's three refits 5-15 min; C5's h
 Pass criteria (summary block and agg_n14.json):
 1. STEP n14: OK. status "ok", errors empty, chain_ok true, main_complete true. A chain mismatch fails the step.
 2. All six blocks present with descriptive true and added_after_results true: c1_gold_all_data (label "development: ..."), c2_side_discrimination, c3_sagittal_attention, c4_fallback_contrast, c5_centre_crop, c6_s1_level.
-3. Same data as N9 (knee-n9-b's agg_results.json, 4 decimals): c1_gold_all_data.encoders.<encoder>.s2_pooled equals s3_gold.macro_auc.<encoder> (convnext_tiny 0.7515, dinov2_vits14 0.7317); c6_s1_level.encoders.<encoder>.s2_mean_of_fold_macros equals s2.<encoder>.mean_of_fold_macros (0.7502, 0.7422) when c6's studies are N9's evaluation studies. A difference = stop and report both.
+3. Same data as N9 (knee-n9-b's agg_results.json, 4 decimals): c1_gold_all_data.encoders.<encoder>.s2_pooled equals s3_gold.macro_auc.<encoder> (convnext_tiny 0.7515, dinov2_vits14 0.7317); s2_fold_stratified equals the gold fold-stratified values (convnext_tiny 0.7272, dinov2_vits14 0.7099); c6_s1_level.encoders.<encoder>.s2_mean_of_fold_macros equals s2.<encoder>.mean_of_fold_macros (convnext_tiny 0.7502, dinov2_vits14 0.7422) when same_studies_as_evaluation_set is true. A difference = stop and report both.
 4. c1: E per encoder is N7's consensus E (dinov2_vits14 4, convnext_tiny 5, vit_s16 10); gold_per_s2_fold, lookalikes_removed and training_studies present.
-5. c3: skipped_units empty (every main unit is gated over all planes); otherwise say which.
+5. c3: skipped_units empty (every main unit is gated over all planes, and max_abs_gap_vs_predictions is at most 0.001 for each: the rebuilt head reproduces the unit's predictions); otherwise say which and why.
 6. c5: series_read about 4,405 per plane; unread 0 or small.
 
 Rules for reading N14:

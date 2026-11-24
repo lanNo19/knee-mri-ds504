@@ -142,16 +142,18 @@ def c1_gold_all_data(c, n_boot: int, seed: int, device: str = "cpu") -> dict:
         P[gold] = heads.predict(bank, r.model, gold, cfg, stats)
         del bank
         S2 = c.units[e]
-        vals = np.full((int(n_boot), 3), np.nan)
+        vals = np.full((int(n_boot), 4), np.nan)  # one draw for all four numbers (paired)
         for b, w in enumerate(n12._draws(len(gold), int(n_boot), seed)):
-            vals[b] = mac(P, w), mac(S2, w), mac(S2, w, f2g)
-        a, p, fs = mac(P), mac(S2), mac(S2, None, f2g)
+            vals[b] = mac(P, w), mac(S2, w), mac(S2, w, f2g), mac(P, w, f2g)
+        a, p, fs, afs = mac(P), mac(S2), mac(S2, None, f2g), mac(P, None, f2g)
         out["encoders"][e] = {
             "all_data": _r(a, nd), "all_data_interval": n12._percentile(vals[:, 0], nd),
             "s2_pooled": _r(p, nd), "s2_fold_stratified": _r(fs, nd),
+            "all_data_fold_stratified": _r(afs, nd),
             "all_data_minus_s2_pooled": {"estimate": _r(a - p, nd), **n12._percentile(vals[:, 0] - vals[:, 1], nd)},
-            "all_data_minus_s2_fold_stratified": {"estimate": _r(a - fs, nd),
-                                                  **n12._percentile(vals[:, 0] - vals[:, 2], nd)},
+            "all_data_minus_s2_fold_stratified": {"estimate": _r(afs - fs, nd),
+                                                  **n12._percentile(vals[:, 3] - vals[:, 2], nd),
+                                                  "note": "both scored on pairs inside one S2 fold"},
             "E": E, "config_source": "N7 consensus", "pooling": cfg.pooling, "planes": cfg.planes}
     diffs = [out["encoders"].get(e, {}).get("all_data_minus_s2_pooled", {}).get("estimate") for e in MAIN]
     if any(x is None for x in diffs):
@@ -258,6 +260,13 @@ def c3_sagittal_attention(c) -> dict:
             si = planes.index("sagittal")
             te = d.split(k)[1]
             rows = te[in_ev[te] & (d.flip_row[te] < 0)]
+            # the rebuilt head must reproduce the unit's own predictions (no flips on these rows)
+            gap = float(np.nanmax(np.abs(heads.predict(bank, model, rows, cfg, stats, use_flip=False)
+                                         - c.units[e][rows]))) if len(rows) else float("nan")
+            out.setdefault("max_abs_gap_vs_predictions", {})[f"{e}_f{k}"] = round(gap, 5) if np.isfinite(gap) else None
+            if not np.isfinite(gap) or gap > 1e-3:
+                out["skipped_units"].append(f"{e}_f{k}")
+                continue
             for i in range(0, len(rows), 256):
                 b = rows[i:i + 256]
                 xs = heads._inputs(bank, torch.as_tensor(b), planes, stats)
@@ -292,10 +301,10 @@ def c3_sagittal_attention(c) -> dict:
     out["reading"] = {
         "acl": ("not available" if any(v is None for v in shares) else
                 "the heads do not find the ACL slices" if all(v < 0.45 for v in shares) else
-                "the heads put more weight on the middle third (rule not met)"),
+                "rule not met (at least one main encoder at 0.45 or above)"),
         "menisci": ("not available" if any(v is None for v in gaps) else
                     "sagittal side information survives the order-blind head" if all(v >= 5 * S / 32 for v in gaps)
-                    else "no clear side split in the sagittal attention (rule not met)")}
+                    else "rule not met (gap under 5 slices for at least one main encoder)")}
     return out
 
 
@@ -334,27 +343,35 @@ def c4_fallback_contrast(c, n_boot: int, seed: int) -> dict:
     zf, zb = np.zeros(len(fs_rows), int), np.zeros(len(fb_rows), int)
     findings = [j for j in metrics.eligible(c.Y[fs_rows], zf) if j in metrics.eligible(c.Y[fb_rows], zb)]
     out["findings"] = [FINDINGS[j] for j in findings]
-    if len(fb_rows) < MIN_SIDE or len(findings) < n12.MIN_FINDINGS:
+    if len(fb_rows) < MIN_SIDE or len(fs_rows) < MIN_SIDE or len(findings) < n12.MIN_FINDINGS:
         return {**out, "status": "suppressed (too few fallback studies or findings)"}
     strata = metrics.strata_codes(f2, d.g_lang)
+    fs_all = c.ev[all_fs[c.ev]]  # every evaluation study with the fluid fat-suppressed series in all planes
+    out["fs_studies_all_groups"] = agg.count(len(fs_all))
     out["encoders"] = {}
     dfs = list(n12._draws(len(fs_rows), int(n_boot), seed))
     dfb = list(n12._draws(len(fb_rows), int(n_boot), seed + 1))
+    dfa = list(n12._draws(len(fs_all), int(n_boot), seed + 2))
     for e, P in c.units.items():
-        if not (np.isfinite(P[fs_rows]).all() and np.isfinite(P[fb_rows]).all()):
+        if not (np.isfinite(P[fs_all]).all() and np.isfinite(P[fb_rows]).all()):
             continue
 
-        def m(rows, w=None):
-            return metrics.macro(P[rows], c.Y[rows], strata[rows], findings, w)
+        def m(rows, w=None, st=strata):
+            return metrics.macro(P[rows], c.Y[rows], st[rows], findings, w)
 
         a, b = m(fs_rows), m(fb_rows)
         diff = [m(fs_rows, wa) - m(fb_rows, wb) for wa, wb in zip(dfs, dfb)]
+        a2, b2 = m(fs_all, None, f2), m(fb_rows, None, f2)
+        diff2 = [m(fs_all, wa, f2) - m(fb_rows, wb, f2) for wa, wb in zip(dfa, dfb)]
         out["encoders"][e] = {"all_fluid_fatsat": _r(a), "fallback": _r(b),
-                              "all_fluid_fatsat_minus_fallback": {"estimate": _r(a - b), **n12._percentile(diff)}}
+                              "all_fluid_fatsat_minus_fallback": {"estimate": _r(a - b), **n12._percentile(diff)},
+                              "fold_stratified_all_groups": {
+                                  "all_fluid_fatsat": _r(a2), "fallback": _r(b2),
+                                  "difference": {"estimate": _r(a2 - b2), **n12._percentile(diff2)}}}
     gaps = [out["encoders"].get(e, {}).get("all_fluid_fatsat_minus_fallback", {}).get("estimate") for e in MAIN]
     out["reading"] = ("not available" if any(v is None for v in gaps) else
                       "goes on the possible-actions list" if all(v > 0.03 for v in gaps) else
-                      "no clear cost (rule not met)")
+                      "rule not met: not on the possible-actions list")
     return out
 
 
@@ -464,7 +481,9 @@ def c6_s1_level(c) -> dict:
         rows = c.ev[(f1[c.ev] >= 0) & np.isfinite(S1[c.ev]).all(axis=1) & np.isfinite(P[c.ev]).all(axis=1)]
         s1 = metrics.per_fold_macro_mean(S1[rows], c.Y[rows], f1[rows], c.elig)
         s2 = metrics.per_fold_macro_mean(P[rows], c.Y[rows], f2[rows], c.elig)
-        out["encoders"][e] = {"studies": agg.count(len(rows)), "s1_mean_of_fold_macros": _r(s1),
+        out["encoders"][e] = {"studies": agg.count(len(rows)),
+                              "same_studies_as_evaluation_set": bool(len(rows) == len(c.ev)),
+                              "s1_mean_of_fold_macros": _r(s1),
                               "s2_mean_of_fold_macros": _r(s2), "s1_minus_s2": _r(s1 - s2)}
     return out
 
@@ -476,16 +495,19 @@ def _summary(s: dict) -> dict:
         v = core._at(s, path)
         return v if isinstance(v, dict) else {}
 
-    out = {"status": s.get("status"), "chain_ok": g("chain").get("s2_folds_match_units"), "errors": s.get("errors"),
+    out = {"status": s.get("status"), "chain_ok": g("chain").get("s2_folds_match_units"),
+           "main_complete": s.get("main_complete"), "errors": s.get("errors"),
            "descriptive_only": "N14 keeps nothing and switches nothing on (R8)"}
     try:
         c1 = g("c1_gold_all_data")
         out["c1"] = {"label": c1.get("label"), "reading": c1.get("reading"), "gold_per_s2_fold": c1.get("gold_per_s2_fold"),
                      "lookalikes_removed": c1.get("lookalikes_removed"),
-                     "encoders": {e: [v.get("all_data"), v.get("s2_pooled"), v.get("s2_fold_stratified"),
-                                      (v.get("all_data_minus_s2_pooled") or {}).get("estimate")]
+                     "encoders": {e: [v.get("all_data"), v.get("s2_pooled"),
+                                      (v.get("all_data_minus_s2_pooled") or {}).get("estimate"),
+                                      v.get("all_data_fold_stratified"), v.get("s2_fold_stratified"),
+                                      (v.get("all_data_minus_s2_fold_stratified") or {}).get("estimate")]
                                   for e, v in (c1.get("encoders") or {}).items()},
-                     "columns": "all-data, S2 pooled, S2 fold-stratified, all-data minus pooled"}
+                     "columns": "pooled: all-data, S2, difference; fold-stratified: all-data, S2, difference"}
         c2 = g("c2_side_discrimination")
         out["c2"] = {k: {"reading": v.get("reading"), "status": v.get("status"),
                          "side_auc": {e: x.get("side_auc") for e, x in (v.get("encoders") or {}).items()}}
@@ -569,6 +591,8 @@ def run(root=None, expect: dict | None = None, n_boot: int = intervals.N_BOOT, s
                     s[name] = val
                 except Exception as e:  # noqa: BLE001 - descriptive blocks must not stop each other
                     errors[name] = safe_log.describe(type(e), e.__traceback__)
+                s["status"] = "running (blocks so far)"
+                agg.write("n14", s)  # a late interrupt keeps the blocks already done
 
             if "c6" in want:
                 put("c6_s1_level", c6_s1_level)
