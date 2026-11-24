@@ -473,54 +473,101 @@ Rules for reading N14:
 1. Every number is descriptive. C1 carries the development label (R6): never a gain over iteration 1, never in a slide title.
 2. Each block's reading follows the rule written in n14_spec_r3.md before the run; quote the rule with the number.
 
-## Stage B-lite N11 (iteration 3)
+## Stage B-lite N11 (iteration 3, all five folds)
 
-N11 is Stage B-lite (it3_declaration_r3.md; Iteration plan, section 11; code knee.nb.n11, tests tests/test_n11.py). One question: does training the last encoder blocks raise the fold-0 score? It is a diagnostic. Nothing is kept and no submission comes from it. Every number is "added after the results" (R10) and a development number (R6). Never attach its output to any other notebook (R9).
+N11 is Stage B-lite on all five S2 folds (Iteration plan, section 12 = it3_amendment_r3.md, which replaces section 11 where they differ; code knee.nb.n11, tests tests/test_n11.py). Everything is "added after the results" (R10). The text of section 12 must be in the plan before the first run (R3). N11's outputs are attached only to its own decide and dev steps and, if the change is kept, to N10. Never to N7 or N9 (R9).
+
+Order: 1. knee-n11-smoke. 2. knee-n11-a and knee-n11-b at the same time. 3. knee-n11-decide. 4. knee-n11-dev.
 
 | Notebook | Accelerator | Internet | Inputs |
 |---|---|---|---|
-| knee-n11-smoke, knee-n11 | GPU T4 x2 | On (pip, and the encoder weights as in N5) | Outputs of knee-n0, **knee-n3-r**, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a. Exactly one output per upstream step. Never knee-n3, knee-n6a-smoke, a unit rerun of another fold, or an iteration-2 output. No competition data |
+| knee-n11-smoke, knee-n11-a, knee-n11-b | GPU T4 x2 | On (pip, and the encoder weights as in N5) | Outputs of knee-n0, **knee-n3-r**, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a. Exactly one output per upstream step. Never knee-n3, knee-n6a-smoke, a unit rerun or an iteration-2 output (the code refuses a unit that is not knee-n6a's). No competition data |
+| knee-n11-decide | None (CPU) | On | Outputs of knee-n11-a and knee-n11-b. Nothing else |
+| knee-n11-dev | None (CPU) | On | Outputs of knee-n11-a, knee-n11-b and knee-n11-decide. Nothing else |
 
-Create knee-n11-smoke and knee-n11 as forks of knee-n5 and keep "Pin to original environment": check (b) compares fp16 features with N5's, so the image must be N5's. The smoke summary's environment (torch, timm) must equal the versions in knee-n5's run.json; if not, stop.
+Create the three GPU notebooks as forks of knee-n5 and keep "Pin to original environment": check (b) compares fp16 features with N5's, and decide() refuses two sessions with different environments. Create knee-n11-decide and knee-n11-dev as forks of one of them.
 
-Cell 1: COMMIT = the commit named in the planning log for N11 (the N11 code after its review). The declaration must be in the Iteration plan, section 11, before the first run (R3).
+Cell 1 (all five): COMMIT = the commit named in the planning log for N11 (the same commit in every notebook).
 
-Cell 2, knee-n11-smoke first (20 optimiser steps per encoder; reads no score):
+### 1. knee-n11-smoke
 
 ```python
 from knee.nb import n11; n11.run(smoke=True, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
 ```
 
-Cell 2, knee-n11:
+Expected time: 5-10 min. It runs 200 micro-batches per encoder on fold 0 and reads no score.
+
+Pass criteria (summary block and agg_n11_smoke.json):
+1. STEP n11_smoke: OK. status "ok (smoke: no score was read)".
+2. Per unit: smoke.reads_no_score true; smoke.peak_memory_gb under 14; smoke.micro_batch_slices 192 (96 = 2 studies did not fit and 1 is used: say so).
+3. smoke.late_code_paths: head_only_step, flipped_forward_finite, checkpoint_round_trip and run_json_lock all true; feature_store float16.
+4. trainable_parameters: dinov2_vits14 5.2-5.4M, convnext_tiny 4.7-4.9M (the code refuses other counts).
+5. environment (torch, python, CUDA, image) equals knee-n5's run.json versions. If not, stop.
+6. validation_table lists all five folds with the plan's groups (names and rounded sizes). "FAILED - AssertionError" at inner_split = the groups differ from the plan's table: correct the table in the plan first, then the code.
+7. suggested_schedule is "full" or "halved" (the slower encoder under 300 slices/s = halved). Write this value into cell 2 of BOTH sessions. steady_slices_per_s is reported only.
+
+### 2. knee-n11-a and knee-n11-b
+
+knee-n11-a:
 
 ```python
-from knee.nb import n11; n11.run(expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+from knee.nb import n11; n11.run(session="a", folds=(0, 1, 2), expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule="full")
 ```
 
-Expected time: smoke 5-10 min. Full run 2.5-4.5 h with one GPU per encoder (2-3 h at 400-600 training slices/s, about 3.5 h at 300, not measured; seed 1 adds about 1 h and runs only if it ends before 0.8 x the 5 h budget). The watchdog stops the step at 5.5 h.
+knee-n11-b:
 
-Pass criteria, smoke (summary block and agg_n11_smoke.json):
-1. STEP n11_smoke: OK. status "ok (smoke: no score was read)".
-2. Per encoder: smoke.reads_no_score true; smoke.peak_memory_gb under 14; smoke.micro_batch_slices 192 (96 = 2 studies did not fit and 1 is used: say so).
-3. smoke.slices_per_s recorded for both. Under 300 for the slower encoder: the full run may use the short schedule; the full run's own probe decides.
-5. smoke.late_code_paths: head_only_step, flipped_forward_finite, checkpoint_round_trip and run_json_lock all true; feature_store float16.
-4. trainable.parameters: dinov2_vits14 5.2-5.4M, convnext_tiny 4.7-4.9M (the code refuses other counts).
+```python
+from knee.nb import n11; n11.run(session="b", folds=(3, 4), expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"}, schedule="full")
+```
 
-Pass criteria, full run (summary block, agg_n11.json and run.json):
-1. STEP n11: OK. status "ok", errors empty. After status "failed in ...": Ablay reads private/n11/<encoder>_f0/error.log in his own browser; the agg still lists every inner run that finished. "STEP n11: FAILED - InvalidRun" = frozen0 check (b) failed: the run is invalid, nothing else is read, log it. A rerun changes no setting.
-2. frozen0 per encoder: frozen0.valid true; check_b.abs_difference at most 0.0005; check_a.max_abs_gap and check_a.min_cosine reported (fp16 noise is expected; min_cosine near 1).
-3. Counts: studies.training about 1,350; studies.inner_validation about 400 (the code refuses a group outside 300-500); trainable.parameters as in the smoke run; trainable.drop_path_max 0.
-4. schedule.name is "long" (12 epochs, rungs 3 and 12) or "short" (6 epochs, rungs 2 and 6), with schedule.slices_per_s for both encoders. "short" must be said with the result.
-5. Chosen rate recorded: run.json n11_chosen_encoder_lr.<encoder>_f0.lr equals encoders.<encoder>.search.chosen_lr, and search.chosen_lr_in_run_json is true (the code refuses a test pass of a trained model otherwise).
-6. Search: search.rung0 has the three rates 5e-06, 2e-05 and 8e-05, each with its curve; search.rung1 has the chosen rate with resumed_from_rung0 true and a curve of 12 (or 6) epochs with train_loss, val_loss and val_macro_auc.
-7. All arms present per encoder: results.encoders.<encoder>.macro_auc has frozen0, head_only_seed_0 and b_lite_seed_0; head_only_seed_macro_aucs has 5 values; final.head_only has seed_0 to seed_4; final.b_lite has seed_0 (seed_1 only if seed1.ran is true, then for both encoders). seed1.ran false (cut, behind the budget, or seed1.failed true) must be said with the result.
-8. results.all_scored_test_studies_used true; leakage_assertion_passed true for both encoders.
+If the smoke run said "halved", write `schedule="halved"` in both. Plan triggers: not started by 20:00 = halved in every fold; not started by 23:00 = halved and `encoders=("convnext_tiny",)` in both (the two GPUs then take different folds). Never fewer folds.
 
-Cut order (only if the run is behind; each is an argument, recorded in cuts): `seed1=False`, then `side_auc=False`, then `rung1_tie=False`, then `search=False` (the registered 2e-5). Never cut: the frozen0 check, head-only, both encoders, the inner training-and-validation graph of the chosen rate. Parts can be rerun in the same session with `blocks=(...)` (probe, frozen0, search, final, seed1, combine). The search cannot be rerun after the final fits unless final is in the same call. After an invalid run only a call with frozen0 clears the flag.
+Expected time (estimate, not measured): session a 6.5-8 h, session b 4.5-5.5 h at 500 slices/s. The watchdog stops a session at 11.5 h.
 
-Rules for reading N11 (plan section 11, sections 6 to 8 of the declaration):
-1. results.encoders.<encoder>.reading and results.joint_reading are computed by the code in the order the plan wrote. Quote the rule with the number. Do not reread the numbers by hand.
-2. The effect is b-lite minus the stricter baseline (the better of frozen0 and head-only). Show both differences with their paired intervals.
-3. Every fold-0 number carries the development label (R6): grey, never in a title, never as a gain over iteration 1, never on slide 12.
-4. results.delta1_fold0.change is not a ranking change unless change_interval_excludes_0 is true.
-5. State the limits with the result (results.limits). The curves for the instructor are search.rung1.<chosen rate>.curve (training and validation) and final.b_lite.seed_0.curve (training only).
+Inside a session: frozen0 checks of every fold, then all inner work of every fold, then the final fits of every fold. The notebook computes no test-fold metric of a trained model.
+
+Pass criteria per session (summary block, agg_n11_a.json or agg_n11_b.json, run.json):
+1. STEP n11_a (n11_b): OK. status "ok", errors empty. "FAILED - InvalidRun" = frozen0 check (b) failed for a unit: the run is invalid, nothing else is read, log it. "FAILED - AssertionError" at inner_split = the printed groups differ from the plan's table: stop and correct the table in the plan first. After status "failed": Ablay reads private/n11_<session>/<encoder>_f<fold>/error.log in his own browser; the agg still lists every inner run that finished.
+2. All units present: 3 folds x 2 encoders in a, 2 x 2 in b. Each with frozen0_valid true, inner_complete true, final_complete true.
+3. Validation table, per unit: test_groups and inner_validation_groups are the plan's (12.1 item 3: fold 0 English / Croatian; 1 Croatian / Greek; 2 Greek / German; 3 Bosnian+German / Bulgarian+Dutch; 4 Bulgarian+Dutch / Greek), sizes 250-500 (the code refuses anything else).
+4. frozen0 per unit: check_b.abs_difference at most 0.0005; max_abs_probability_gap and check_a.min_cosine reported.
+5. config.epochs: 12 for fold 0 and 4 for folds 1-4 under "full" (6 and 2 under "halved"). schedule equal in both sessions and equal to run.json config.schedule.
+6. Inner work per unit: inner.rung0 has the three rates (curves of 3 points); inner.to_the_end has the survivor and 2e-05 (curves of 12 points with train_loss, val_loss, val_macro_auc); inner.head_only has seed_0 and seed_100; inner.keep_rule_arms has start, head_only_seed_0, head_only_seed_100 and b_lite_2e-05.
+7. Chosen rate recorded: run.json n11_chosen_encoder_lr.<encoder>_f<fold>.lr equals units.<unit>.inner.chosen_lr (the code refuses a test pass of a trained model otherwise).
+8. No test-fold metric: the only keys with "auc" outside inner are frozen0.check_b's. Do not compute anything from the private prediction files.
+
+Cut order (plan 12.5; arguments, recorded in cuts): the B-lite S4 submission; the side AUC (`n11.dev(side_auc=False)`); `head_only_seeds=(0,)`; `rung1_tie=False`. Never cut: any fold, the inner head-only arm, the null seed, the 2e-5 run, the frozen0 checks, the training-and-validation graph.
+
+### 3. knee-n11-decide (after both sessions have ended)
+
+```python
+from knee.nb import n11; n11.decide()
+```
+
+Expected time: 3-6 min. It reads inner validation files only and opens no test-fold file.
+
+Pass criteria (summary block = agg_n11_decide.json, the decision record):
+1. STEP n11_decide: OK. status "decided". "env_mismatch" = the two sessions ran in different environments: there is no decision; say so and stop (no dev step).
+2. sessions ["a", "b"]; encoders_run lists both encoders (or convnext_tiny only after the 23:00 trigger; then n_null is 5 and development_delta1_reported false); n_null 10; written_at_utc and sha256 present.
+3. Per encoder: keep (true or false), gain, threshold = max(0.005, 2 s / sqrt(5)), folds_up, interval, baseline (start or head_only), per_fold. Copy them; never recompute by hand. Kept needs all three conditions.
+4. Record the file in the planning folder with its sha256 before the dev step starts (R5).
+
+### 4. knee-n11-dev (only after the decision is recorded)
+
+```python
+from knee.nb import n11; n11.dev()
+```
+
+Expected time: 3-6 min. It refuses to run without a "decided" record, after an edited record (sha256) and when a prediction file is not the one the record lists.
+
+Pass criteria (summary block and agg_n11_dev.json):
+1. STEP n11_dev: OK. status "ok". decision.sha256 equals the recorded decision's.
+2. Per encoder: frozen0, head_only_seed_0 and b_lite, each with mean_of_fold_macros and fold_stratified_macro_auc; both differences; head_only_seed_values (5).
+3. frozen0 equals iteration 1's S2 values for that encoder (knee-n9-b: mean of fold macros convnext_tiny 0.7502, dinov2_vits14 0.7422) to about 0.001. A larger gap = stop and report.
+4. delta1 present with both encoders ("not reported" with ConvNeXt-T only); side_discrimination has frozen0 and b_lite.
+
+Rules for reading N11:
+1. The decision is the record's keep per encoder, from inner validation only (R4). Limits said with it (record.limits).
+2. Every dev number carries the development label (R6): grey, never in a title, never as a gain over iteration 1, never on slide 12. They are reported whatever the decision (R10). A development Delta1 is not a new H1 result.
+3. The graph for the instructor: units.<unit>.inner.to_the_end.<2e-05 and the survivor>.curve (training and validation, 12 points; the training curve has dropout on, the validation curve has it off). Fold 0 on the slide, all folds in the appendix.
+4. If kept for an encoder: the S4 submission needs N10 with tails (private/n11_<session>/<encoder>_f<fold>/b_lite_seed_0.pt) and Ablay's OK (plan 12.4).

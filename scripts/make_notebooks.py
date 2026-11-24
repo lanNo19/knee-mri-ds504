@@ -23,6 +23,10 @@ TABLES = ["pilkwang/rsna-knee-llm-labels", "stevenleehans/rsna-knee-llm-report-l
           "lixin73/rsna-knee-llm-report-labels-sol56"]
 DREAD = "dreaddevelopment/knee-raptor-corpus"
 
+N11_GPU_INPUTS = ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a"]
+# "full" unless the smoke run says "halved" (plan 12.1 item 10): the same value in both sessions
+N11_SCHEDULE = "full"
+
 # name: (gpu, uses competition, uses label tables, upstream notebooks, timeout s)
 NOTEBOOKS = {
     "smoke": (True, True, True, [], 1800),
@@ -53,10 +57,14 @@ NOTEBOOKS = {
     "n12": (False, False, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 3600),
     # N14 (error hunt, n14_spec_r3): CPU, descriptive; the competition data for C5's header pass only
     "n14": (False, True, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 10800),
-    # N11 (iteration 3, Stage B-lite; plan section 11): GPU T4 x2, internet on (pip and the encoder weights,
-    # as N5); the three N4 caches, N5's embeddings and index, fold 0's Stage A units of knee-n6a
-    "n11-smoke": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a"], 3600),
-    "n11": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a"], 32400),
+    # N11 (iteration 3, Stage B-lite on all five folds; plan section 12). GPU steps: internet on (pip and the
+    # encoder weights, as N5); the three N4 caches, N5's embeddings and index, knee-n6a's Stage A units.
+    # Two sessions at the same time: a = folds 0, 1, 2; b = folds 3, 4. The CPU steps attach only N11's outputs.
+    "n11-smoke": (True, False, False, N11_GPU_INPUTS, 3600),
+    "n11-a": (True, False, False, N11_GPU_INPUTS, 43200),
+    "n11-b": (True, False, False, N11_GPU_INPUTS, 43200),
+    "n11-decide": (False, False, False, ["n11-a", "n11-b"], 3600),
+    "n11-dev": (False, False, False, ["n11-a", "n11-b", "n11-decide"], 3600),
 }
 
 
@@ -114,8 +122,14 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return f"from knee.nb import n14; n14.run(expect={EXPECT})"
     if name == "n11-smoke":
         return f"from knee.nb import n11; n11.run(smoke=True, expect={EXPECT})"
-    if name == "n11":
-        return f"from knee.nb import n11; n11.run(expect={EXPECT})"
+    if name in ("n11-a", "n11-b"):
+        s = name[-1]
+        folds = {"a": "(0, 1, 2)", "b": "(3, 4)"}[s]
+        return f'from knee.nb import n11; n11.run(session="{s}", folds={folds}, expect={EXPECT}, schedule="{N11_SCHEDULE}")'
+    if name == "n11-decide":
+        return "from knee.nb import n11; n11.decide()"
+    if name == "n11-dev":
+        return "from knee.nb import n11; n11.dev()"
     raise KeyError(name)
 
 

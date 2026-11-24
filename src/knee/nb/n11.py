@@ -1,45 +1,53 @@
-"""N11: Stage B-lite, iteration 3 (GPU T4 x2; the declaration it3_declaration_r3.md, plan section 11).
+"""N11: Stage B-lite on all five outer folds, iteration 3 (plan section 12, it3_amendment_r3.md, which
+replaces section 11, it3_declaration_r3.md, where the two differ).
 
-One question: does training the last encoder blocks raise the fold-0 score? Outer fold 0 only, both
-main encoders, the N4 uint8 caches, the fold-0 Stage A head and its fixed z-scoring statistics.
-Every number is "added after the results" (R10) and a development number (R6). Nothing is kept, no
-submission comes from it, and its output is attached to no other notebook (R9). Expert labels are
-not read: gold rows are only excluded.
+The question: does training the last encoder blocks raise the score? Every number is "added after the
+results" (R10). Outputs are attached only to this module's own decision and dev steps and, if the change is
+kept, to N10; never to N7 or N9 (R9). Expert labels are not read: gold rows are only excluded.
 
-Arms per encoder (section 3):
-  frozen0    no training; this module's own forward (frozen trunk + trainable tail, eval mode, fp16).
-             Check (a): features of 200 training studies against the N5 embeddings (reported).
-             Check (b): fold-0 macro AUC within 0.0005 of the value recomputed here from knee-n6a's
-             saved predictions; if it fails the run is invalid and nothing else is read.
-  head-only  the encoder stays frozen; the head trains on in this module's loop on the frozen0
-             features (seeds 0-4; their SD is the noise floor).
-  b-lite     the last blocks train with the head (seed 0; seed 1 if the run is ahead of the budget).
-Search (section 4): successive halving over the encoder learning rate {5e-6, 2e-5, 8e-5} on one inner
-split (the largest g_lang group of the training set is the inner validation group); inner runs start
-from a head refit on the inner training rows only. The test fold never chooses anything; the chosen
-rate is written to run.json before any test-fold forward pass of a trained model.
+Steps (each its own Kaggle notebook):
+  run(smoke=True)   GPU. 200 micro-batches per encoder on fold 0: slices/s and peak memory, plus the code
+                    paths that otherwise first run hours into a session. No score. Its slices/s decides the
+                    schedule of both sessions ("halved" if the slower encoder is under 300 slices/s).
+  run(session, folds, schedule)   GPU, two sessions at the same time (a: folds 0, 1, 2; b: folds 3, 4). One
+                    process per encoder, one GPU each, working through its folds in order (one encoder only:
+                    the two GPUs take different folds). A unit is one encoder on one fold; it uses its own
+                    fold's Stage A config, E, head and statistics (knee-n6a only). Order inside a session:
+                    1. frozen0 for every fold: this module's forward against N5 (check a) and against
+                       knee-n6a's saved predictions (check b: fold macro AUC within 0.0005, else the run is
+                       invalid and stops; the largest absolute probability gap is reported beside it).
+                    2. all inner work for every fold, on the plan's inner validation group (VAL_TABLE):
+                       the head refit on the inner training rows; that head's score with no training; the
+                       inner head-only arm at seeds 0 and 100; successive halving over the encoder learning
+                       rate (rung 0 = 3 twelfths for each of three rates, the survivor to the end); the
+                       registered 2e-5 to the end if it is not the survivor. Per-study inner validation
+                       predictions are saved privately for decide().
+                    3. the final fits of every fold (head-only seeds 0-4 and b-lite at the chosen rate,
+                       seed 0): the test-fold predictions and the b-lite weights go to the private output.
+                       No test-fold metric of a trained model is computed or printed.
+  decide()          CPU. Reads both sessions' outputs (inner files only; no test-fold file is opened) and
+                    writes the keep decision per encoder, with time and sha256 (12.2).
+  dev()             CPU. Refuses to run without a "decided" record; checks the prediction files' hashes
+                    against it; computes the registered S2 metrics, Delta1 and N14-C2's side AUC, each
+                    labelled as a development number (R6).
 
-Phases of run() (one process per encoder, one GPU each, when two GPUs exist):
-  probe    the first 200 micro-batches of the first rung-0 run: slices/s and peak memory (no score).
-           Below 300 slices/s for the slower encoder: both run the short schedule (6 epochs; rungs 2, 6).
-  main     frozen0 (checks), search (refit, rung 0, rung 1, the chosen rate), final (head-only seeds
-           0-4 and b-lite seed 0; the test fold scored once, at the last epoch).
-  seed1    b-lite seed 1 for both encoders, only if the run is ahead of the budget (cut first).
-  combine  the parent, CPU: macro AUCs with paired study bootstraps, the reading per encoder and the
-           joint reading (section 7, in its order), fold-0 Delta1 and its change, N14-C2's side AUC.
+Schedules are counted in twelfths of a fit's optimiser steps: epochs = round(16,200 / the fold's training
+size) (halved: half of it), warm-up = 1 twelfth, cosine to 0 at the end, rung 0 ends after 3 twelfths, the
+training loss and the inner validation loss and macro AUC are logged at every twelfth.
 
-Outputs: agg_n11.json and run.json (aggregates only; curves as per-epoch aggregates). Private:
-private/n11/<encoder>/ holds state.json, pred_<arm>.csv (per-study, for the bootstrap), the b-lite
-weights and, during the search, the rung checkpoints.
+Outputs of a session: agg_n11_<session>.json and run.json (aggregates only). Private:
+private/n11_<session>/<encoder>_f<fold>/ holds state.json, inner_<arm>.csv, pred_<arm>.csv and
+b_lite_seed_0.pt (tail and head, for N10).
 """
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
 import tempfile
-import multiprocessing as mp
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -59,36 +67,42 @@ MAIN = encoders.MAIN  # ("dinov2_vits14", "convnext_tiny")
 DINO, CONV = MAIN
 LRS = (5e-6, 2e-5, 8e-5)
 REGISTERED_LR = 2e-5
-LONG = {"name": "long", "epochs": 12, "rung0": 3}
-SHORT = {"name": "short", "epochs": 6, "rung0": 2}
-SCHEDULES = {"long": LONG, "short": SHORT}
+PASSES = 16200  # study passes per fit: epochs = round(PASSES / the fold's training size)
+TWELFTHS = 12
+RUNG0 = 3  # rung 0 ends after 3 twelfths (the first quarter)
+SCHEDULES = ("full", "halved")
+SESSIONS = {"a": (0, 1, 2), "b": (3, 4)}
+N_OUTER = 5
+# 12.1 item 3: the inner validation group(s) per outer fold, with the fold's test group(s). g_lang values
+# are the report-language names N0 writes. The run stops if a fold's test groups differ from this table.
+VAL_TABLE = {0: {"test": ("ENGLISH",), "val": ("CROATIAN",)},
+             1: {"test": ("CROATIAN",), "val": ("GREEK",)},
+             2: {"test": ("GREEK",), "val": ("GERMAN",)},
+             3: {"test": ("BOSNIAN", "GERMAN"), "val": ("BULGARIAN", "DUTCH")},
+             4: {"test": ("BULGARIAN", "DUTCH"), "val": ("GREEK",)}}
+VAL_RANGE = (250, 500)
 TIE = 0.005  # rung scores within this are a tie
-MARGIN = 0.02  # the plan's margin (reading rule)
 DECIMALS = 4  # every comparison of a rule is made at 4 decimals, the precision the scores are stored at
 ENC_WEIGHT_DECAY = 0.05
 MICRO = 2  # studies per micro-batch (1 if 2 do not fit in memory)
-PROBE_MICRO = 200  # micro-batches of the throughput rule
+SMOKE_MICRO = 200  # micro-batches of the smoke run
 MIN_SLICES_PER_S = 300.0
-SMOKE_STEPS = 20
-HEAD_ONLY_SEEDS = (0, 1, 2, 3, 4)
+HEAD_ONLY_SEEDS = (0, 1, 2, 3, 4)  # final fits: a noise description only (test-fold numbers)
+NULL_SEED = 100  # the inner head-only arm's second seed: s of the keep rule
 CHECK_A_STUDIES = 200
 CHECK_B_TOL = 0.0005
 N_BOOT = 2000
-INNER_VAL_RANGE = (300, 500)  # "about 400 studies" (declaration, section 4 step 1)
-SEED1_SHARE = 0.8  # seed 1 starts only if it is projected to end before this share of the budget
+MIN_GAIN = 0.005
+MIN_FOLDS_UP = 4
 FLIP_PLANES = heads.FLIP_PLANES
-BLOCKS = ("probe", "frozen0", "search", "final", "seed1", "combine")
+INNER_ARMS = ("start", "head_only_seed_0", f"head_only_seed_{NULL_SEED}", "b_lite")  # inner_<arm>.csv
 DEV_LABEL = "development: these studies were test studies in iteration 1; likely optimistic"
 DISPLAY = "grey; never in a title, never as a gain over iteration 1, never on slide 12 (R6)"
-NOISE = "not distinguishable from seed noise"
-HELPS = "training the last blocks helps on fold 0"
-LOWERED = "training the last blocks lowered the fold-0 score"
-SMALL = "small or mixed"
-LIMITS = ["a positive result does not single out the ceiling (training can also undo dilution)",
-          "a null result rules out neither (one fold, 1,350 training studies, 12 epochs, one depth)",
-          "nothing is kept; no S4 submission comes from B-lite; D11 stands"]
-SCOPE = ("Stage B-lite, iteration 3 (plan section 11): a diagnostic on outer fold 0; no number here keeps or "
-         "switches on a change (R8)")
+LIMITS = ["the folds share most training studies and two folds share a validation group: sqrt(5) and 4 of 5 are approximate",
+          "each fold is judged on one small site", "s is a lower bound on the seed noise of a fine-tuned fit"]
+SCOPE = "Stage B-lite on all five folds, iteration 3 (plan section 12): added after the results (R10)"
+PLAN = "iteration plan section 12 (it3_amendment_r3)"
+CURVE_NOTE = "training loss: dropout on, over the twelfth; validation loss: dropout off, at the twelfth's end"
 
 
 class InvalidRun(RuntimeError):
@@ -96,7 +110,7 @@ class InvalidRun(RuntimeError):
 
 
 class N11Error(RuntimeError):
-    """An encoder's task failed (the safe description is in agg_n11.json's errors)."""
+    """An encoder's task failed (the safe description is in the summary's errors)."""
 
 
 def _r(x, nd: int = DECIMALS):
@@ -105,6 +119,39 @@ def _r(x, nd: int = DECIMALS):
 
 def _lr_key(lr: float) -> str:
     return f"{float(lr):g}"
+
+
+def _step_name(session: str) -> str:
+    return f"{NAME}_{session}"
+
+
+# ---------------------------------------------------------------- the schedule, in twelfths
+
+def schedule_epochs(n_train: int, schedule: str = "full", passes: int = PASSES) -> int:
+    """Epochs of a fold: PASSES study passes over its training size, rounded (12 for 1,350 studies, 4 for
+    about 4,000); the halved schedule takes half (6 and 2)."""
+    if schedule not in SCHEDULES:
+        raise ValueError('schedule: "full" or "halved"')
+    e = max(1, int(round(passes / max(1, int(n_train)))))
+    return e if schedule == "full" else max(1, e // 2)
+
+
+def twelfth_marks(total_steps: int) -> list:
+    """The optimiser step counts at which each twelfth of a schedule ends (the last one is the total)."""
+    total = int(total_steps)
+    if total < TWELFTHS:
+        raise ValueError("a schedule needs at least 12 optimiser steps")
+    return [int(k * total / TWELFTHS + 0.5) for k in range(1, TWELFTHS + 1)]
+
+
+def twelfth_factor(step: int, total_steps: int) -> float:
+    """The learning rate at optimiser step `step` (from 0) as a fraction of its peak: linear warm-up over the
+    first twelfth, then a cosine to 0 at the end. With 12 whole epochs this is heads.schedule_factor(step,
+    steps_per_epoch, 12) step for step (a twelfth is then an epoch)."""
+    warm = twelfth_marks(total_steps)[0]
+    if step < warm:
+        return (step + 1) / warm
+    return 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warm) / max(1, int(total_steps) - warm))))
 
 
 # ---------------------------------------------------------------- the encoder split
@@ -314,138 +361,17 @@ class FeatSource:
         return out
 
 
-# ---------------------------------------------------------------- one encoder's context
-
-FINAL_FILES = ("pred_head_only_*.csv", "pred_b_lite_*.csv", "b_lite_seed_*.pt")  # what the final fits write
-RUN_FILES = ("state.json", "pred_*.csv", "b_lite_seed_*.pt", "rung0_*.pt")  # everything a unit writes
-
+# ---------------------------------------------------------------- helpers kept from the fold-0 version
 
 def _unit(enc: str, fold: int = 0) -> str:
     """A unit is one encoder on one outer fold (as Stage A's units): its folder and its run.json key."""
     return f"{enc}_f{int(fold)}"
 
 
-def _enc_dir(working, enc: str, fold: int = 0) -> Path:
-    p = Path(working) / "private" / NAME / _unit(enc, fold)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _clean(working, enc: str, fold: int, patterns) -> None:
-    d = _enc_dir(working, enc, fold)
-    for pat in patterns:
-        for p in d.glob(pat):
-            p.unlink(missing_ok=True)
-
-
-def _load_state(working, enc: str, fold: int = 0) -> dict:
-    p = _enc_dir(working, enc, fold) / "state.json"
-    return json.loads(p.read_text()) if p.exists() else {}
-
-
-def _save_state(working, enc: str, st: dict, fold: int = 0) -> None:
-    text = json.dumps(st, indent=1, default=agg._json_default)
-    agg._check(json.loads(text))  # the state becomes agg_n11.json's encoder block: aggregates only
-    p = _enc_dir(working, enc, fold) / "state.json"
-    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")  # atomic: a reader never sees half a file
-    tmp.write_text(text)
-    os.replace(tmp, p)
-
-
-def inner_split(d, tr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(inner training rows, the inner validation group's rows, its scored rows): the validation group is
-    the largest g_lang group of the training set (ties: the first name in sorted order)."""
-    g = d.g_lang[tr].astype(str)
-    G = inner_group(d, tr)
-    iva_all = tr[g == G]
-    return tr[g != G], iva_all, iva_all[d.scored[iva_all]]
-
-
-def inner_group(d, tr: np.ndarray) -> str:
-    """The g_lang value of the inner validation group (the largest group of the training set)."""
-    names, cnt = np.unique(d.g_lang[tr].astype(str), return_counts=True)
-    if len(names) < 2:
-        raise ValueError("the training set needs at least two site groups for an inner split")
-    return str(names[int(np.argmax(cnt))])
-
-
-def _context(task: dict):
-    """Everything one encoder's task needs: data, index sets, caches, the Stage A head and the encoder."""
-    import torch
-
-    root = Path(task["root"]) if task.get("root") else None
-    base = root or paths.INPUT
-    enc_name, dev = task["encoder"], torch.device(task["device"])
-    d = stage.StageData(root, task.get("expect"))
-    fold = int(task.get("fold") or 0)
-    c = SimpleNamespace(d=d, name=enc_name, fold=fold, unit=_unit(enc_name, fold), device=dev,
-                        amp=dev.type == "cuda", working=Path(task["working"]),
-                        micro=int(task.get("micro") or MICRO), eval_studies=int(task.get("eval_studies") or 4))
-    c.tr, c.te, c.te_s = d.split(fold)
-    c.gold = d.gold_rows()
-    if d.is_gold[c.tr].any() or d.is_gold[c.te].any():
-        raise AssertionError("a gold study is in the fold's training or test set")
-    c.itr, c.iva_all, c.iva = inner_split(d, c.tr)
-    c.iva_group = inner_group(d, c.tr)
-    rng = task.get("inner_val_range")
-    if rng and not rng[0] <= len(c.iva_all) <= rng[1]:
-        raise AssertionError("the inner validation group is not about 400 studies")
-    c.forbid_outer = np.concatenate([c.te, c.gold])  # every fit: test rows and gold rows
-    c.forbid_inner = np.concatenate([c.iva_all, c.te, c.gold])  # the inner refit: validation rows too
-    ud = unit_files.unit_dirs(base).get((enc_name, fold))
-    if ud is None:
-        raise FileNotFoundError("the fold's Stage A unit is not attached")
-    if ud.parent.parent.name != "n6a":  # private/n6a/units/<encoder>_f<k>: never an iteration-2 unit or a rerun
-        raise AssertionError("the Stage A unit must be knee-n6a's")
-    c.unit_dir = ud
-    c.chain = unit_files.check_units(d, {(enc_name, fold): ud})
-    if not c.chain["s2_folds_match_units"]:
-        raise unit_files.ChainError("the Stage A unit does not match the attached S2 folds")
-    cj = json.loads((ud / "config.json").read_text())
-    c.cfg, c.E = heads.config_from(cj["config"]), int(cj["E"])
-    se = cj.get("schedule_epochs")  # the unit's schedule length (n6._unit); the registered 30 is passed as None
-    c.stage_a_schedule = None if se is None or int(se) == heads.MAX_EPOCHS else int(se)
-    c.planes = heads.PLANE_SETS[c.cfg.planes]
-    c.caches, c.upstream_n4 = {}, {}
-    for p in c.planes:
-        mm, _, st, up, _ = n5._load_plane(p, root)
-        if st[UID].astype(str).tolist() != d.uids.tolist():
-            raise AssertionError("cache rows differ from N5's index")
-        c.caches[p], c.upstream_n4[p] = mm, up
-    c.S = int(c.caches[c.planes[0]].shape[1])
-    c.bank = d.bank(enc_name, str(dev))
-    c.dim = int(c.bank.x[c.planes[0]].shape[-1])
-    raw = torch.load(ud / "stats.pt", map_location="cpu")
-    c.stats = {p: (mu.float().to(dev), sd.float().to(dev)) for p, (mu, sd) in raw.items()}
-    c.stats_l = [c.stats[p] for p in c.planes]
-    c.head_state = torch.load(ud / "head.pt", map_location="cpu")
-    c.enc = _factory(task)
-    c.trainable = c.enc.check()
-    c.src = EncSource(c.enc, c.caches, c.planes, c.amp)
-    c.fdtype = torch.float16 if c.amp else torch.float32
-    if dev.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    return c
-
-
 def _guard(train_idx, val_idx, forbidden) -> None:
     """The plan's run-time leakage assertion, for every fit of this module (heads.fit calls it itself)."""
     heads._check_guard(train_idx, val_idx, forbidden)
 
-
-def inner_refit(c):
-    """The head the inner runs start from: fold 0's Stage A config and E, seed 0, the cached N5 embeddings,
-    the fixed Stage A statistics, on the inner training rows only. Forbidden: the validation group's rows,
-    the test rows and the gold rows (the leakage guard raises if one reaches the fit)."""
-    r = heads.fit(c.bank, c.cfg, c.itr, epochs=c.E, stats=c.stats, forbidden=c.forbid_inner, seed=0,
-                  schedule_epochs=c.stage_a_schedule)
-    state = {k: v.detach().cpu().clone() for k, v in r.model.state_dict().items()}
-    if all(bool((state[k] == c.head_state[k]).all()) for k in state):
-        raise AssertionError("the inner refit equals Stage A's head")
-    return state
-
-
-# ---------------------------------------------------------------- the training loop
 
 def _sync(dev) -> None:
     if dev.type == "cuda":
@@ -476,53 +402,6 @@ def _scaler(amp: bool):
         return torch.amp.GradScaler("cuda", enabled=amp)
     except (AttributeError, TypeError):  # older torch
         return torch.cuda.amp.GradScaler(enabled=amp)
-
-
-def new_run(c, src, head_state: dict, rows, lr_enc: float, schedule_epochs: int, seed: int, val_rows=None,
-            with_encoder: bool = True):
-    """A fit of this module's loop, at epoch 0.
-
-    AdamW (the heads' betas and eps). Groups: the trainable encoder weights (lr_enc, weight decay 0.05),
-    the encoder's biases, norm weights and layer-scale (lr_enc, no decay), the head (its Stage A peak rate
-    and weight decay). All share heads.schedule_factor over schedule_epochs. Effective batch = the head's
-    Stage A batch size; pos_weight from the fit's own training rows, as heads.fit. with_encoder false
-    (the head-only arm on the frozen0 features): the head group alone."""
-    import torch
-
-    r = SimpleNamespace(src=src, rows=np.asarray(rows), lr_enc=float(lr_enc), sched_epochs=int(schedule_epochs),
-                        seed=int(seed), val_rows=None if val_rows is None else np.asarray(val_rows),
-                        with_encoder=bool(with_encoder), step=0, epoch=0, history=[], slices=0, train_s=0.0,
-                        skipped=0, clock=None)
-    dev = c.device
-    r.head = heads.make_head(c.cfg, c.dim, len(c.planes))
-    r.head.load_state_dict(head_state)
-    r.head.to(dev)
-    groups, r.peaks = [], []
-    if with_encoder:
-        c.enc.reset()
-        dec, nod = [], []
-        for n, p in c.enc.tail_named_parameters():
-            (nod if c.enc.no_decay(n, p) else dec).append(p)
-        for ps, wd in ((dec, ENC_WEIGHT_DECAY), (nod, 0.0)):
-            if ps:
-                groups.append({"params": ps, "lr": r.lr_enc, "weight_decay": wd})
-                r.peaks.append(r.lr_enc)
-    groups.append({"params": list(r.head.parameters()), "lr": c.cfg.lr, "weight_decay": c.cfg.weight_decay})
-    r.peaks.append(float(c.cfg.lr))
-    r.opt = torch.optim.AdamW(groups, lr=c.cfg.lr, betas=(0.9, 0.999), eps=1e-8)
-    r.scaler = _scaler(c.amp and with_encoder)
-    r.gen = torch.Generator().manual_seed(r.seed)  # the batch order, as heads.fit
-    if dev.type == "cuda":  # the head's dropout stream
-        with torch.cuda.device(dev):
-            torch.cuda.manual_seed(r.seed)
-    else:
-        torch.manual_seed(r.seed)
-    r.bs = max(1, int(c.cfg.batch_size))
-    r.spe = math.ceil(len(r.rows) / r.bs)
-    yb = c.bank.binary[r.rows]
-    pos, neg = (yb == 1).sum(0), (yb == 0).sum(0)
-    r.pw = torch.tensor(np.minimum(neg / np.maximum(pos, 1), c.cfg.pos_cap), dtype=torch.float32, device=dev)
-    return r
 
 
 def _z(c, xs):
@@ -566,63 +445,6 @@ def batch_backward(c, r, b: np.ndarray, micro: int | None = None, limit: int | N
     return loss_sum, w_raw, z_sum, done
 
 
-def run_epochs(c, r, until: int, limit: tuple | None = None) -> None:
-    """Train r up to epoch `until` of its schedule. Head in train mode (dropout), encoder in eval mode.
-    One optimiser step, one schedule step and one scaler update per effective batch. Per epoch: the
-    training loss (weighted mean over the epoch, dropout on), mean |z| of the training features and, with
-    validation rows, the validation loss and macro AUC (no flips, as Stage A's inner fits).
-    limit: ("micro", n) stops after n micro-batches (the throughput probe); ("steps", n) after n optimiser
-    steps (the smoke run). A limited run records no epoch and reads no score."""
-    import torch
-
-    dev = c.device
-    n = len(r.rows)
-    micro_done, steps0, stop = 0, r.step, False
-    while r.epoch < until and not stop:
-        if r.with_encoder and c.enc.model.training:
-            raise AssertionError("the encoder must stay in eval mode")
-        r.head.train()
-        perm = r.rows[torch.randperm(n, generator=r.gen).numpy()]
-        loss_sum = torch.zeros((), device=dev)
-        w_sum = torch.zeros((), device=dev)
-        z_sum = torch.zeros((), device=dev)
-        z_n = 0
-        _sync(dev)
-        t0 = time.time()
-        for i in range(0, n, r.bs):
-            f = heads.schedule_factor(r.step, r.spe, r.sched_epochs)
-            for g, peak in zip(r.opt.param_groups, r.peaks):
-                g["lr"] = peak * f
-            left = None if not (limit and limit[0] == "micro") else limit[1] - micro_done
-            ls, w, z, done = batch_backward(c, r, perm[i:i + r.bs], limit=left)
-            micro_done += done
-            if left is not None and micro_done >= limit[1]:
-                stop = True  # the probe ends inside a batch: no optimiser step for a partial batch
-                break
-            scale0 = r.scaler.get_scale()
-            r.scaler.step(r.opt)
-            r.scaler.update()
-            if r.scaler.get_scale() < scale0:
-                r.skipped += 1  # a non-finite gradient: the scaler skipped this step
-            r.step += 1
-            loss_sum += ls
-            w_sum += w
-            z_sum += z
-            z_n += done
-            if limit and limit[0] == "steps" and r.step - steps0 >= limit[1]:
-                stop = True
-                break
-        _sync(dev)
-        r.train_s += time.time() - t0
-        if stop:
-            break
-        r.epoch += 1
-        rec = {"train_loss": float(loss_sum / w_sum.clamp_min(1e-6)), "mean_abs_z": float(z_sum / max(z_n, 1))}
-        if r.val_rows is not None:
-            rec.update(_validate(c, r))
-        r.history.append(rec)
-
-
 def _logits(c, src, head, rows, flipped: bool = False):
     import torch
 
@@ -631,23 +453,6 @@ def _logits(c, src, head, rows, flipped: bool = False):
         for i in range(0, len(rows), c.eval_studies):
             out.append(head(_z(c, src(rows[i:i + c.eval_studies], grad=False, flipped=flipped))).float())
     return torch.cat(out) if out else torch.zeros((0, heads.N_OUT), device=c.device)
-
-
-def _validate(c, r) -> dict:
-    """Inner validation: the same loss (the fit's pos_weight) and the macro AUC over the findings with both
-    classes in the validation group's scored studies (report labels), no flip averaging."""
-    import torch
-    import torch.nn.functional as F
-
-    r.head.eval()
-    lg = _logits(c, r.src, r.head, r.val_rows)
-    vt = torch.as_tensor(r.val_rows, device=c.device)
-    w = c.bank.w[vt]
-    loss = F.binary_cross_entropy_with_logits(lg, c.bank.y[vt], weight=w, pos_weight=r.pw, reduction="sum")
-    pv = torch.sigmoid(lg).cpu().numpy()
-    score = metrics.macro_available(pv, c.bank.eval_y[r.val_rows], list(range(heads.N_OUT)))
-    return {"val_loss": float(loss / w.sum().clamp_min(1e-6)),
-            "val_macro_auc": float(score) if np.isfinite(score) else None}
 
 
 def predict(c, src, head, rows, use_flip: bool = True) -> np.ndarray:
@@ -665,53 +470,6 @@ def predict(c, src, head, rows, use_flip: bool = True) -> np.ndarray:
             p[m] = (p[m] + pf) / 2
     return p
 
-
-def save_checkpoint(c, r, path: Path) -> None:
-    """Everything a rung-1 run needs to continue exactly: the trainable weights, the optimiser, the
-    scaler, the schedule step, the batch-order generator and the dropout stream."""
-    import torch
-
-    torch.save({"tail": c.enc.tail_state() if r.with_encoder else {}, "head": r.head.state_dict(),
-                "opt": r.opt.state_dict(), "scaler": r.scaler.state_dict(), "step": r.step, "epoch": r.epoch,
-                "gen": r.gen.get_state(), "rng": _rng_state(c.device), "history": r.history,
-                "skipped": r.skipped, "slices": r.slices, "train_s": r.train_s,
-                "lr_enc": r.lr_enc, "sched_epochs": r.sched_epochs, "seed": r.seed}, path)
-
-
-def load_checkpoint(c, r, path: Path) -> None:
-    import torch
-
-    ck = torch.load(path, map_location="cpu", weights_only=False)
-    if (ck["lr_enc"], ck["sched_epochs"], ck["seed"]) != (r.lr_enc, r.sched_epochs, r.seed):
-        raise AssertionError("the checkpoint belongs to another run")
-    if r.with_encoder:
-        c.enc.load_tail_state(ck["tail"])
-    r.head.load_state_dict(ck["head"])
-    r.opt.load_state_dict(ck["opt"])
-    r.scaler.load_state_dict(ck["scaler"])
-    r.step, r.epoch, r.history = int(ck["step"]), int(ck["epoch"]), list(ck["history"])
-    r.skipped, r.slices, r.train_s = int(ck["skipped"]), int(ck["slices"]), float(ck["train_s"])
-    r.gen.set_state(ck["gen"])
-    _set_rng_state(c.device, ck["rng"])
-
-
-def _curve(r) -> dict:
-    keys = [k for k in ("train_loss", "val_loss", "val_macro_auc", "mean_abs_z") if any(k in h for h in r.history)]
-    return {k: [_r(h.get(k)) for h in r.history] for k in keys}
-
-
-def _fit_summary(r) -> dict:
-    out = {"epochs": int(r.epoch), "curve": _curve(r), "train_seconds": round(r.train_s, 1),
-           "slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1),
-           "skipped_step_share": round(r.skipped / max(r.step, 1), 4),
-           "mean_abs_z_last_epoch": _r(r.history[-1]["mean_abs_z"]) if r.history else None}
-    vl = [h.get("val_loss") for h in r.history]
-    if vl and all(v is not None for v in vl):
-        out["val_loss_min"] = {"epoch": int(np.argmin(vl)) + 1, "value": _r(min(vl))}  # reported, not used
-    return out
-
-
-# ---------------------------------------------------------------- selection rules (pure)
 
 def _score4(v) -> float:
     return round(float(v), DECIMALS) if v is not None and np.isfinite(v) else float("-inf")
@@ -759,53 +517,11 @@ def select_final(continued, final_scores: dict) -> tuple[float, str]:
     return (a if sa > sb else b), "tied at rung 0: the last epoch decided"
 
 
-def schedule_for(slices_per_s, minimum: float = MIN_SLICES_PER_S) -> dict:
-    """The throughput rule: the slower encoder below `minimum` slices/s puts both on the short schedule."""
-    vals = [float(v) for v in slices_per_s if v is not None]
-    if not vals:
-        raise ValueError("no throughput was measured")
-    return dict(SHORT if min(vals) < minimum else LONG)
-
-
-def reading(b_lite: float, frozen0: float, head_only: float, seed_sd, ci_frozen0: dict, ci_head_only: dict) -> str:
-    """Section 7, in its order; the first line that fits is the reading.
-    1. |b-lite minus the stricter baseline| smaller than twice the head-only seed SD: seed noise.
-    2. b-lite beats both by at least 0.02 and both paired intervals exclude 0: helps.
-    3. b-lite below both by 0.02 or more: lowered.
-    4. otherwise: small or mixed."""
-    def r4(x):
-        return round(float(x), DECIMALS)
-
-    def excludes0(ci):
-        lo, hi = (ci or {}).get("lo"), (ci or {}).get("hi")
-        return lo is not None and hi is not None and (lo > 0 or hi < 0)
-
-    df, dh = r4(b_lite - frozen0), r4(b_lite - head_only)
-    diff = r4(b_lite - max(frozen0, head_only))
-    if seed_sd is not None and np.isfinite(seed_sd) and abs(diff) < r4(2 * seed_sd):
-        return NOISE
-    if df >= MARGIN and dh >= MARGIN and excludes0(ci_frozen0) and excludes0(ci_head_only):
-        return HELPS
-    if df <= -MARGIN and dh <= -MARGIN:
-        return LOWERED
-    return SMALL
-
-
-def joint_reading(readings: dict) -> str:
-    """ "helps" only if both encoders read "helps"; if the two disagree, "mixed"."""
-    vals = [readings.get(e) for e in MAIN]
-    if any(v is None for v in vals):
-        return "not available"
-    return vals[0] if len(set(vals)) == 1 else "mixed"
-
-
-# ---------------------------------------------------------------- run.json: the chosen rate
-
 def record_chosen(working, enc: str, rec: dict) -> None:
     """Write one unit's chosen learning rate into run.json under its key (_unit; both encoders' processes
     write it: locked, and agg.write replaces the file atomically, so a reader never sees half a file)."""
     working = Path(working)
-    lock = working / "private" / NAME / "run.lock"
+    lock = working / "private" / f"{NAME}_run.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     with open(lock, "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
@@ -821,57 +537,6 @@ def chosen_recorded(working, enc: str, lr: float) -> bool:
         return False
     rec = (json.loads(p.read_text()).get("n11_chosen_encoder_lr") or {}).get(enc) or {}
     return rec.get("lr") is not None and math.isclose(float(rec["lr"]), float(lr))
-
-
-def predict_test(c, src, head, trained: bool, lr: float | None = None) -> np.ndarray:
-    """The fold-0 scored test studies, with flip averaging. A trained model is refused until the chosen
-    learning rate stands in run.json."""
-    if trained and (lr is None or not chosen_recorded(c.working, c.unit, lr)):
-        raise AssertionError("the chosen learning rate must be in run.json before a trained model sees the test fold")
-    return predict(c, src, head, c.te_s, use_flip=True)
-
-
-def _save_pred(c, arm: str, P: np.ndarray) -> None:
-    df = pd.DataFrame(P, columns=FINDINGS)
-    df.insert(0, "s2_fold", c.fold)
-    df.insert(0, UID, c.d.uids[c.te_s])
-    df.to_csv(_enc_dir(c.working, c.name, c.fold) / f"pred_{arm}.csv", index=False)
-
-
-# ---------------------------------------------------------------- an encoder's blocks
-
-def _invalid_flag(working) -> Path:
-    return Path(working) / "private" / NAME / "INVALID"
-
-
-def _abort_if_invalid(working) -> None:
-    if _invalid_flag(working).exists():
-        raise InvalidRun("frozen0 check (b) failed for an encoder: nothing else is read")
-
-
-def _base_block(c, task: dict) -> dict:
-    d, sch = c.d, task.get("schedule") or {}
-    pos = (d.eval_y[c.iva] == 1).sum(0)
-    return {
-        "config": {"pooling": c.cfg.pooling, "planes": c.cfg.planes, "batch_size": int(c.cfg.batch_size), "E": c.E,
-                   "head_lr": c.cfg.lr, "head_weight_decay": c.cfg.weight_decay, "dropout": c.cfg.dropout,
-                   "encoder_weight_decay": ENC_WEIGHT_DECAY, "micro_batch_studies": c.micro,
-                   "micro_batch_slices": c.micro * c.S * len(c.planes), "amp_fp16": c.amp,
-                   "schedule_epochs": sch.get("epochs"), "rung0_epochs": sch.get("rung0"),
-                   "steps_per_epoch_inner": math.ceil(len(c.itr) / max(1, int(c.cfg.batch_size))),
-                   "steps_per_epoch_final": math.ceil(len(c.tr) / max(1, int(c.cfg.batch_size))),
-                   "learning_rates": list(LRS), "head_only_seeds": list(HEAD_ONLY_SEEDS)},
-        "trainable": c.trainable, "kind": c.enc.kind, "device": c.device.type,
-        "device_name": _device_name(c.device), "chain": c.chain, "upstream_n4": c.upstream_n4,
-        "studies": {"training": agg.count(len(c.tr)), "test": agg.count(len(c.te)),
-                    "test_scored": agg.count(len(c.te_s)), "inner_training": agg.count(len(c.itr)),
-                    "inner_validation": agg.count(len(c.iva_all)), "inner_validation_scored": agg.count(len(c.iva)),
-                    "gold_excluded": agg.count(len(c.gold))},
-        "inner_validation_positives": {f: agg.count(int(v)) for f, v in zip(FINDINGS, pos)},
-        "inner_validation_findings_with_both_classes": [f for f, a, b in zip(FINDINGS, pos, (d.eval_y[c.iva] == 0).sum(0))
-                                                        if a > 0 and b > 0],
-        "inner_validation_group": c.iva_group, "fold": c.fold, "stage_a_unit": "knee-n6a",
-    }
 
 
 def _device_name(dev) -> str:
@@ -891,79 +556,6 @@ def _peak_gb(dev):
     import torch
 
     return round(torch.cuda.max_memory_allocated(dev) / 2 ** 30, 2)
-
-
-def pick_micro(c, head_state) -> int:
-    """2 studies per micro-batch; 1 if a forward and backward pass of 2 does not fit in memory."""
-    import torch
-
-    if c.micro <= 1 or c.device.type != "cuda":
-        return c.micro
-    r = new_run(c, c.src, head_state, c.tr[:c.micro], REGISTERED_LR, LONG["epochs"], 0)
-    try:
-        batch_backward(c, r, r.rows, micro=c.micro)
-        fits = True
-    except RuntimeError as e:  # torch.cuda.OutOfMemoryError is a RuntimeError
-        if "out of memory" not in str(e).lower():
-            raise
-        fits = False
-    r.opt.zero_grad(set_to_none=True)
-    del r
-    torch.cuda.empty_cache()
-    return c.micro if fits else 1
-
-
-def _probe(c, task: dict, st: dict) -> None:
-    """The throughput rule's measurement: the first 200 micro-batches of the first rung-0 run (the refit
-    head, the first learning rate, the 12-epoch schedule). No validation pass, no score."""
-    _guard(c.itr, c.iva, c.forbid_outer)
-    head0 = inner_refit(c)
-    lr = LRS[0] if task.get("search", True) else REGISTERED_LR
-    r = new_run(c, c.src, head0, c.itr, lr, LONG["epochs"], 0)
-    r.clock = []
-    run_epochs(c, r, LONG["rung0"], limit=("micro", int(task.get("probe_micro") or PROBE_MICRO)))
-    last = r.clock[-101:]  # the last 100 micro-batches: without cold disk reads and cuDNN autotune
-    steady = ((last[-1][1] - last[0][1]) / max(last[-1][0] - last[0][0], 1e-6)) if len(last) >= 2 else None
-    st["probe"] = {"slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1), "slices": agg.count(r.slices),
-                   "steady_slices_per_s": round(steady, 1) if steady is not None else None,
-                   "steady_note": "the last 100 micro-batches; reported only, the rule uses slices_per_s",
-                   "seconds": round(r.train_s, 1), "peak_memory_gb": _peak_gb(c.device),
-                   "micro_batch_slices": c.micro * c.S * len(c.planes), "learning_rate": lr}
-    st["micro"] = {"config": {"micro_batch_studies": c.micro}}
-
-
-def _smoke(c, task: dict, st: dict) -> None:
-    """20 optimiser steps of the b-lite loop on training studies: memory and slices/s only, no score."""
-    _guard(c.tr, None, c.forbid_outer)
-    r = new_run(c, c.src, c.head_state, c.tr, REGISTERED_LR, LONG["epochs"], 0)
-    run_epochs(c, r, LONG["epochs"], limit=("steps", int(task.get("smoke_steps") or SMOKE_STEPS)))
-    st["smoke"] = {"optimiser_steps": agg.count(r.step), "slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1),
-                   "seconds": round(r.train_s, 1), "peak_memory_gb": _peak_gb(c.device),
-                   "micro_batch_slices": c.micro * c.S * len(c.planes), "reads_no_score": True,
-                   "skipped_step_share": round(r.skipped / max(r.step, 1), 4)}
-    # the code that otherwise first runs hours into the full run (review r1, S7), on 8 training studies:
-    # the stored features, one head-only step, a flipped forward, a checkpoint round trip, the run.json lock.
-    # Still no score: no validation or test row is touched and nothing is compared with a label.
-    import torch
-
-    rows = c.tr[:8]
-    feat, _ = _features(c, rows, rows)
-    h = new_run(c, feat, c.head_state, rows, 0.0, LONG["epochs"], 0, with_encoder=False)
-    run_epochs(c, h, 1, limit=("steps", 1))
-    h.head.eval()
-    flipped = [_logits(c, src, h.head, rows[:2], flipped=True) for src in (c.src, feat)]
-    with tempfile.TemporaryDirectory() as tmp:
-        ck = Path(tmp) / "ck.pt"
-        steps_before = r.step
-        save_checkpoint(c, r, ck)
-        load_checkpoint(c, r, ck)
-        record_chosen(tmp, "smoke", {"lr": REGISTERED_LR, "reason": "smoke: a dummy key in a temporary folder"})
-        locked = chosen_recorded(tmp, "smoke", REGISTERED_LR)
-    st["smoke"]["late_code_paths"] = {"feature_store": str(feat.x[c.planes[0]].dtype).replace("torch.", ""),
-                                      "head_only_step": bool(h.step == 1),
-                                      "flipped_forward_finite": bool(all(torch.isfinite(x).all() for x in flipped)),
-                                      "checkpoint_round_trip": bool(r.step == steps_before),
-                                      "run_json_lock": bool(locked)}
 
 
 def _features(c, rows, flip_rows) -> tuple[FeatSource, float]:
@@ -989,9 +581,485 @@ def _features(c, rows, flip_rows) -> tuple[FeatSource, float]:
     return FeatSource(c.d.n, rows, x, frows, flip, c.planes), time.time() - t0
 
 
+def _map(tasks: list, parallel: bool) -> list:
+    if not parallel:
+        return [_task(t) for t in tasks]
+    out = []
+    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=mp.get_context("spawn")) as ex:
+        futs = [ex.submit(_task, {**t, "spawned": True}) for t in tasks]
+        for t, f in zip(tasks, futs):
+            try:
+                out.append(f.result())
+            except (KeyboardInterrupt, SystemExit):  # the watchdog or a manual stop: never swallowed
+                raise
+            except BaseException as e:  # noqa: BLE001 - a crashed worker
+                out.append({"ok": False, "encoder": t["encoder"], "error": safe_log.describe(type(e), e.__traceback__)})
+    return out
+
+
+def _pct(vals) -> dict:
+    v = np.asarray(vals, dtype=float)
+    ok = np.isfinite(v)
+    if not ok.any():
+        return {"lo": None, "hi": None, "valid_share": 0.0}
+    lo, hi = np.percentile(v[ok], [2.5, 97.5])
+    return {"lo": _r(lo), "hi": _r(hi), "valid_share": _r(float(ok.mean()), 3)}
+
+
+# ---------------------------------------------------------------- units, state, index sets
+
+def _unit_dir(working, step: str, enc: str, fold: int) -> Path:
+    p = Path(working) / "private" / step / _unit(enc, fold)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _write_atomic(p: Path, text: str) -> None:
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")  # a reader never sees half a file
+    tmp.write_text(text)
+    os.replace(tmp, p)
+
+
+def _load_state(udir: Path) -> dict:
+    p = Path(udir) / "state.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def _save_state(udir: Path, st: dict) -> None:
+    text = json.dumps(st, indent=1, default=agg._json_default)
+    agg._check(json.loads(text))  # the state becomes the summary's unit block: aggregates only
+    _write_atomic(Path(udir) / "state.json", text)
+
+
+def inner_split(d, fold: int, table: dict | None = None, val_range=VAL_RANGE) -> dict:
+    """The fold's inner split by the plan's table (12.1 item 3): the validation set is one or two g_lang
+    groups of the training set. Asserted: the fold's test groups are the table's, the validation groups are
+    in the training set and not in the test set, and the validation set holds 250-500 studies. Any mismatch
+    stops the run (the table is corrected first). Returns the row sets and the groups' sizes."""
+    table = VAL_TABLE if table is None else table
+    tr, te, _ = d.split(fold)
+    g = d.g_lang.astype(str)
+    test_groups = sorted(set(g[te].tolist()))
+    row = table.get(fold) or table.get(str(fold))
+    if row is None:
+        raise AssertionError("the fold has no row in the validation table")
+    if test_groups != sorted(str(x) for x in row["test"]):
+        raise AssertionError("the fold's test groups differ from the plan's table: correct the table first")
+    val = sorted(str(x) for x in row["val"])
+    if set(val) & set(test_groups):
+        raise AssertionError("a validation group is in the fold's test set")
+    if not set(val) <= set(g[tr].tolist()):
+        raise AssertionError("a validation group of the table is not in the fold's training set")
+    m = np.isin(g[tr], val)
+    iva_all = tr[m]
+    if val_range and not val_range[0] <= len(iva_all) <= val_range[1]:
+        raise AssertionError("the inner validation set is outside 250-500 studies")
+    if set(iva_all.tolist()) & set(te.tolist()):
+        raise AssertionError("a validation study is in the fold's test set")
+    return {"itr": tr[~m], "iva_all": iva_all, "iva": iva_all[d.scored[iva_all]], "val_set": "+".join(val),
+            "val_groups": {v: agg.count(int((g[tr] == v).sum())) for v in val},
+            "test_groups": {v: agg.count(int((g[te] == v).sum())) for v in test_groups}}
+
+
+def _shared(task: dict):
+    """What every unit of one process shares: the data, the caches, the embeddings and the encoder."""
+    import torch
+
+    root = Path(task["root"]) if task.get("root") else None
+    dev = torch.device(task["device"])
+    d = stage.StageData(root, task.get("expect"))
+    sh = SimpleNamespace(d=d, root=root, base=root or paths.INPUT, name=task["encoder"], device=dev,
+                         amp=dev.type == "cuda", working=Path(task["working"]), step=task["step"],
+                         micro=int(task.get("micro") or MICRO), eval_studies=int(task.get("eval_studies") or 4),
+                         task=task)
+    sh.caches, sh.upstream_n4 = {}, {}
+    for p in heads.PLANES:
+        mm, _, st, up, _ = n5._load_plane(p, root)
+        if st[UID].astype(str).tolist() != d.uids.tolist():
+            raise AssertionError("cache rows differ from N5's index")
+        sh.caches[p], sh.upstream_n4[p] = mm, up
+    sh.S = int(sh.caches[heads.PLANES[0]].shape[1])
+    sh.bank = d.bank(sh.name, str(dev))
+    sh.dim = int(sh.bank.x[heads.PLANES[0]].shape[-1])
+    sh.enc = _factory(task)
+    sh.trainable = sh.enc.check()
+    sh.fdtype = torch.float16 if sh.amp else torch.float32
+    sh.unit_dirs = unit_files.unit_dirs(sh.base)
+    if dev.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    return sh
+
+
+def _context(sh, fold: int):
+    """One unit (this encoder on one outer fold): its index sets, its own fold's Stage A config, E, head and
+    statistics (knee-n6a only) and its forbidden rows."""
+    import torch
+
+    d, task = sh.d, sh.task
+    c = SimpleNamespace(**vars(sh))
+    c.fold, c.unit = int(fold), _unit(sh.name, fold)
+    c.dir = _unit_dir(sh.working, sh.step, sh.name, fold)
+    c.tr, c.te, c.te_s = d.split(c.fold)
+    c.gold = d.gold_rows()
+    if d.is_gold[c.tr].any() or d.is_gold[c.te].any():
+        raise AssertionError("a gold study is in the fold's training or test set")
+    sp = inner_split(d, c.fold, task.get("val_table"), task.get("val_range"))
+    c.itr, c.iva_all, c.iva, c.split = sp["itr"], sp["iva_all"], sp["iva"], sp
+    c.forbid_outer = np.concatenate([c.te, c.gold])  # every fit: test rows and gold rows
+    c.forbid_inner = np.concatenate([c.iva_all, c.te, c.gold])  # the inner refit: the validation rows too
+    ud = sh.unit_dirs.get((sh.name, c.fold))
+    if ud is None:
+        raise FileNotFoundError("the fold's Stage A unit is not attached")
+    if ud.parent.parent.name != "n6a":  # private/n6a/units/<encoder>_f<k>: never an iteration-2 unit or a rerun
+        raise AssertionError("the Stage A unit must be knee-n6a's")
+    c.unit_dir = ud
+    c.chain = unit_files.check_units(d, {(sh.name, c.fold): ud})
+    if not c.chain["s2_folds_match_units"]:
+        raise unit_files.ChainError("the Stage A unit does not match the attached S2 folds")
+    cj = json.loads((ud / "config.json").read_text())
+    c.cfg, c.E = heads.config_from(cj["config"]), int(cj["E"])
+    se = cj.get("schedule_epochs")  # the unit's schedule length (n6._unit); the registered 30 is passed as None
+    c.stage_a_schedule = None if se is None or int(se) == heads.MAX_EPOCHS else int(se)
+    c.planes = heads.PLANE_SETS[c.cfg.planes]
+    raw = torch.load(ud / "stats.pt", map_location="cpu")
+    c.stats = {p: (mu.float().to(sh.device), sd.float().to(sh.device)) for p, (mu, sd) in raw.items()}
+    c.stats_l = [c.stats[p] for p in c.planes]
+    c.head_state = torch.load(ud / "head.pt", map_location="cpu")
+    c.src = EncSource(sh.enc, {p: sh.caches[p] for p in c.planes}, c.planes, sh.amp)
+    c.schedule = task.get("schedule") or "full"
+    c.epochs = schedule_epochs(len(c.tr), c.schedule, int(task.get("passes") or PASSES))
+    return c
+
+
+def inner_refit(c):
+    """The head the inner runs start from: the fold's Stage A config, E and schedule length, seed 0, the
+    cached N5 embeddings, the fixed Stage A statistics, on the inner training rows only. Forbidden: the
+    validation rows, the test rows and the gold rows (the leakage guard raises if one reaches the fit)."""
+    r = heads.fit(c.bank, c.cfg, c.itr, epochs=c.E, stats=c.stats, forbidden=c.forbid_inner, seed=0,
+                  schedule_epochs=c.stage_a_schedule)
+    state = {k: v.detach().cpu().clone() for k, v in r.model.state_dict().items()}
+    if all(bool((state[k] == c.head_state[k]).all()) for k in state):
+        raise AssertionError("the inner refit equals Stage A's head")
+    return state
+
+
+# ---------------------------------------------------------------- the training loop
+
+def new_run(c, src, head_state: dict, rows, lr_enc: float, seed: int, val_rows=None, with_encoder: bool = True,
+            epochs: int | None = None):
+    """A fit of this module's loop, at step 0.
+
+    AdamW (the heads' betas and eps). Groups: the trainable encoder weights (lr_enc, weight decay 0.05),
+    the encoder's biases, norm weights and layer-scale (lr_enc, no decay), the head (its Stage A peak rate
+    and weight decay). All share twelfth_factor over the fit's total steps = epochs (default: the fold's)
+    x its steps per epoch. Effective batch = the head's Stage A batch size; pos_weight from the fit's own
+    training rows, as heads.fit. with_encoder false (head-only on the frozen0 features): the head group alone."""
+    import torch
+
+    r = SimpleNamespace(src=src, rows=np.asarray(rows), lr_enc=float(lr_enc), seed=int(seed),
+                        val_rows=None if val_rows is None else np.asarray(val_rows), with_encoder=bool(with_encoder),
+                        step=0, k=0, history=[], slices=0, train_s=0.0, skipped=0, clock=None, perm=None, pos=0)
+    dev = c.device
+    r.head = heads.make_head(c.cfg, c.dim, len(c.planes))
+    r.head.load_state_dict(head_state)
+    r.head.to(dev)
+    groups, r.peaks = [], []
+    if with_encoder:
+        c.enc.reset()
+        dec, nod = [], []
+        for n, p in c.enc.tail_named_parameters():
+            (nod if c.enc.no_decay(n, p) else dec).append(p)
+        for ps, wd in ((dec, ENC_WEIGHT_DECAY), (nod, 0.0)):
+            if ps:
+                groups.append({"params": ps, "lr": r.lr_enc, "weight_decay": wd})
+                r.peaks.append(r.lr_enc)
+    groups.append({"params": list(r.head.parameters()), "lr": c.cfg.lr, "weight_decay": c.cfg.weight_decay})
+    r.peaks.append(float(c.cfg.lr))
+    r.opt = torch.optim.AdamW(groups, lr=c.cfg.lr, betas=(0.9, 0.999), eps=1e-8)
+    r.scaler = _scaler(c.amp and with_encoder)
+    r.gen = torch.Generator().manual_seed(r.seed)  # the batch order, as heads.fit
+    if dev.type == "cuda":  # the head's dropout stream
+        with torch.cuda.device(dev):
+            torch.cuda.manual_seed(r.seed)
+    else:
+        torch.manual_seed(r.seed)
+    r.bs = max(1, int(c.cfg.batch_size))
+    r.spe = math.ceil(len(r.rows) / r.bs)
+    r.epochs = int(c.epochs if epochs is None else epochs)
+    r.total = r.epochs * r.spe
+    r.marks = twelfth_marks(r.total)
+    yb = c.bank.binary[r.rows]
+    pos, neg = (yb == 1).sum(0), (yb == 0).sum(0)
+    r.pw = torch.tensor(np.minimum(neg / np.maximum(pos, 1), c.cfg.pos_cap), dtype=torch.float32, device=dev)
+    _zero_acc(c, r)
+    return r
+
+
+def _zero_acc(c, r) -> None:
+    import torch
+
+    r.acc = [torch.zeros((), device=c.device) for _ in range(3)]  # loss sum, weight sum, mean |z| sum
+    r.acc_n = 0
+
+
+def run_to(c, r, twelfth: int, limit: tuple | None = None) -> None:
+    """Train r up to the end of twelfth `twelfth` (1-12) of its schedule. Head in train mode (dropout),
+    encoder in eval mode. One optimiser step, one schedule step and one scaler update per effective batch;
+    batches are drawn epoch by epoch in heads.fit's order. At every twelfth: the training loss (weighted
+    mean over the twelfth, dropout on), mean |z| of the training features and, with validation rows, the
+    validation loss and macro AUC (no flips, as Stage A's inner fits).
+    limit: ("micro", n) stops after n micro-batches (the smoke run): no record, no score."""
+    import torch
+
+    dev, n = c.device, len(r.rows)
+    target = r.marks[int(twelfth) - 1]
+    micro_done = 0
+    while r.step < target:
+        if r.with_encoder and c.enc.model.training:
+            raise AssertionError("the encoder must stay in eval mode")
+        r.head.train()
+        if r.perm is None or r.pos >= n:  # a new epoch
+            r.perm, r.pos = r.rows[torch.randperm(n, generator=r.gen).numpy()], 0
+        _sync(dev)
+        t0 = time.time()
+        f = twelfth_factor(r.step, r.total)
+        for g, peak in zip(r.opt.param_groups, r.peaks):
+            g["lr"] = peak * f
+        left = None if not limit else limit[1] - micro_done
+        ls, w, z, done = batch_backward(c, r, r.perm[r.pos:r.pos + r.bs], limit=left)
+        micro_done += done
+        if left is not None and micro_done >= limit[1]:
+            _sync(dev)
+            r.train_s += time.time() - t0
+            return  # the smoke run ends inside a batch: no optimiser step for a partial batch
+        scale0 = r.scaler.get_scale()
+        r.scaler.step(r.opt)
+        r.scaler.update()
+        if r.scaler.get_scale() < scale0:
+            r.skipped += 1  # a non-finite gradient: the scaler skipped this step
+        r.step += 1
+        r.pos += r.bs
+        r.acc[0] += ls
+        r.acc[1] += w
+        r.acc[2] += z
+        r.acc_n += done
+        _sync(dev)
+        r.train_s += time.time() - t0
+        if r.step == r.marks[r.k]:
+            rec = {"train_loss": float(r.acc[0] / r.acc[1].clamp_min(1e-6)), "mean_abs_z": float(r.acc[2] / max(r.acc_n, 1))}
+            if r.val_rows is not None:
+                rec.update(_validate(c, r))
+            r.history.append(rec)
+            r.k += 1
+            _zero_acc(c, r)
+
+
+def _validate(c, r) -> dict:
+    """Inner validation: the same loss (the fit's pos_weight) and the macro AUC over the findings with both
+    classes in the validation set's scored studies (report labels), no flip averaging."""
+    import torch
+    import torch.nn.functional as F
+
+    r.head.eval()
+    lg = _logits(c, r.src, r.head, r.val_rows)
+    vt = torch.as_tensor(r.val_rows, device=c.device)
+    w = c.bank.w[vt]
+    loss = F.binary_cross_entropy_with_logits(lg, c.bank.y[vt], weight=w, pos_weight=r.pw, reduction="sum")
+    r.val_pred = torch.sigmoid(lg).cpu().numpy()
+    score = metrics.macro_available(r.val_pred, c.bank.eval_y[r.val_rows], list(range(heads.N_OUT)))
+    return {"val_loss": float(loss / w.sum().clamp_min(1e-6)),
+            "val_macro_auc": float(score) if np.isfinite(score) else None}
+
+
+def save_checkpoint(c, r, path: Path) -> None:
+    """Everything a run needs to continue exactly from a twelfth: the trainable weights, the optimiser, the
+    scaler, the step, the epoch's batch order and position, its generator and the dropout stream."""
+    import torch
+
+    torch.save({"tail": c.enc.tail_state() if r.with_encoder else {}, "head": r.head.state_dict(),
+                "opt": r.opt.state_dict(), "scaler": r.scaler.state_dict(), "step": r.step, "k": r.k,
+                "perm": r.perm, "pos": r.pos, "gen": r.gen.get_state(), "rng": _rng_state(c.device),
+                "history": r.history, "skipped": r.skipped, "slices": r.slices, "train_s": r.train_s,
+                "lr_enc": r.lr_enc, "total": r.total, "seed": r.seed}, path)
+
+
+def load_checkpoint(c, r, path: Path) -> None:
+    import torch
+
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if (ck["lr_enc"], ck["total"], ck["seed"]) != (r.lr_enc, r.total, r.seed):
+        raise AssertionError("the checkpoint belongs to another run")
+    if r.with_encoder:
+        c.enc.load_tail_state(ck["tail"])
+    r.head.load_state_dict(ck["head"])
+    r.opt.load_state_dict(ck["opt"])
+    r.scaler.load_state_dict(ck["scaler"])
+    r.step, r.k, r.history = int(ck["step"]), int(ck["k"]), list(ck["history"])
+    r.perm, r.pos = ck["perm"], int(ck["pos"])
+    r.skipped, r.slices, r.train_s = int(ck["skipped"]), int(ck["slices"]), float(ck["train_s"])
+    r.gen.set_state(ck["gen"])
+    _set_rng_state(c.device, ck["rng"])
+    _zero_acc(c, r)
+
+
+def _curve(r) -> dict:
+    keys = [k for k in ("train_loss", "val_loss", "val_macro_auc", "mean_abs_z") if any(k in h for h in r.history)]
+    return {k: [_r(h.get(k)) for h in r.history] for k in keys}
+
+
+def _fit_summary(r) -> dict:
+    out = {"schedule_share": round(r.k / TWELFTHS, 3), "curve": _curve(r), "train_seconds": round(r.train_s, 1),
+           "slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1),
+           "skipped_step_share": round(r.skipped / max(r.step, 1), 4),
+           "config": {"epochs": r.epochs, "steps": r.total, "steps_per_epoch": r.spe, "seed": r.seed},
+           "mean_abs_z_last": _r(r.history[-1]["mean_abs_z"]) if r.history else None}
+    vl = [h.get("val_loss") for h in r.history]
+    if vl and all(v is not None for v in vl):  # where the validation loss bottoms: reported, not used
+        out["val_loss_min"] = {"schedule_share": round((int(np.argmin(vl)) + 1) / TWELFTHS, 3), "value": _r(min(vl))}
+    return out
+
+
+# ---------------------------------------------------------------- run.json, files
+
+def predict_test(c, src, head, trained: bool, lr: float | None = None) -> np.ndarray:
+    """The fold's scored test studies, with flip averaging. A trained model is refused until the unit's
+    chosen learning rate stands in run.json. No metric is computed from a trained model's output here."""
+    if trained and (lr is None or not chosen_recorded(c.working, c.unit, lr)):
+        raise AssertionError("the chosen learning rate must be in run.json before a trained model sees the test fold")
+    return predict(c, src, head, c.te_s, use_flip=True)
+
+
+def sha16(p: Path) -> str:
+    return common.sha16(p)
+
+
+def _save_rows(c, name: str, rows, P: np.ndarray, st: dict, extra: dict) -> None:
+    """A private per-study file: UID, the fold, the probabilities and the report labels (uncertain = negative)
+    of the same studies, so that decide() and dev() need no other input. Its hash goes into the state."""
+    df = pd.DataFrame(P, columns=FINDINGS)
+    for j, f in enumerate(FINDINGS):
+        df[f"y_{f}"] = c.d.eval_y[rows, j]
+    for k, v in reversed(list(extra.items())):
+        df.insert(0, k, v)
+    df.insert(0, "s2_fold", c.fold)
+    df.insert(0, UID, c.d.uids[rows])
+    df.to_csv(c.dir / name, index=False)
+    st.setdefault("files_sha16", {})[name] = sha16(c.dir / name)
+
+
+def _save_pred(c, arm: str, P: np.ndarray, st: dict) -> None:
+    _save_rows(c, f"pred_{arm}.csv", c.te_s, P, st, {"resolved": c.d.flip_row[c.te_s] < 0})
+
+
+def _save_inner(c, arm: str, P: np.ndarray, st: dict) -> None:
+    _save_rows(c, f"inner_{arm}.csv", c.iva, P, st, {"val_set": c.split["val_set"]})
+
+
+# ---------------------------------------------------------------- a unit's blocks
+
+def _invalid_flag(working, step: str) -> Path:
+    return Path(working) / "private" / step / "INVALID"
+
+
+def _abort_if_invalid(c) -> None:
+    if _invalid_flag(c.working, c.step).exists():
+        raise InvalidRun("frozen0 check (b) failed for a unit: nothing else is read")
+
+
+def _base_block(c) -> dict:
+    d = c.d
+    pos = (d.eval_y[c.iva] == 1).sum(0)
+    neg = (d.eval_y[c.iva] == 0).sum(0)
+    bs = max(1, int(c.cfg.batch_size))
+    return {
+        "encoder": c.name, "fold": c.fold, "session": c.task.get("session"), "schedule": c.schedule,
+        "stage_a_unit": "knee-n6a", "environment": c.task.get("environment"),
+        "config": {"pooling": c.cfg.pooling, "planes": c.cfg.planes, "batch_size": bs, "E": c.E,
+                   "head_lr": c.cfg.lr, "head_weight_decay": c.cfg.weight_decay, "dropout": c.cfg.dropout,
+                   "encoder_weight_decay": ENC_WEIGHT_DECAY, "micro_batch_studies": c.micro,
+                   "micro_batch_slices": c.micro * c.S * len(c.planes), "amp_fp16": c.amp,
+                   "epochs": c.epochs, "passes": int(c.task.get("passes") or PASSES),
+                   "steps_inner": c.epochs * math.ceil(len(c.itr) / bs),
+                   "steps_final": c.epochs * math.ceil(len(c.tr) / bs),
+                   "learning_rates": list(LRS), "rung0_twelfths": RUNG0, "warmup_twelfths": 1},
+        "trainable": c.trainable, "kind": c.enc.kind, "device": c.device.type,
+        "device_name": _device_name(c.device), "chain": c.chain, "upstream_n4": c.upstream_n4,
+        "studies": {"training": agg.count(len(c.tr)), "test": agg.count(len(c.te)),
+                    "test_scored": agg.count(len(c.te_s)), "inner_training": agg.count(len(c.itr)),
+                    "inner_validation": agg.count(len(c.iva_all)), "inner_validation_scored": agg.count(len(c.iva)),
+                    "gold_excluded": agg.count(len(c.gold))},
+        "test_groups": c.split["test_groups"], "inner_validation_groups": c.split["val_groups"],
+        "inner_validation_set": c.split["val_set"],
+        "inner_validation_positives": {f: agg.count(int(v)) for f, v in zip(FINDINGS, pos)},
+        "inner_validation_findings_with_both_classes": [f for f, a, b in zip(FINDINGS, pos, neg) if a > 0 and b > 0],
+    }
+
+
+def pick_micro(c) -> int:
+    """2 studies per micro-batch; 1 if a forward and backward pass of 2 does not fit in memory."""
+    import torch
+
+    if c.micro <= 1 or c.device.type != "cuda":
+        return c.micro
+    r = new_run(c, c.src, c.head_state, c.tr[:max(c.micro, 24)], REGISTERED_LR, 0, epochs=12)
+    try:
+        batch_backward(c, r, r.rows[:c.micro], micro=c.micro)
+        fits = True
+    except RuntimeError as e:  # torch.cuda.OutOfMemoryError is a RuntimeError
+        if "out of memory" not in str(e).lower():
+            raise
+        fits = False
+    r.opt.zero_grad(set_to_none=True)
+    del r
+    torch.cuda.empty_cache()
+    return c.micro if fits else 1
+
+
+def _smoke(c, st: dict) -> None:
+    """The smoke run (12.1 item 10): 200 micro-batches of the b-lite loop on fold 0's training studies:
+    slices/s and peak memory. Then, on 8 training studies, the code that otherwise first runs hours into a
+    session: the stored features, a head-only step, a flipped forward, a checkpoint round trip, the run.json
+    lock. No score: no validation or test row is touched and nothing is compared with a label."""
+    import torch
+
+    _guard(c.tr, None, c.forbid_outer)
+    r = new_run(c, c.src, c.head_state, c.tr, REGISTERED_LR, 0)
+    r.clock = []
+    run_to(c, r, TWELFTHS, limit=("micro", int(c.task.get("smoke_micro") or SMOKE_MICRO)))
+    last = r.clock[-101:]  # the last 100 micro-batches: without cold disk reads and cuDNN autotune
+    steady = ((last[-1][1] - last[0][1]) / max(last[-1][0] - last[0][0], 1e-6)) if len(last) >= 2 else None
+    st["smoke"] = {"micro_batches": agg.count(len(r.clock)), "slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1),
+                   "steady_slices_per_s": round(steady, 1) if steady is not None else None,
+                   "steady_note": "the last 100 micro-batches; reported only, the rule uses slices_per_s",
+                   "seconds": round(r.train_s, 1), "peak_memory_gb": _peak_gb(c.device),
+                   "micro_batch_slices": c.micro * c.S * len(c.planes), "reads_no_score": True,
+                   "skipped_step_share": round(r.skipped / max(r.step, 1), 4)}
+    rows = c.tr[:8]
+    feat, _ = _features(c, rows, rows)
+    h = new_run(c, feat, c.head_state, c.tr[:max(24, 3 * int(c.cfg.batch_size))], 0.0, 0, with_encoder=False, epochs=12)
+    h.rows = rows  # one step on the 8 studies
+    h.perm, h.pos = rows, 0
+    batch_backward(c, h, rows)
+    h.opt.step()
+    h.head.eval()
+    flipped = [_logits(c, src, h.head, rows[:2], flipped=True) for src in (c.src, feat)]
+    with tempfile.TemporaryDirectory() as tmp:
+        ck = Path(tmp) / "ck.pt"
+        before = (r.step, r.pos)
+        save_checkpoint(c, r, ck)
+        load_checkpoint(c, r, ck)
+        record_chosen(tmp, "smoke", {"lr": REGISTERED_LR, "reason": "smoke: a dummy key in a temporary folder"})
+        locked = chosen_recorded(tmp, "smoke", REGISTERED_LR)
+    st["smoke"]["late_code_paths"] = {"feature_store": str(feat.x[c.planes[0]].dtype).replace("torch.", ""),
+                                      "head_only_step": True,
+                                      "flipped_forward_finite": bool(all(torch.isfinite(x).all() for x in flipped)),
+                                      "checkpoint_round_trip": bool((r.step, r.pos) == before),
+                                      "run_json_lock": bool(locked)}
+
+
 def _frozen0(c, st: dict) -> FeatSource:
-    """The frozen0 arm: features of the training and scored test studies through this module's forward,
-    checks (a) and (b), and the arm's test predictions. Check (b) failing marks the run invalid."""
+    """The frozen0 arm of a unit: features of its training and scored test studies through this module's
+    forward, checks (a) and (b), and the arm's test predictions. Check (b) failing marks the run invalid."""
     import torch
 
     d, dev = c.d, c.device
@@ -1010,7 +1078,7 @@ def _frozen0(c, st: dict) -> FeatSource:
         cos = min(cos, float(torch.nn.functional.cosine_similarity(a, b, dim=-1).min()))
     check_a = {"studies": agg.count(len(sel)), "max_abs_gap": round(gap, 5), "mean_abs_gap": round(float(np.mean(mean_gap)), 6),
                "min_cosine": round(cos, 5), "reported_only": True}
-    # (b) the arm's fold-0 macro AUC against knee-n6a's saved predictions, same rows
+    # (b) the arm's fold macro AUC against knee-n6a's saved predictions, same rows (an iteration-1 number)
     head = heads.make_head(c.cfg, c.dim, len(c.planes))
     head.load_state_dict(c.head_state)
     head.to(dev)
@@ -1024,9 +1092,9 @@ def _frozen0(c, st: dict) -> FeatSource:
     check_b = {"macro_auc_frozen0": _r(m0, 5), "macro_auc_from_n6a_predictions": _r(mref, 5),
                "abs_difference": _r(abs(m0 - mref), 5), "tolerance": CHECK_B_TOL, "passed": passed,
                "max_abs_probability_gap": _r(float(np.nanmax(np.abs(P0 - ref))), 5) if np.isfinite(ref).any() else None,
-               "rows": "fold 0's scored test studies; gold rows dropped"}
-    # the drift diagnostic's reference: mean |z| of the frozen training features
-    tot, cnt = 0.0, 0
+               "rows": "the fold's scored test studies; gold rows dropped",
+               "note": "the only test-fold number of this notebook: it equals an iteration-1 number"}
+    tot, cnt = 0.0, 0  # the drift diagnostic's reference: mean |z| of the frozen training features
     for i in range(0, len(c.tr), 64):
         zs = _z(c, feat(c.tr[i:i + 64]))
         tot += float(sum(z.abs().mean() for z in zs) / len(zs)) * len(zs[0])
@@ -1035,181 +1103,187 @@ def _frozen0(c, st: dict) -> FeatSource:
                      "mean_abs_z_training": _r(tot / max(cnt, 1)),
                      "forward_slices_per_s": round((len(rows) + len(frows)) * c.S * len(c.planes) / max(secs, 1e-6), 1),
                      "seconds": round(secs, 1)}
-    _save_state(c.working, c.name, st, c.fold)
+    _save_state(c.dir, st)
     if not passed:
-        _invalid_flag(c.working).write_text("frozen0 check (b) failed\n")
+        _invalid_flag(c.working, c.step).write_text("frozen0 check (b) failed\n")
         raise InvalidRun("frozen0 check (b) failed: the run is invalid")
-    _save_pred(c, "frozen0", P0)
+    _save_pred(c, "frozen0", P0, st)
+    _save_state(c.dir, st)
     return feat
 
 
-def _search(c, task: dict, st: dict) -> None:
-    """Successive halving over the encoder learning rate on the inner split (section 4)."""
-    sch = task["schedule"]
-    total, r0 = int(sch["epochs"]), int(sch["rung0"])
-    ed = _enc_dir(c.working, c.name, c.fold)
-    _abort_if_invalid(c.working)
-    if "final" in set(task.get("blocks") or ()):  # the final fits are rerun in this call: their files go first
-        _clean(c.working, c.name, c.fold, FINAL_FILES)
-        st.pop("final", None)
-    elif st.get("final") or any(True for pat in FINAL_FILES[:2] for _ in ed.glob(pat)):
-        raise AssertionError("the search cannot be rerun after the final fits unless the same call reruns final")
+def _inner(c, st: dict, feat: FeatSource) -> None:
+    """All inner work of a unit (12.1 items 2 to 5, 12.2), on its inner split. Scores are inner validation
+    scores only. Per-study validation predictions of the four arms decide() reads are saved privately."""
+    task = c.task
+    _abort_if_invalid(c)
     _guard(c.itr, c.iva, c.forbid_outer)
     head0 = inner_refit(c)
-    prev = st.get("search") or {}
     s = {"refit": {"E": c.E, "seed": 0, "differs_from_stage_a_head": True,
-                   "forbidden": "validation group rows, test rows, gold rows"},
+                   "forbidden": "validation rows, test rows, gold rows"},
          "strategy": "successive halving, reduction factor 3; known bias: rung 0 favours fast learners",
-         "curve_note": "training loss: dropout on, during the epoch; validation loss: dropout off, at the epoch's end",
-         "rung0": {}, "rung1": {}}
-    st["search"] = s
+         "curve_note": CURVE_NOTE, "rung0": {}, "to_the_end": {}, "head_only": {}}
+    st["inner"] = s
+    # the starting head with no further training (baseline i), on the frozen0 features
+    hd = heads.make_head(c.cfg, c.dim, len(c.planes))
+    hd.load_state_dict(head0)
+    hd.to(c.device)
+    P = predict(c, feat, hd, c.iva, use_flip=False)
+    s["start"] = {"val_macro_auc": _r(metrics.macro_available(P, c.bank.eval_y[c.iva], list(range(heads.N_OUT))))}
+    _save_inner(c, "start", P, st)
+    # the inner head-only arm (baseline ii) at seed 0 and at the null seed: same schedule and batch order
+    for seed in (0, NULL_SEED):
+        r = new_run(c, feat, head0, c.itr, 0.0, seed, val_rows=c.iva, with_encoder=False)
+        run_to(c, r, TWELFTHS)
+        s["head_only"][f"seed_{seed}"] = {"val_macro_auc": _r(r.history[-1]["val_macro_auc"]), **_fit_summary(r)}
+        _save_inner(c, f"head_only_seed_{seed}", r.val_pred, st)
+    _save_state(c.dir, st)
+    # rung 0: each learning rate for the first quarter of the schedule
     ck = {}
-    if task.get("search", True):
-        for lr in LRS:
-            _abort_if_invalid(c.working)
-            r = new_run(c, c.src, head0, c.itr, lr, total, 0, val_rows=c.iva)
-            run_epochs(c, r, r0)
-            ck[lr] = ed / f"rung0_{_lr_key(lr)}.pt"
-            save_checkpoint(c, r, ck[lr])
-            s["rung0"][_lr_key(lr)] = {"val_macro_auc": _r(r.history[-1]["val_macro_auc"]), **_fit_summary(r)}
-            _save_state(c.working, c.name, st, c.fold)
-        sel = select_rung0({lr: s["rung0"][_lr_key(lr)]["val_macro_auc"] for lr in LRS}, task.get("rung1_tie", True))
-    else:  # the cut: the registered rate; rung-0 values of an earlier call of this session are kept
-        s["rung0"] = prev.get("rung0") or {}
-        sel = {"continue": [REGISTERED_LR], "tied": False, "note": "the search was cut: the registered 2e-5"}
+    for lr in LRS:
+        _abort_if_invalid(c)
+        r = new_run(c, c.src, head0, c.itr, lr, 0, val_rows=c.iva)
+        run_to(c, r, RUNG0)
+        ck[lr] = c.dir / f"rung0_{_lr_key(lr)}.pt"
+        save_checkpoint(c, r, ck[lr])
+        s["rung0"][_lr_key(lr)] = {"val_macro_auc": _r(r.history[-1]["val_macro_auc"]), **_fit_summary(r)}
+        _save_state(c.dir, st)
+    sel = select_rung0({lr: s["rung0"][_lr_key(lr)]["val_macro_auc"] for lr in LRS}, task.get("rung1_tie", True))
     s["selection"] = {"continue": [float(x) for x in sel["continue"]], "tied": sel["tied"], "note": sel["note"]}
+    # to the end: the survivor (or the tied pair), and the registered 2e-5 whether or not it survived
+    to_end = [float(x) for x in sel["continue"]]
+    if not any(math.isclose(x, REGISTERED_LR) for x in to_end):
+        to_end.append(REGISTERED_LR)
     final_scores = {}
-    for lr in sel["continue"]:
-        _abort_if_invalid(c.working)
-        r = new_run(c, c.src, head0, c.itr, lr, total, 0, val_rows=c.iva)
-        if lr in ck:
-            load_checkpoint(c, r, ck[lr])
-        run_epochs(c, r, total)
+    for lr in to_end:
+        _abort_if_invalid(c)
+        r = new_run(c, c.src, head0, c.itr, lr, 0, val_rows=c.iva)
+        load_checkpoint(c, r, ck[lr])
+        run_to(c, r, TWELFTHS)
         final_scores[lr] = r.history[-1]["val_macro_auc"]
-        s["rung1"][_lr_key(lr)] = {"val_macro_auc": _r(final_scores[lr]), "resumed_from_rung0": lr in ck,
-                                   **_fit_summary(r)}
-        _save_state(c.working, c.name, st, c.fold)
+        s["to_the_end"][_lr_key(lr)] = {"val_macro_auc": _r(final_scores[lr]), "resumed_from_rung0": True,
+                                        "survivor": lr in sel["continue"], **_fit_summary(r)}
+        if math.isclose(lr, REGISTERED_LR):  # the keep rule's b-lite arm: no choice on either side
+            _save_inner(c, "b_lite", r.val_pred, st)
+        _save_state(c.dir, st)
     chosen, why = select_final(sel["continue"], final_scores)
-    if not task.get("search", True):
-        why = "the search was cut: the registered 2e-5"
     s["chosen_lr"], s["chosen_reason"] = float(chosen), why
-    s["graph"] = "the 12-epoch training-and-validation graph is rung1[chosen_lr].curve"
-    for p in ck.values():  # the rung checkpoints are not needed any more
+    s["keep_rule_arms"] = {"start": s["start"]["val_macro_auc"],
+                           "head_only_seed_0": s["head_only"]["seed_0"]["val_macro_auc"],
+                           f"head_only_seed_{NULL_SEED}": s["head_only"][f"seed_{NULL_SEED}"]["val_macro_auc"],
+                           "b_lite_2e-05": s["to_the_end"][_lr_key(REGISTERED_LR)]["val_macro_auc"]}
+    for p in ck.values():  # rung checkpoints are deleted when a unit's inner work is done (output limit)
         p.unlink(missing_ok=True)
-    _save_state(c.working, c.name, st, c.fold)
     record_chosen(c.working, c.unit, {"lr": float(chosen), "reason": why,
                                       "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                       "before_any_test_pass_of_a_trained_model": True})
     s["chosen_lr_in_run_json"] = True
-    _save_state(c.working, c.name, st, c.fold)
+    s["complete"] = True
+    _save_state(c.dir, st)
 
 
-def _chosen(c, st: dict) -> float:
-    s = st.get("search") or {}
-    if s.get("chosen_lr") is None:
-        raise AssertionError("no chosen learning rate: run the search block first")
-    lr = float(s["chosen_lr"])
-    if not chosen_recorded(c.working, c.unit, lr):  # a later call of run() rewrote run.json: record it again
-        record_chosen(c.working, c.unit, {"lr": lr, "reason": s.get("chosen_reason"),
-                                          "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                          "copied_from": "state.json of the search block"})
-    return lr
-
-
-def _b_lite(c, task: dict, st: dict, seed: int) -> None:
+def _final(c, st: dict, feat: FeatSource) -> None:
+    """The final fits of a unit, from Stage A's head on all its training studies: head-only (seeds 0-4) and
+    b-lite at the unit's chosen rate (seed 0). They write test-fold predictions and the b-lite weights to the
+    private output. No test-fold metric is computed."""
     import torch
 
-    total = int(task["schedule"]["epochs"])
-    lr = _chosen(c, st)
-    _abort_if_invalid(c.working)
+    _abort_if_invalid(c)
+    s_in = st.get("inner") or {}
+    if not s_in.get("complete"):
+        raise AssertionError("the unit's inner work is not complete")
+    lr = float(s_in["chosen_lr"])
     _guard(c.tr, None, c.forbid_outer)
-    r = new_run(c, c.src, c.head_state, c.tr, lr, total, seed)
-    run_epochs(c, r, total)
-    t0 = time.time()
-    P = predict_test(c, c.src, r.head, trained=True, lr=lr)  # the test fold, once, at the last epoch
-    _save_pred(c, f"b_lite_seed_{seed}", P)
-    torch.save({"tail": c.enc.tail_state(), "head": r.head.state_dict()},
-               _enc_dir(c.working, c.name, c.fold) / f"b_lite_seed_{seed}.pt")
-    st.setdefault("final", {}).setdefault("b_lite", {})[f"seed_{seed}"] = {
-        "encoder_lr": lr, **_fit_summary(r), "test_seconds": round(time.time() - t0, 1)}
-    _save_state(c.working, c.name, st, c.fold)
-
-
-def _final(c, task: dict, st: dict, feat: FeatSource) -> None:
-    """Final fits from Stage A's fold-0 head on all training studies: head-only seeds 0-4, b-lite seed 0."""
-    total = int(task["schedule"]["epochs"])
-    _abort_if_invalid(c.working)
-    lr = _chosen(c, st)
-    _guard(c.tr, None, c.forbid_outer)
-    _clean(c.working, c.name, c.fold, FINAL_FILES)  # no arm of an earlier call survives a new final block
-    st["final"] = {"head_only": {}, "b_lite": {},
-                   "note": "training loss per epoch only (dropout on); the test fold is scored once, at the last epoch",
-                   "feature_note": "b-lite sees unrounded float32 features, head-only the fp16-stored frozen0 "
-                                   "features (a relative difference of about 5e-4)"}
-    for k in HEAD_ONLY_SEEDS:
-        r = new_run(c, feat, c.head_state, c.tr, 0.0, total, k, with_encoder=False)
-        run_epochs(c, r, total)
-        _save_pred(c, f"head_only_seed_{k}", predict_test(c, feat, r.head, trained=True, lr=lr))
-        st["final"]["head_only"][f"seed_{k}"] = _fit_summary(r)
-    _save_state(c.working, c.name, st, c.fold)
-    _b_lite(c, task, st, 0)
-    st["final"]["drift"] = {"mean_abs_z_frozen0": st["frozen0"]["mean_abs_z_training"],
-                            "mean_abs_z_b_lite_last_epoch": st["final"]["b_lite"]["seed_0"]["mean_abs_z_last_epoch"],
-                            "what": "mean absolute z of the training features under the fixed Stage A statistics"}
-    _save_state(c.working, c.name, st, c.fold)
+    fin = {"head_only": {}, "b_lite": {}, "curve_note": "training loss per twelfth only (dropout on)",
+           "feature_note": "b-lite sees unrounded float32 features, head-only the fp16-stored frozen0 features "
+                           "(a relative difference of about 5e-4)",
+           "note": "predictions only: no test-fold metric of a trained model is computed in this notebook"}
+    st["final"] = fin
+    for k in c.task.get("head_only_seeds") or HEAD_ONLY_SEEDS:
+        r = new_run(c, feat, c.head_state, c.tr, 0.0, k, with_encoder=False)
+        run_to(c, r, TWELFTHS)
+        _save_pred(c, f"head_only_seed_{k}", predict_test(c, feat, r.head, trained=True, lr=lr), st)
+        fin["head_only"][f"seed_{k}"] = _fit_summary(r)
+    _save_state(c.dir, st)
+    r = new_run(c, c.src, c.head_state, c.tr, lr, 0)
+    run_to(c, r, TWELFTHS)
+    _save_pred(c, "b_lite", predict_test(c, c.src, r.head, trained=True, lr=lr), st)  # once, at the end
+    torch.save({"tail": c.enc.tail_state(), "head": r.head.state_dict(), "encoder": c.name, "fold": c.fold,
+                "tail_prefixes": list(c.enc.tail_prefixes)}, c.dir / "b_lite_seed_0.pt")  # kept for N10
+    st["files_sha16"]["b_lite_seed_0.pt"] = sha16(c.dir / "b_lite_seed_0.pt")
+    fin["b_lite"]["seed_0"] = {"encoder_lr": lr, **_fit_summary(r)}
+    fin["drift"] = {"mean_abs_z_frozen0": st["frozen0"]["mean_abs_z_training"],
+                    "mean_abs_z_b_lite_last": fin["b_lite"]["seed_0"]["mean_abs_z_last"],
+                    "what": "mean absolute z of the training features under the fixed Stage A statistics"}
+    fin["complete"] = True
+    _save_state(c.dir, st)
 
 
 def _task(task: dict) -> dict:
-    """One encoder's part of a phase, in its own process when two GPUs exist. Returns only safe fields."""
-    enc, working, fold = task["encoder"], Path(task["working"]), int(task.get("fold") or 0)
+    """One process's part: one encoder on one device, through its folds in order. Returns only safe fields."""
+    enc, working, step = task["encoder"], Path(task["working"]), task["step"]
+    folds = [int(k) for k in task["folds"]]
     if task.get("spawned"):
         safe_log.worker_init()
         paths.WORKING = working
         try:
             import torch
 
-            torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))  # two processes share the CPU cores (4 on Kaggle)
+            torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))  # two processes share the CPU cores
         except Exception:  # noqa: BLE001
             pass
+    cur = folds[0]
+    states: dict = {}
     try:
-        phase, want = task["phase"], set(task["blocks"])
-        st = _load_state(working, enc, fold) if phase != "smoke" else {}
-        c = _context(task)
-        if not task.get("micro"):
-            c.micro = pick_micro(c, c.head_state)
-        if phase in ("smoke", "probe"):
-            st.update(_base_block(c, task))
-            (_smoke if phase == "smoke" else _probe)(c, task, st)
-        elif phase == "main":
-            st.update(_base_block(c, task))
-            st["schedule"] = task["schedule"]["name"]
-            feat = None
-            if want & {"frozen0", "final"}:
-                feat = _frozen0(c, st)
-            elif not (st.get("frozen0") or {}).get("valid"):
-                raise AssertionError("frozen0 has not passed: run the frozen0 block first")
-            if "search" in want:
-                _search(c, task, st)
-            if "final" in want:
-                _final(c, task, st, feat)
-        elif phase == "seed1":
-            _b_lite(c, task, st, 1)
-        st["leakage_assertion_passed"] = True
-        if phase != "smoke":
-            _save_state(working, enc, st, fold)
-        return {"ok": True, "encoder": enc, "state": st}
+        sh = _shared(task)
+        if task["phase"] == "smoke":
+            c = _context(sh, cur)
+            c.micro = sh.micro = pick_micro(c)
+            st = _base_block(c)
+            _smoke(c, st)
+            return {"ok": True, "encoder": enc, "states": {cur: st}}
+        feats = {}
+        for cur in folds:  # 1. frozen0 for every fold: an invalid run stops before any training
+            c = _context(sh, cur)
+            if not task.get("micro") and cur == folds[0]:
+                sh.micro = c.micro = pick_micro(c)
+            st = _base_block(c)
+            f = _frozen0(c, st)
+            feats[cur] = SimpleNamespace(pos=f.pos, fpos=f.fpos, planes=f.planes,
+                                         x={p: v.cpu() for p, v in f.x.items()}, flip={p: v.cpu() for p, v in f.flip.items()})
+            states[cur] = st
+            del f
+
+        def feat_of(k):  # one fold's frozen0 features on the device at a time
+            h = feats[k]
+            f = FeatSource.__new__(FeatSource)
+            f.planes, f.pos, f.fpos = h.planes, h.pos, h.fpos
+            f.x = {p: v.to(sh.device) for p, v in h.x.items()}
+            f.flip = {p: v.to(sh.device) for p, v in h.flip.items()}
+            return f
+
+        for cur in folds:  # 2. all inner work for every fold
+            c = _context(sh, cur)
+            _inner(c, states[cur], feat_of(cur))
+        for cur in folds:  # 3. then the final fits of every fold
+            c = _context(sh, cur)
+            _final(c, states[cur], feat_of(cur))
+            states[cur]["leakage_assertion_passed"] = True
+            _save_state(c.dir, states[cur])
+            feats.pop(cur, None)
+        return {"ok": True, "encoder": enc, "states": states}
     except BaseException as e:  # noqa: BLE001 - only the type and the location leave the process
         try:
-            (_enc_dir(working, enc, fold) / "error.log").write_text(
+            (_unit_dir(working, step, enc, cur) / "error.log").write_text(
                 "".join(traceback.format_exception(type(e), e, e.__traceback__)))
         except Exception:  # noqa: BLE001
             pass
         if isinstance(e, (KeyboardInterrupt, SystemExit)):  # the watchdog or a manual stop ends the whole step
             raise
-        return {"ok": False, "encoder": enc, "invalid": isinstance(e, InvalidRun),
+        return {"ok": False, "encoder": enc, "fold": cur, "invalid": isinstance(e, InvalidRun),
                 "error": safe_log.describe(type(e), e.__traceback__)}
     finally:
-        try:  # encoders in turn on one GPU: free this encoder's tensors
+        try:
             import gc
 
             import torch
@@ -1221,403 +1295,441 @@ def _task(task: dict) -> dict:
             pass
 
 
-def _map(tasks: list, parallel: bool) -> list:
-    if not parallel:
-        return [_task(t) for t in tasks]
-    out = []
-    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=mp.get_context("spawn")) as ex:
-        futs = [ex.submit(_task, {**t, "spawned": True}) for t in tasks]
-        for t, f in zip(tasks, futs):
-            try:
-                out.append(f.result())
-            except (KeyboardInterrupt, SystemExit):  # the watchdog or a manual stop: never swallowed
-                raise
-            except BaseException as e:  # noqa: BLE001 - a crashed worker
-                out.append({"ok": False, "encoder": t["encoder"], "error": safe_log.describe(type(e), e.__traceback__)})
-    return out
 
+# ---------------------------------------------------------------- the GPU step
 
-# ---------------------------------------------------------------- combine (the parent, CPU)
-
-def _draws(n: int, n_boot: int, seed: int):
-    """Study-bootstrap weights (n12._draws): n_boot times, n studies drawn with replacement."""
-    rng = np.random.default_rng(seed)
-    for _ in range(n_boot):
-        yield np.bincount(rng.integers(0, n, n), minlength=n).astype(float)
-
-
-def _pct(vals) -> dict:
-    v = np.asarray(vals, dtype=float)
-    ok = np.isfinite(v)
-    if not ok.any():
-        return {"lo": None, "hi": None, "valid_share": 0.0}
-    lo, hi = np.percentile(v[ok], [2.5, 97.5])
-    return {"lo": _r(lo), "hi": _r(hi), "valid_share": _r(float(ok.mean()), 3)}
-
-
-def _load_pred(working, enc: str, arm: str, n: int, row_of: dict, fold: int = 0):
-    p = _enc_dir(working, enc, fold) / f"pred_{arm}.csv"
-    if not p.exists():
-        return None
-    df = pd.read_csv(p)
-    P = np.full((n, len(FINDINGS)), np.nan)
-    rows = df[UID].astype(str).map(row_of)
-    ok = rows.notna().to_numpy()
-    P[rows[ok].astype(int).to_numpy()] = df.loc[ok, FINDINGS].to_numpy(float)
-    return P
-
-
-def listed_arms(st: dict) -> list:
-    """The arms an encoder's state lists as finished: only these are loaded (a prediction file left by an
-    earlier call is never combined)."""
-    fin = st.get("final") or {}
-    arms = ["frozen0"] if (st.get("frozen0") or {}).get("valid") else []
-    arms += [f"head_only_seed_{k}" for k in HEAD_ONLY_SEEDS if f"seed_{k}" in (fin.get("head_only") or {})]
-    return arms + [f"b_lite_seed_{k}" for k in (0, 1) if f"seed_{k}" in (fin.get("b_lite") or {})]
-
-
-def combine(d, working, encs, n_boot: int = N_BOOT, seed: int = 0, side_auc: bool = True, fold: int = 0) -> dict:
-    """Scores, paired study bootstraps and the readings from the arms' saved fold-0 predictions.
-
-    Rows: fold 0's scored test studies (gold is never in the test set), the same for every arm and both
-    encoders, so every difference is paired. Metric: macro AUC over the 12 findings, report labels."""
-    row_of = {u: i for i, u in enumerate(d.uids)}
-    te_s = d.split(fold)[2]
-    Y, find = d.eval_y, list(range(len(FINDINGS)))
-    P = {e: {a: _load_pred(working, e, a, d.n, row_of, fold) for a in listed_arms(_load_state(working, e, fold))}
-         for e in encs}
-    P = {e: {a: v for a, v in pa.items() if v is not None} for e, pa in P.items()}
-    need = ["frozen0", "head_only_seed_0", "b_lite_seed_0"]
-    done = [e for e in encs if all(a in P[e] for a in need)]
-    out: dict = {"label": DEV_LABEL, "display": DISPLAY, "added_after_results": True, "descriptive": True,
-                 "metric": "fold-0 macro AUC over the 12 findings, scored test studies, report labels",
-                 "interval": "study bootstrap, paired across arms and encoders, percentile 2.5-97.5",
-                 "n_boot": int(n_boot), "encoders": {}, "limits": LIMITS,
-                 "reading_rule": ["1: |b-lite minus the stricter baseline| under twice the head-only seed SD = seed noise",
-                                  "2: b-lite beats frozen0 and head-only by 0.02 or more, both paired intervals exclude 0 = helps",
-                                  "3: b-lite below both by 0.02 or more = lowered", "4: otherwise small or mixed",
-                                  "the first line that fits is the reading; joint: helps only if both; mixed if they disagree"]}
-    for e in list(done):  # a diverged fit: no number for that encoder, the other one is still read
-        if any(not np.isfinite(v[te_s]).all() for v in P[e].values()):
-            out["encoders"][e] = {"status": "b-lite predictions not finite"}
-            done.remove(e)
-    if not done:
-        return {**out, "status": "not available (no encoder has all three arms with finite predictions)"}
-    # seed 1 is used only if every encoder has it (else the two encoders' numbers would not be comparable)
-    if not all("b_lite_seed_1" in P[e] for e in done):
-        out["seed_1_ignored_for"] = [e for e in done if P[e].pop("b_lite_seed_1", None) is not None]
-    have = np.ones(d.n, bool)
-    for e in done:
-        for v in P[e].values():
-            have &= np.isfinite(v).all(axis=1)
-    ev = te_s[have[te_s]]
-    out["evaluation_studies"] = agg.count(len(ev))
-    out["all_scored_test_studies_used"] = bool(len(ev) == len(te_s))
-    zeros = np.zeros(len(ev), int)
-    W = list(_draws(len(ev), int(n_boot), seed))
-
-    def mac(X, w=None):
-        return metrics.macro(X[ev], Y[ev], zeros, find, w)
-
-    point, draws, two_seeds = {}, {}, {}
-    for e in done:
-        point[e] = {a: mac(X) for a, X in P[e].items()}
-        boot = [a for a in ("frozen0", "head_only_seed_0", "b_lite_seed_0", "b_lite_seed_1") if a in P[e]]
-        draws[e] = {a: np.array([mac(P[e][a], w) for w in W]) for a in boot}
-        two_seeds[e] = "b_lite_seed_1" in P[e]
-
-    def b_lite(e, both: bool):
-        """(point, draws) of b-lite: seed 0, or the mean of the two seeds' macro AUCs."""
-        if both:
-            return ((point[e]["b_lite_seed_0"] + point[e]["b_lite_seed_1"]) / 2,
-                    (draws[e]["b_lite_seed_0"] + draws[e]["b_lite_seed_1"]) / 2)
-        return point[e]["b_lite_seed_0"], draws[e]["b_lite_seed_0"]
-
-    readings = {}
-    for e in done:
-        pt, dr = point[e], draws[e]
-        bl, bl_d = b_lite(e, two_seeds[e])
-        ho = [pt[f"head_only_seed_{k}"] for k in HEAD_ONLY_SEEDS if f"head_only_seed_{k}" in pt]
-        sd = float(np.std(ho, ddof=1)) if len(ho) >= 2 else None
-        f0, h0 = pt["frozen0"], pt["head_only_seed_0"]
-        ci_f = {"estimate": _r(bl - f0), **_pct(bl_d - dr["frozen0"])}
-        ci_h = {"estimate": _r(bl - h0), **_pct(bl_d - dr["head_only_seed_0"])}
-        stricter = "frozen0" if f0 >= h0 else "head_only"
-        read = reading(bl, f0, h0, sd, ci_f, ci_h)
-        readings[e] = read
-        out["encoders"][e] = {
-            "macro_auc": {"frozen0": {"estimate": _r(f0), **_pct(dr["frozen0"])},
-                          "head_only_seed_0": {"estimate": _r(h0), **_pct(dr["head_only_seed_0"])},
-                          "b_lite_seed_0": {"estimate": _r(pt["b_lite_seed_0"]), **_pct(dr["b_lite_seed_0"])},
-                          "b_lite_seed_1": ({"estimate": _r(pt["b_lite_seed_1"]), **_pct(dr["b_lite_seed_1"])}
-                                            if two_seeds[e] else None),
-                          "b_lite": _r(bl), "b_lite_is": "the mean of seeds 0 and 1" if two_seeds[e] else "seed 0"},
-            "head_only_seed_macro_aucs": [_r(v) for v in ho],
-            "head_only_seed_sd": _r(sd, 5), "twice_head_only_seed_sd": _r(2 * sd) if sd is not None else None,
-            "seed_sd_note": "sample SD (n - 1) over the head-only seeds: a lower bound on a fine-tuned fit's seed noise",
-            "b_lite_minus_frozen0": ci_f, "b_lite_minus_head_only": ci_h,
-            "stricter_baseline": stricter,
-            "stricter_baseline_note": "the better of frozen0 and head-only, chosen on the test fold: it can only shrink the effect",
-            "effect": ci_f if stricter == "frozen0" else ci_h,
-            "reading": read}
-    out["readings"] = readings
-    out["joint_reading"] = joint_reading(readings)
-    # fold-0 Delta1 (DINOv2 minus ConvNeXt-T) for frozen0 and b-lite, and the paired interval of its change
-    if all(e in done for e in MAIN):
-        both = two_seeds[DINO] and two_seeds[CONV]
-        (bd, bd_d), (bc, bc_d) = b_lite(DINO, both), b_lite(CONV, both)
-        d_f = point[DINO]["frozen0"] - point[CONV]["frozen0"]
-        d_fd = draws[DINO]["frozen0"] - draws[CONV]["frozen0"]
-        change = {"estimate": _r((bd - bc) - d_f), **_pct((bd_d - bc_d) - d_fd)}
-        excl = change["lo"] is not None and (change["lo"] > 0 or change["hi"] < 0)
-        out["delta1_fold0"] = {
-            "what": "DINOv2 minus ConvNeXt-T, fold-0 macro AUC", "label": DEV_LABEL,
-            "frozen0": {"estimate": _r(d_f), **_pct(d_fd)}, "b_lite": {"estimate": _r(bd - bc), **_pct(bd_d - bc_d)},
-            "b_lite_is": "the mean of seeds 0 and 1" if both else "seed 0", "change": change,
-            "change_interval_excludes_0": bool(excl),
-            "reading": ("the change's paired interval excludes 0" if excl else
-                        "not read as a ranking change (the paired interval of the change includes 0)")}
-    else:
-        out["delta1_fold0"] = {"status": "not available (needs both main encoders)"}
-    if side_auc:
-        out["side_discrimination"] = _side(d, ev, Y, {a: {e: P[e][src] for e in done}
-                                                      for a, src in (("frozen0", "frozen0"), ("b_lite", "b_lite_seed_0"))},
-                                           n_boot, seed)
-    else:
-        out["side_discrimination"] = {"status": "cut (the cut order's second item)"}
-    out["status"] = "ok" if len(done) == len(encs) else "ok (an encoder has no result: see its status)"
-    return out
-
-
-def _side(d, ev, Y, units_by_arm: dict, n_boot: int, seed: int) -> dict:
-    """N14-C2's side-discrimination AUC (its function) for the b-lite outputs beside the frozen value."""
-    from . import n14
-
-    out = {"what": "N14-C2 on fold 0's scored test studies: a description of FM3", "b_lite_is": "seed 0"}
-    for arm, units in units_by_arm.items():
-        r = n14.c2_side_discrimination(SimpleNamespace(d=d, ev=ev, Y=Y, units=units), n_boot, seed)
-        r["scope"] = f"side information in the {arm} outputs, fold 0; report labels"
-        r["studies"] = "fold 0's scored test studies with exactly one side positive; unresolved laterality left out"
-        out[arm] = r
-    return out
-
-
-# ---------------------------------------------------------------- run
-
-def _summary(s: dict) -> dict:
-    enc = s.get("encoders") or {}
-    res = (s.get("results") or {}).get("encoders") or {}
-
+def _unit_summary(b: dict) -> dict:
     def g(o, *path):
         for k in path:
             o = o.get(k) if isinstance(o, dict) else None
         return o
 
-    out = {"status": s.get("status"), "errors": s.get("errors"), "schedule": g(s, "schedule", "name"),
-           "throughput_slices_per_s": g(s, "schedule", "slices_per_s"), "seed1": g(s, "seed1", "ran"),
-           "seed1_failed": g(s, "seed1", "failed"), "environment": s.get("environment"),
-           "diagnostic_only": "nothing is kept; every number is a development number (R6, R8)",
-           "encoders": {}, "joint_reading": g(s, "results", "joint_reading"),
-           "delta1_fold0": {k: g(s, "results", "delta1_fold0", k) for k in ("frozen0", "b_lite", "change", "reading")},
-           "side_discrimination": {arm: {k: {"reading": v.get("reading"), "status": v.get("status"),
-                                             "side_auc": {e: x.get("side_auc") for e, x in (v.get("encoders") or {}).items()}}
-                                         for k, v in (g(s, "results", "side_discrimination", arm, "pairs") or {}).items()}
-                                   for arm in ("frozen0", "b_lite")}}
-    for e, b in enc.items():
-        out["encoders"][e] = {
-            "trainable_parameters": g(b, "trainable", "parameters"), "peak_memory_gb": g(b, "probe", "peak_memory_gb"),
-            "steady_slices_per_s": g(b, "probe", "steady_slices_per_s"), "result_status": g(res, e, "status"),
-            "smoke": b.get("smoke"),
-            "frozen0_valid": g(b, "frozen0", "valid"), "check_a_max_abs_gap": g(b, "frozen0", "check_a", "max_abs_gap"),
-            "check_b_abs_difference": g(b, "frozen0", "check_b", "abs_difference"),
-            "rung0_val_macro_auc": {k: v.get("val_macro_auc") for k, v in (g(b, "search", "rung0") or {}).items()},
-            "rung1_val_macro_auc": {k: v.get("val_macro_auc") for k, v in (g(b, "search", "rung1") or {}).items()},
-            "chosen_lr": g(b, "search", "chosen_lr"), "chosen_lr_in_run_json": g(b, "search", "chosen_lr_in_run_json"),
-            "macro_auc": {k: (v.get("estimate") if isinstance(v, dict) else v)
-                          for k, v in (g(res, e, "macro_auc") or {}).items()},
-            "b_lite_minus_frozen0": g(res, e, "b_lite_minus_frozen0"),
-            "b_lite_minus_head_only": g(res, e, "b_lite_minus_head_only"),
-            "twice_head_only_seed_sd": g(res, e, "twice_head_only_seed_sd"), "reading": g(res, e, "reading")}
-    return out
+    return {"frozen0_valid": g(b, "frozen0", "valid"), "check_b_abs_difference": g(b, "frozen0", "check_b", "abs_difference"),
+            "max_abs_probability_gap": g(b, "frozen0", "check_b", "max_abs_probability_gap"),
+            "check_a_min_cosine": g(b, "frozen0", "check_a", "min_cosine"),
+            "inner_validation_set": b.get("inner_validation_set"), "inner_validation_groups": b.get("inner_validation_groups"),
+            "test_groups": b.get("test_groups"),
+            "rung0_val_macro_auc": {k: v.get("val_macro_auc") for k, v in (g(b, "inner", "rung0") or {}).items()},
+            "keep_rule_arms_inner": g(b, "inner", "keep_rule_arms"), "chosen_lr": g(b, "inner", "chosen_lr"),
+            "inner_complete": g(b, "inner", "complete"), "final_complete": g(b, "final", "complete"),
+            "smoke": b.get("smoke"), "trainable_parameters": g(b, "trainable", "parameters")}
 
 
-def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN, blocks=None, smoke: bool = False,
-        n_boot: int = N_BOOT, seed: int = 0, budget_h: float = 5.0, quiet: bool = True, devices=None,
-        processes: bool | None = None, seed1: bool | None = None, side_auc: bool = True, rung1_tie: bool = True,
-        search: bool = True, schedule: str | None = None, min_slices_per_s: float = MIN_SLICES_PER_S,
-        deadline_utc: str | None = None, inner_val_range=INNER_VAL_RANGE, encoder_factory=None,
-        eval_studies: int = 4, probe_micro: int = PROBE_MICRO, fold: int = 0) -> dict:
-    """Stage B-lite on one outer fold (the declaration: fold 0; see the module docstring). expect: the upstream
-    hash prefixes of the card. fold: the outer fold (default 0, the declared one); a unit's files are in
-    private/n11/<encoder>_f<fold>/ and its run.json key is <encoder>_f<fold>.
+def _summary(s: dict) -> dict:
+    return {"status": s.get("status"), "errors": s.get("errors"), "session": s.get("session"),
+            "schedule": s.get("schedule"), "suggested_schedule": s.get("suggested_schedule"),
+            "environment": s.get("environment"), "folds": s.get("folds"),
+            "validation_table": s.get("validation_table"),
+            "note": "no test-fold metric of a trained model is computed here; frozen0's check equals an iteration-1 number",
+            "units": {u: _unit_summary(b) for u, b in (s.get("units") or {}).items()}}
 
-    smoke: 20 optimiser steps per encoder; reads no score; reports memory and slices/s (step n11_smoke).
-    blocks: which of ("probe", "frozen0", "search", "final", "seed1", "combine") run (default all); a later
-      call in the same session reuses private/n11/<encoder>_f<fold>/state.json and the predictions that the
-      state lists. A full run (all blocks) first deletes what an earlier call wrote. The search cannot be
-      rerun after the final fits unless "final" is in the same call. The invalid flag of a failed frozen0
-      check stays until a call reruns "frozen0".
-    The cut order, first to last (defaults = the declaration, nothing cut):
-      seed1      None = b-lite seed 1 runs for both encoders only if it is projected to end before 0.8 x
-                 budget_h (and before deadline_utc); True forces it; False cuts it.
-      side_auc   False cuts N14-C2's side-discrimination AUC.
-      rung1_tie  False: a tied pair at rung 0 does not continue as a pair (2e-5 if in the pair, else the lower).
-      search     False cuts the learning-rate search: the registered 2e-5 (its inner 12-epoch run still runs).
-    schedule: None = the throughput rule decides ("short" if the slower encoder is under min_slices_per_s
-      over the first 200 micro-batches); "long" or "short" forces it (recorded as an override).
-    processes: None = one process per encoder when at least two GPUs exist; False = in this process.
-    budget_h: the wall-clock budget (the watchdog stops the step at 1.1 x). seed: the bootstrap's seed.
-    encoder_factory, inner_val_range, min_slices_per_s, probe_micro, eval_studies: for tests (a module-level
-      factory(name, device) -> Split; no weights are downloaded)."""
-    if schedule is not None and schedule not in SCHEDULES:
-        raise ValueError('schedule: None, "long" or "short"')
-    want = set(blocks or BLOCKS)
-    if not want <= set(BLOCKS):
-        raise ValueError(f"blocks: a subset of {BLOCKS}")
+
+def run(session: str | None = None, folds=None, schedule: str | None = None, root=None, expect: dict | None = None,
+        encoders: tuple[str, ...] = MAIN, smoke: bool = False, budget_h: float = 10.5, quiet: bool = True,
+        devices=None, processes: bool | None = None, rung1_tie: bool = True, head_only_seeds=HEAD_ONLY_SEEDS,
+        val_table: dict | None = None, val_range=VAL_RANGE, passes: int = PASSES, encoder_factory=None,
+        eval_studies: int = 4, smoke_micro: int = SMOKE_MICRO) -> dict:
+    """One GPU session of Stage B-lite (see the module docstring). expect: the upstream hash prefixes of the card.
+
+    smoke=True: the smoke run (step n11_smoke; fold 0; 200 micro-batches per encoder; no score). Its summary
+      gives suggested_schedule: "halved" if the slower encoder is under 300 slices/s, else "full".
+    session, folds: "a" (folds 0, 1, 2) or "b" (folds 3, 4); folds defaults to the session's. The step is
+      n11_<session>; a call first deletes what an earlier call of the same session wrote.
+    schedule: "full" or "halved", required: the value the smoke run decided, the same in both sessions. It
+      is recorded in run.json's config.
+    encoders: both main encoders (one process and one GPU each), or ConvNeXt-T only (12.5's trigger: the two
+      GPUs then take different folds).
+    The cut order's items that live here (defaults = nothing cut): head_only_seeds (the final head-only
+      seeds; (0,) cuts seeds 1-4) and rung1_tie (False: a tied pair at rung 0 does not continue as a pair).
+    budget_h: the watchdog stops the step at 1.1 x (Kaggle's limit is 12 h).
+    val_table, val_range, passes, encoder_factory, eval_studies, smoke_micro, devices, processes: for tests."""
+    from . import n13
+
     encs = tuple(encoders)
-    name = f"{NAME}_smoke" if smoke else NAME
-    overrides = bool(encoder_factory is not None or schedule is not None or tuple(inner_val_range or ()) != INNER_VAL_RANGE
-                     or min_slices_per_s != MIN_SLICES_PER_S or probe_micro != PROBE_MICRO or encs != MAIN)
-    cfg = {"encoders": list(encs), "blocks": sorted(want), "smoke": bool(smoke), "n_boot": int(n_boot), "seed": seed,
-           "budget_h": budget_h, "seed1": seed1, "side_auc": side_auc, "rung1_tie": rung1_tie, "search": search,
-           "schedule": schedule, "min_slices_per_s": min_slices_per_s, "deadline_utc": deadline_utc,
-           "eval_studies": eval_studies, "fold": int(fold), "test_overrides": overrides}
-    s: dict = {"written_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": SCOPE,
-               "plan": "iteration plan section 11 (it3_declaration_r3)", "added_after_results": True,
-               "descriptive": True, "label": DEV_LABEL, "display": DISPLAY, "fold": int(fold),
-               "environment": {k: agg._version(k) for k in ("torch", "timm")}}
-    with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
+    if smoke:
+        session, folds, schedule = "smoke", (0,), schedule or "full"
+    if not session or not str(session).isalnum():
+        raise ValueError('session: "a" or "b" (letters and digits)')
+    if schedule not in SCHEDULES:
+        raise ValueError('schedule: "full" or "halved", as the smoke run decided')
+    folds = tuple(int(k) for k in (folds if folds is not None else SESSIONS.get(session, ())))
+    if not folds or len(set(folds)) != len(folds):
+        raise ValueError("folds: the session's outer folds, each once")
+    hos = tuple(int(k) for k in head_only_seeds)
+    if 0 not in hos:
+        raise ValueError("head_only_seeds must hold seed 0")
+    step = _step_name(session)
+    overrides = bool(encoder_factory is not None or val_table is not None or tuple(val_range or ()) != VAL_RANGE
+                     or passes != PASSES or smoke_micro != SMOKE_MICRO)
+    env = n13.environment()
+    cfg = {"session": session, "folds": list(folds), "schedule": schedule, "encoders": list(encs), "smoke": bool(smoke),
+           "budget_h": budget_h, "rung1_tie": rung1_tie, "head_only_seeds": list(hos), "passes": passes,
+           "eval_studies": eval_studies, "environment": env, "test_overrides": overrides}
+    s: dict = {"written_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": SCOPE, "plan": PLAN,
+               "added_after_results": True, "session": session, "folds": list(folds), "schedule": schedule,
+               "environment": env, "knee_commit": agg.repo_commit(),
+               "cuts": {"head_only_seeds_1_to_4": hos != HEAD_ONLY_SEEDS, "rung1_for_a_tied_pair": not rung1_tie}}
+    with common.notebook(step, cfg, quiet=quiet, budget_h=budget_h):
+        import shutil
+
         t0 = time.time()
         working = paths.WORKING
         d = stage.StageData(root, expect)
         s["upstream"] = d.upstream
+        # the plan's validation table against the attached folds, before anything runs (the smoke run checks
+        # all five folds): groups as names and rounded sizes; any mismatch stops the step here
+        s["validation_table"] = {}
+        for k in (range(d.n_folds("s2")) if smoke else folds):
+            sp = inner_split(d, k, val_table, val_range)
+            s["validation_table"][f"fold_{k}"] = {"test_groups": sp["test_groups"], "inner_validation_groups": sp["val_groups"],
+                                                  "inner_validation_studies": agg.count(len(sp["iva_all"]))}
         devs = n5._devices(devices)
-        parallel = bool(len(devs) >= 2 and len(encs) >= 2) if processes is None else bool(processes)
-        s["processes"] = "one per encoder" if parallel else "one (encoders in turn)"
-        s["cuts"] = {"seed1": seed1 is False, "side_auc": not side_auc, "rung1_for_a_tied_pair": not rung1_tie,
-                     "search": not search}
-        base = {"root": str(root) if root else None, "expect": expect, "working": str(working),
-                "factory": encoder_factory, "inner_val_range": list(inner_val_range) if inner_val_range else None,
-                "eval_studies": eval_studies, "search": search, "rung1_tie": rung1_tie, "probe_micro": probe_micro,
-                "fold": int(fold)}
-
-        def state(e: str) -> dict:
-            return _load_state(working, e, fold)
-
-        def invalid_stop(bad: dict | None = None) -> None:
-            """Nothing else is read: only each encoder's frozen0 checks are written."""
-            s["encoders"] = {e: {"frozen0": state(e).get("frozen0")} for e in encs}
-            s["status"] = "invalid: frozen0 check (b) failed; nothing else is read"
-            s["errors"] = bad or {}
-            agg.write(name, s)
-            raise InvalidRun("frozen0 check (b) failed: the run is invalid")
-
-        def tasks(phase: str, **extra) -> list:
-            return [{**base, "encoder": e, "device": devs[i % len(devs)], "phase": phase,
-                     "blocks": sorted(want), "micro": micro.get(e), **extra} for i, e in enumerate(encs)]
-
-        def collect(results: list, what: str) -> None:
-            for r in results:
-                if r.get("ok"):
-                    s.setdefault("encoders", {})[r["encoder"]] = r["state"]
-            bad = {r["encoder"]: r.get("error") for r in results if not r.get("ok")}
-            invalid = any(r.get("invalid") for r in results) or _invalid_flag(working).exists()
-            if invalid:
-                invalid_stop(bad)
-            if bad:
-                if not smoke:  # every inner run that finished before the failure is still reported (R10)
-                    for e in encs:
-                        s.setdefault("encoders", {})[e] = state(e)
-                s["errors"] = bad
-                s["status"] = f"failed in {what}"
-                agg.write(name, s)
-                raise N11Error(f"an encoder's task failed in {what}")
-            s["status"] = f"running ({what} done)"
-            agg.write(name, s)
-
-        micro: dict = {}
-        if smoke:
-            collect(_map(tasks("smoke"), parallel), "smoke")
-            s["status"] = "ok (smoke: no score was read)"
-            agg.write(name, s)
+        parallel = bool(len(devs) >= 2) if processes is None else bool(processes)
+        shutil.rmtree(Path(working) / "private" / step, ignore_errors=True)  # nothing of an earlier call survives
+        base = {"root": str(root) if root else None, "expect": expect, "working": str(working), "step": step,
+                "session": session, "schedule": schedule, "factory": encoder_factory, "val_table": val_table,
+                "val_range": list(val_range) if val_range else None, "passes": int(passes),
+                "eval_studies": eval_studies, "rung1_tie": rung1_tie, "head_only_seeds": list(hos),
+                "smoke_micro": smoke_micro, "environment": env, "phase": "smoke" if smoke else "session"}
+        if len(encs) == 1 and len(devs) >= 2 and len(folds) >= 2 and not smoke:  # one encoder: the GPUs split the folds
+            jobs = [(encs[0], devs[i], folds[i::2]) for i in range(2)]
         else:
-            sched_file = Path(working) / "private" / NAME / "schedule.json"
-            if "frozen0" in want:  # only a new frozen0 check clears an invalid run
-                _invalid_flag(working).unlink(missing_ok=True)
-            elif _invalid_flag(working).exists():
-                invalid_stop()
-            if want == set(BLOCKS):  # a full run starts from nothing: no state, prediction or weight of an earlier call
-                for e in encs:
-                    _clean(working, e, fold, RUN_FILES)
-                sched_file.unlink(missing_ok=True)
-            # 1. the throughput rule
-            sch = None
-            if "probe" in want:
-                collect(_map(tasks("probe", schedule=LONG), parallel), "probe")
-                rates = {e: s["encoders"][e]["probe"]["slices_per_s"] for e in encs}
-                sch = dict(SCHEDULES[schedule]) if schedule else schedule_for(rates.values(), min_slices_per_s)
-                s["schedule"] = {"name": sch["name"], "config": {"epochs": sch["epochs"], "rung0": sch["rung0"]},
-                                 "slices_per_s": rates, "minimum_slices_per_s": min_slices_per_s,
-                                 "rule": "the slower encoder under the minimum over the first 200 micro-batches of the "
-                                         "first rung-0 run: both run 6 epochs (rungs 2 and 6)",
-                                 "forced": schedule is not None,
-                                 "note": "the first rung-0 run restarts under either schedule (the probe is not reused)"}
-                sched_file.parent.mkdir(parents=True, exist_ok=True)
-                sched_file.write_text(json.dumps(s["schedule"]))
-            elif schedule:
-                sch = dict(SCHEDULES[schedule])
-                s["schedule"] = {"name": sch["name"], "config": {"epochs": sch["epochs"], "rung0": sch["rung0"]}, "forced": True}
-            elif sched_file.exists():
-                s["schedule"] = json.loads(sched_file.read_text())
-                sch = dict(SCHEDULES[s["schedule"]["name"]])
-            elif want & {"frozen0", "search", "final", "seed1"}:
-                raise ValueError("no schedule: run the probe block or pass schedule")
-            micro = {e: ((state(e).get("micro") or {}).get("config") or {}).get("micro_batch_studies")
-                     for e in encs}
-            # 2. frozen0, the search and the final fits
-            if want & {"frozen0", "search", "final"}:
-                collect(_map(tasks("main", schedule=sch), parallel), "frozen0, search and final fits")
-            # 3. b-lite seed 1, for both encoders or neither (the first cut)
-            if "seed1" in want:
-                st = {e: state(e) for e in encs}
-                fit = [((st[e].get("final") or {}).get("b_lite") or {}).get("seed_0") or {} for e in encs]
-                secs = [f.get("train_seconds", 0.0) + f.get("test_seconds", 0.0) for f in fit]
-                need_s = 1.15 * (max(secs) if parallel else sum(secs))
-                limit = t0 + SEED1_SHARE * budget_h * 3600
-                if deadline_utc:
-                    from .n6 import _deadline_epoch
-
-                    limit = min(limit, _deadline_epoch(deadline_utc))
-                ahead = bool(all(fit) and time.time() + need_s <= limit)
-                go = bool(all(fit) and (seed1 is True or (seed1 is None and ahead)))
-                s["seed1"] = {"ran": go, "ahead_of_budget": ahead, "projected_seconds": round(need_s, 1),
-                              "rule": "seed 1 runs for both encoders only if it is projected to end before 0.8 x the "
-                                      "budget (the first cut); forced or cut by the seed1 argument",
-                              "argument": seed1}
-                if go:
-                    try:
-                        collect(_map(tasks("seed1", schedule=sch), parallel), "b-lite seed 1")
-                    except N11Error:  # seed 1 is the first cut: its failure must not cost the seed-0 result
-                        s["seed1"].update({"ran": False, "failed": True, "errors": s.pop("errors", None)})
-                        for e in encs:  # for both encoders or neither
-                            _clean(working, e, fold, ("pred_b_lite_seed_1.csv", "b_lite_seed_1.pt"))
-                            st_e = state(e)
-                            ((st_e.get("final") or {}).get("b_lite") or {}).pop("seed_1", None)
-                            _save_state(working, e, st_e, fold)
-            for e in encs:
-                s.setdefault("encoders", {})[e] = state(e)
-            # 4. scores, intervals and readings
-            if "combine" in want:
-                s["results"] = combine(d, working, encs, n_boot=n_boot, seed=seed, side_auc=side_auc, fold=fold)
-                rs = str(s["results"].get("status"))
-                s["status"] = "ok" if rs == "ok" else f"results: {rs}"
-            else:
-                s["status"] = "ok (blocks so far)"
-            s["seconds"] = round(time.time() - t0, 1)
-            agg.write(name, s)
+            jobs = [(e, devs[i % len(devs)], folds) for i, e in enumerate(encs)]
+        s["processes"] = [f"{e} on {dv.split(':')[0]}: folds {', '.join(str(k) for k in fs)}" for e, dv, fs in jobs]
+        results = _map([{**base, "encoder": e, "device": dv, "folds": list(fs)} for e, dv, fs in jobs],
+                       parallel and len(jobs) >= 2)
+        on_disk = {_unit(e, k): _load_state(_unit_dir(working, step, e, k)) for e in encs for k in folds}
+        bad = {_unit(r["encoder"], r.get("fold", folds[0])): r.get("error") for r in results if not r.get("ok")}
+        if any(r.get("invalid") for r in results) or _invalid_flag(working, step).exists():
+            s["units"] = {u: {"frozen0": b.get("frozen0")} for u, b in on_disk.items() if b.get("frozen0")}
+            s["status"] = "invalid: frozen0 check (b) failed for a unit; nothing else is read"
+            s["errors"] = bad
+            agg.write(step, s)
+            raise InvalidRun("frozen0 check (b) failed: the run is invalid")
+        if smoke:
+            s["units"] = {_unit(r["encoder"], k): b for r in results if r.get("ok") for k, b in r["states"].items()}
+        else:
+            s["units"] = {u: b for u, b in on_disk.items() if b}  # every inner run that finished is reported (R10)
+        if bad:
+            s["errors"] = bad
+            s["status"] = "failed"
+            agg.write(step, s)
+            raise N11Error("an encoder's task failed")
+        if smoke:
+            rates = {u: b["smoke"]["slices_per_s"] for u, b in s["units"].items()}
+            s["slices_per_s"] = rates
+            s["suggested_schedule"] = "halved" if min(rates.values()) < MIN_SLICES_PER_S else "full"
+            s["rule"] = "the slower encoder under 300 slices/s over 200 micro-batches: every fold gets the halved schedule"
+            s["status"] = "ok (smoke: no score was read)"
+        else:
+            s["status"] = "ok"
+        s["seconds"] = round(time.time() - t0, 1)
+        agg.write(step, s)
     try:
         common.summary(_summary(s))
     except agg.UnsafeSummary:
         common.summary({"status": s.get("status"), "errors": s.get("errors"),
-                        "summary_error": "the summary block was refused by the checks; read agg_n11.json"})
+                        "summary_error": f"the summary block was refused by the checks; read agg_{step}.json"})
+    return s
+
+
+# ---------------------------------------------------------------- decide (CPU; inner validation only)
+
+def find_units(root=None) -> dict:
+    """{(encoder, fold): folder} of the attached sessions' units. Two finished units for one encoder and fold
+    are refused. The smoke run's folder is not a session."""
+    out: dict = {}
+    for p in paths.glob_outputs(f"private/{NAME}_*/*_f*/state.json", Path(root) if root else None):
+        if p.parent.parent.name == _step_name("smoke"):
+            continue
+        enc, k = p.parent.name.rsplit("_f", 1)
+        key = (enc, int(k))
+        if key in out:
+            raise ValueError(f"two units for {enc} fold {k}: attach each session once")
+        out[key] = p.parent
+    return dict(sorted(out.items()))
+
+
+def _read_rows(p: Path) -> dict:
+    df = pd.read_csv(p).astype({UID: str})
+    out = {"uid": df[UID].to_numpy(), "P": df[FINDINGS].to_numpy(float),
+           "Y": df[[f"y_{f}" for f in FINDINGS]].to_numpy(float), "fold": df["s2_fold"].to_numpy(int)}
+    for k in ("val_set", "resolved"):
+        if k in df.columns:
+            out[k] = df[k].to_numpy()
+    return out
+
+
+def _wmacro(P, Y, w=None) -> float:
+    """The inner validation score (metrics.macro_available) with study weights: the mean AUC over the
+    findings that have both classes in the (resampled) validation set."""
+    vals = [metrics.auc(P[:, j], Y[:, j], w)[0] for j in range(P.shape[1])]
+    vals = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float = MIN_GAIN) -> dict:
+    """The keep rule of 12.2, per encoder, on inner validation only. units: find_units()'s result. Only
+    state.json and the inner_<arm>.csv files are opened; the test-fold files' hashes are copied from the states.
+
+    Per encoder, over its five folds, every comparison at 4 decimals:
+      b-lite    the run at the registered 2e-5 to the end of the schedule;
+      baseline  the arm with the higher five-fold mean of (i) the inner starting head with no training and
+                (ii) the inner head-only arm at seed 0 (a tie: head-only); both are reported;
+      s         sample SD (n - 1) of the per-unit differences head-only seed 100 minus seed 0, over all units
+                (10; 5 if only ConvNeXt-T ran);
+      kept      (a) mean difference > max(min_gain, 2 s / sqrt(5)); (b) b-lite higher in at least 4 of 5 folds;
+                (c) the study-bootstrap interval of the mean difference excludes 0 (studies resampled inside
+                each distinct validation set, one draw used in every fold that has it, paired across arms).
+    The sessions' environments must be equal field by field, else the status is "env_mismatch" and nothing
+    is kept. Returns the record with its time and sha256."""
+    if not units:
+        raise ValueError("decide: no unit found: attach both sessions' outputs")
+    encs = sorted({e for e, _ in units}, key=lambda e: (e not in MAIN, MAIN.index(e) if e in MAIN else 0))
+    for e in encs:
+        if sorted(k for ee, k in units if ee == e) != list(range(N_OUTER)):
+            raise ValueError(f"decide: {e} must have exactly one unit for each of the five folds (never fewer folds)")
+    st = {key: _load_state(ud) for key, ud in units.items()}
+    for (e, k), b in st.items():
+        if not (b.get("inner") or {}).get("complete") or not (b.get("frozen0") or {}).get("valid"):
+            raise ValueError(f"decide: the inner work of {e} fold {k} is not complete")
+    if len({b.get("schedule") for b in st.values()}) != 1:
+        raise ValueError("decide: the units ran under different schedules")
+    envs = [b.get("environment") for b in st.values()]
+    if not all(isinstance(x, dict) for x in envs):
+        raise ValueError("decide: a unit has no environment record")
+    differ = sorted(f for f in set().union(*(x.keys() for x in envs))
+                    if len({json.dumps(x.get(f), sort_keys=True) for x in envs}) > 1)
+    rec: dict = {"rule": "plan section 12.2, the B-lite keep rule (n11.decision)", "plan": PLAN,
+                 "decided_from": "inner validation scores only (R4, R5); no test-fold file was opened",
+                 "written_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "added_after_results": True,
+                 "encoders_run": encs, "schedule": next(iter(st.values())).get("schedule"),
+                 "min_gain": float(min_gain), "n_boot": int(n_boot), "limits": LIMITS,
+                 "development_delta1_reported": all(e in encs for e in MAIN),
+                 "sessions": sorted({str(b.get("session")) for b in st.values()}),
+                 "knee_commits": sorted({str(json.loads((ud.parent.parent.parent / "run.json").read_text()).get("commit"))
+                                         for ud in units.values() if (ud.parent.parent.parent / "run.json").exists()}),
+                 "units": {_unit(e, k): {"session": b.get("session"), "chosen_lr": b["inner"]["chosen_lr"],
+                                         "inner_validation_set": b.get("inner_validation_set")}
+                           for (e, k), b in st.items()},
+                 "prediction_files_sha16": {_unit(e, k): {n: h for n, h in (b.get("files_sha16") or {}).items()
+                                                          if n.startswith(("pred_", "b_lite_"))}
+                                            for (e, k), b in st.items()}}
+    if differ:
+        rec.update({"status": "env_mismatch", "env_differences": differ,
+                    "encoders": {e: {"keep": False} for e in encs}})
+        return _signed(rec)
+    # the inner files (hash-checked against the states) and the scores, recomputed and compared with the states
+    files, score = {}, {}
+    names = {"start": "start", "head_only": "head_only_seed_0", "null": f"head_only_seed_{NULL_SEED}", "b_lite": "b_lite"}
+    logged = {"start": "start", "head_only": "head_only_seed_0", "null": f"head_only_seed_{NULL_SEED}", "b_lite": "b_lite_2e-05"}
+    for key, ud in units.items():
+        for arm, fname in names.items():
+            p = ud / f"inner_{fname}.csv"
+            if sha16(p) != (st[key].get("files_sha16") or {}).get(p.name):
+                raise ValueError("decide: an inner file is not the one its state records")
+            files[key + (arm,)] = _read_rows(p)
+            v = _wmacro(files[key + (arm,)]["P"], files[key + (arm,)]["Y"])
+            if abs(v - float(st[key]["inner"]["keep_rule_arms"][logged[arm]])) > 2e-4:
+                raise ValueError("decide: an inner file's score differs from the score its state logged")
+            score[key + (arm,)] = round(v, DECIMALS)
+        sets = {tuple(files[key + (a,)]["uid"].tolist()) for a in names}
+        if len(sets) != 1:
+            raise ValueError("decide: a unit's inner files hold different studies")
+    folds = list(range(N_OUTER))
+    null = [score[(e, k, "null")] - score[(e, k, "head_only")] for e in encs for k in folds]
+    s = float(np.std(null, ddof=1))
+    thr_raw = max(float(min_gain), 2 * s / math.sqrt(N_OUTER))
+    thr = round(thr_raw, DECIMALS)
+    # one draw per distinct validation set, used in every fold that has it
+    vsets: dict = {}
+    for (e, k), ud in units.items():
+        f = files[(e, k, "b_lite")]
+        name = str(f["val_set"][0])
+        if vsets.setdefault(name, f["uid"].tolist()) != f["uid"].tolist():
+            raise ValueError("decide: two folds list different studies for one validation set")
+    W = {}
+    for i, name in enumerate(sorted(vsets)):
+        rng = np.random.default_rng([int(seed), i])
+        n = len(vsets[name])
+        W[name] = [np.bincount(rng.integers(0, n, n), minlength=n).astype(float) for _ in range(int(n_boot))]
+    out_e = {}
+    for e in encs:
+        means = {a: float(np.mean([score[(e, k, a)] for k in folds])) for a in ("start", "head_only")}
+        base = "start" if round(means["start"], DECIMALS) > round(means["head_only"], DECIMALS) else "head_only"
+        diffs = [round(score[(e, k, "b_lite")] - score[(e, k, base)], DECIMALS) for k in folds]
+        gain_raw = float(np.mean(diffs))
+        gain = round(gain_raw, DECIMALS)
+        up = sum(1 for x in diffs if x > 0)
+        boot = np.empty(int(n_boot))
+        for b in range(int(n_boot)):
+            tot = 0.0
+            for k in folds:
+                fb, f0 = files[(e, k, "b_lite")], files[(e, k, base)]
+                w = W[str(fb["val_set"][0])][b]
+                tot += _wmacro(fb["P"], fb["Y"], w) - _wmacro(f0["P"], f0["Y"], w)
+            boot[b] = tot / len(folds)
+        ci = _pct(boot)
+        excl = bool(ci["lo"] is not None and (ci["lo"] > 0 or ci["hi"] < 0))
+        out_e[e] = {"keep": bool(gain > thr and up >= MIN_FOLDS_UP and excl),
+                    "gain": gain, "threshold": thr, "folds_up": up, "interval": ci, "interval_excludes_0": excl,
+                    "conditions": {"a_gain_above_threshold": bool(gain > thr), "b_at_least_4_of_5_folds_up": bool(up >= MIN_FOLDS_UP),
+                                   "c_bootstrap_interval_excludes_0": excl},
+                    "baseline": base, "baseline_means": {a: _r(v) for a, v in means.items()},
+                    "gain_unrounded": gain_raw,
+                    "per_fold": {f"fold_{k}": {"b_lite": score[(e, k, "b_lite")], "start": score[(e, k, "start")],
+                                               "head_only": score[(e, k, "head_only")],
+                                               "head_only_null_seed": score[(e, k, "null")], "difference": dv}
+                                 for k, dv in zip(folds, diffs)}}
+    rec.update({"status": "decided", "environment": envs[0], "s": s, "s_divisor": "n - 1 (sample SD)",
+                "n_null": len(null), "null_mean": float(np.mean(null)), "threshold": thr,
+                "threshold_unrounded": thr_raw, "validation_sets": {n: agg.count(len(u)) for n, u in vsets.items()},
+                "bootstrap": "studies resampled inside each distinct validation set; one draw per set, used in every "
+                             "fold that has it; paired across arms; percentile 2.5-97.5",
+                "encoders": out_e})
+    return _signed(rec)
+
+
+def _canon(rec: dict) -> bytes:
+    body = {k: v for k, v in rec.items() if k != "sha256"}
+    return json.dumps(body, sort_keys=True, default=agg._json_default).encode()
+
+
+def _signed(rec: dict) -> dict:
+    rec = json.loads(json.dumps(rec, default=agg._json_default))
+    rec["sha256"] = hashlib.sha256(_canon(rec)).hexdigest()
+    return rec
+
+
+def decide(root=None, n_boot: int = N_BOOT, seed: int = 0, quiet: bool = True, budget_h: float = 1.0) -> dict:
+    """The CPU decision step: both sessions' outputs attached, nothing else. Writes agg_n11_decide.json (the
+    decision record, with its time and sha256) and prints it. No test-fold file is opened."""
+    rec: dict = {}
+    with common.notebook(f"{NAME}_decide", {"n_boot": int(n_boot), "seed": seed}, quiet=quiet, budget_h=budget_h):
+        rec = decision(find_units(root), n_boot=n_boot, seed=seed)
+        agg.write(f"{NAME}_decide", rec)
+    common.summary(rec)
+    return rec
+
+
+# ---------------------------------------------------------------- dev (CPU; after the decision)
+
+def _decision(decision_record, root=None) -> dict:
+    """The written decision: decision()'s output as a dict, its JSON text, the path of its file, or (None)
+    the attached agg_n11_decide.json. Only status "decided" with an intact sha256 is accepted (R5)."""
+    d = decision_record
+    if d is None:
+        p = paths.find_file(f"agg_{NAME}_decide.json", Path(root) if root else None)
+        if p is None:
+            raise ValueError("dev needs the written decision (decide()'s output): R5")
+        d = p
+    if isinstance(d, (str, Path)):
+        text = str(d)
+        d = json.loads(text) if text.lstrip().startswith("{") else json.loads(Path(text).read_text())
+    status = d.get("status") if isinstance(d, dict) else None
+    if status == "env_mismatch":
+        raise ValueError("dev: the record says env_mismatch, so there is no decision; no S2 number is computed (R5)")
+    if status != "decided":
+        raise ValueError('dev needs a decision written by n11.decide, with status "decided" (R5)')
+    if d.get("sha256") != hashlib.sha256(_canon(d)).hexdigest():
+        raise ValueError("dev: the decision record was changed after it was written (sha256)")
+    if not all(isinstance(((d.get("encoders") or {}).get(e) or {}).get("keep"), bool) for e in d.get("encoders_run") or [None]):
+        raise ValueError("dev: this is not a decision written by n11.decide")
+    return d
+
+
+def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, side_auc: bool = True,
+        quiet: bool = True, budget_h: float = 1.0) -> dict:
+    """The S2 development numbers of B-lite (12.3), run only after the decision is written.
+
+    Inputs attached: both sessions' outputs and the decision (knee-n11-decide's output, or decision_record).
+    Refused without a "decided" record with an intact sha256, and when a prediction file's hash differs from
+    the record's. Per encoder and arm (frozen0, head-only seed 0, b-lite), on every fold's scored test
+    studies: the mean of fold macros and the fold-stratified macro AUC; b-lite minus each baseline; the
+    head-only seeds' SD; Delta1 (both encoders only) and N14-C2's side AUC. Every number is a development
+    number (R6), whatever the decision (R10)."""
+    dec = _decision(decision_record, root)
+    s: dict = {"label": DEV_LABEL, "display": DISPLAY, "descriptive": True, "added_after_results": True, "plan": PLAN,
+               "decision": {"status": dec["status"], "sha256": dec["sha256"], "written_at_utc": dec.get("written_at_utc"),
+                            "keep": {e: dec["encoders"][e]["keep"] for e in dec["encoders_run"]}}}
+    with common.notebook(f"{NAME}_dev", {"decision_sha256": dec["sha256"], "n_boot": int(n_boot), "seed": seed},
+                         quiet=quiet, budget_h=budget_h):
+        units = find_units(root)
+        encs = list(dec["encoders_run"])
+        want = dec["prediction_files_sha16"]
+        if {_unit(e, k) for e, k in units} != set(want):
+            raise ValueError("dev: the attached units are not the ones the decision was written on")
+        data: dict = {}
+        for (e, k), ud in units.items():
+            for fname, h in want[_unit(e, k)].items():
+                if sha16(ud / fname) != h:
+                    raise ValueError("dev: a prediction file is not the one the decision record lists")
+                if fname.startswith("pred_"):
+                    data.setdefault(e, {}).setdefault(fname[len("pred_"):-len(".csv")], []).append(_read_rows(ud / fname))
+        find = list(range(len(FINDINGS)))
+        arms_of = {e: {a: {k: np.concatenate([x[k] for x in parts]) for k in ("uid", "P", "Y", "fold", "resolved")}
+                       for a, parts in data[e].items()} for e in encs}
+        out: dict = {}
+        ok_encs = []
+        for e in encs:
+            A = arms_of[e]
+            need = ("frozen0", "head_only_seed_0", "b_lite")
+            if not all(a in A and len(set(A[a]["fold"].tolist())) == N_OUTER for a in need):
+                out[e] = {"status": "an arm or a fold is missing"}
+                continue
+            if any(not np.isfinite(A[a]["P"]).all() for a in A):
+                out[e] = {"status": "b-lite predictions not finite"}
+                continue
+            if any(A[a]["uid"].tolist() != A["frozen0"]["uid"].tolist() for a in A):
+                raise ValueError("dev: the arms of an encoder hold different studies")
+
+            def m(a, A=A):
+                x = A[a]
+                return {"mean_of_fold_macros": metrics.per_fold_macro_mean(x["P"], x["Y"], x["fold"], find),
+                        "fold_stratified_macro_auc": metrics.macro(x["P"], x["Y"], x["fold"], find)}
+
+            vals = {a: m(a) for a in need}
+            seeds = sorted(a for a in A if a.startswith("head_only_seed_"))
+            ho = [m(a)["mean_of_fold_macros"] for a in seeds]
+            out[e] = {"label": DEV_LABEL, "studies": agg.count(len(A["frozen0"]["uid"])),
+                      "decision_keep": dec["encoders"][e]["keep"],
+                      **{a: {k: _r(v) for k, v in vals[a].items()} for a in need},
+                      "b_lite_minus_frozen0": {k: _r(vals["b_lite"][k] - vals["frozen0"][k]) for k in vals["b_lite"]},
+                      "b_lite_minus_head_only": {k: _r(vals["b_lite"][k] - vals["head_only_seed_0"][k]) for k in vals["b_lite"]},
+                      "head_only_seed_values": [_r(v) for v in ho],
+                      "head_only_seed_sd": _r(float(np.std(ho, ddof=1)), 5) if len(ho) >= 2 else None,
+                      "head_only_seed_note": "mean of fold macros per final head-only seed: a noise description only"}
+            ok_encs.append(e)
+        s["encoders"] = out
+        s["metrics"] = {"mean_of_fold_macros": "mean over the S2 folds of each fold's macro AUC",
+                        "fold_stratified_macro_auc": "pairs inside one S2 test fold, mean over the 12 findings"}
+        if all(e in ok_encs for e in MAIN):
+            if arms_of[DINO]["frozen0"]["uid"].tolist() != arms_of[CONV]["frozen0"]["uid"].tolist():
+                raise ValueError("dev: the two encoders hold different studies")
+            d1 = {a: {k: out[DINO][a][k] - out[CONV][a][k] for k in s["metrics"]} for a in ("frozen0", "b_lite")}
+            s["delta1"] = {"what": "DINOv2 minus ConvNeXt-T", "label": DEV_LABEL,
+                           **{a: {k: _r(v) for k, v in d1[a].items()} for a in d1},
+                           "change": {k: _r(d1["b_lite"][k] - d1["frozen0"][k]) for k in s["metrics"]},
+                           "note": "a development Delta1 is not a new H1 result"}
+        else:
+            s["delta1"] = {"status": "not reported (needs both main encoders)"}
+        if side_auc and ok_encs:
+            from . import n14
+
+            ref = arms_of[ok_encs[0]]["frozen0"]
+            fake = SimpleNamespace(folds={"s2_fold": ref["fold"]}, flip_row=np.where(ref["resolved"].astype(bool), -1, 0))
+            s["side_discrimination"] = {"what": "N14-C2 on every fold's scored test studies: a description of FM3"}
+            same = all(arms_of[e]["frozen0"]["uid"].tolist() == ref["uid"].tolist() for e in ok_encs)
+            for arm in ("frozen0", "b_lite"):
+                r = n14.c2_side_discrimination(SimpleNamespace(d=fake, ev=np.arange(len(ref["uid"])), Y=ref["Y"],
+                                                               units={e: arms_of[e][arm]["P"] for e in ok_encs if same}),
+                                               n_boot, seed)
+                r["scope"] = f"side information in the {arm} outputs, all folds; report labels"
+                r["label"] = DEV_LABEL
+                s["side_discrimination"][arm] = r
+        else:
+            s["side_discrimination"] = {"status": "cut" if not side_auc else "not available"}
+        s["status"] = "ok" if len(ok_encs) == len(encs) else "ok (an encoder has no result: see its status)"
+        agg.write(f"{NAME}_dev", s)
+    common.summary(s)
     return s
