@@ -53,6 +53,10 @@ NOTEBOOKS = {
     "n12": (False, False, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 3600),
     # N14 (error hunt, n14_spec_r3): CPU, descriptive; the competition data for C5's header pass only
     "n14": (False, True, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 10800),
+    # N11 (iteration 3, Stage B-lite; plan section 11): GPU T4 x2, internet on (pip and the encoder weights,
+    # as N5); the three N4 caches, N5's embeddings and index, fold 0's Stage A units of knee-n6a
+    "n11-smoke": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a"], 3600),
+    "n11": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a"], 32400),
 }
 
 
@@ -108,6 +112,10 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return f"from knee.nb import n12; n12.run(expect={EXPECT})"
     if name == "n14":
         return f"from knee.nb import n14; n14.run(expect={EXPECT})"
+    if name == "n11-smoke":
+        return f"from knee.nb import n11; n11.run(smoke=True, expect={EXPECT})"
+    if name == "n11":
+        return f"from knee.nb import n11; n11.run(expect={EXPECT})"
     raise KeyError(name)
 
 
