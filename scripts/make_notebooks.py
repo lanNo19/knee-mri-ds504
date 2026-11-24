@@ -51,6 +51,8 @@ NOTEBOOKS = {
     "montage": (False, False, False, ["n4-sagittal", "n4-coronal", "n4-axial", "n6p"], 3600),
     # N12 (plan r2, error analysis; RUNBOOK "Error analysis N12"): CPU, descriptive, existing outputs only
     "n12": (False, False, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 3600),
+    # N14 (error hunt, n14_spec_r3): CPU, descriptive; the competition data for C5's header pass only
+    "n14": (False, True, False, ["n0", "n3-r", "n5", "n6a", "n6b-g", "n7-b"], 10800),
 }
 
 
@@ -104,6 +106,8 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return 'from knee.nb import n10; n10.run("convnext_tiny")'
     if name == "n12":
         return f"from knee.nb import n12; n12.run(expect={EXPECT})"
+    if name == "n14":
+        return f"from knee.nb import n14; n14.run(expect={EXPECT})"
     raise KeyError(name)
 
 
