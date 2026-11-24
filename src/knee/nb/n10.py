@@ -314,8 +314,8 @@ def _split(encoder: str, dev: str, ckpt: Path, encoder_factory=None):
 
 CHECK_MAX_GAP = 0.01
 CHECK_MEAN_GAP = 0.001
-CHECK_NOTE = ("two fp16 runs differ by about 5e-4 relative in the features (N11's note): a few 1e-3 in probability "
-              "at most. A wrong trunk, tail, head or statistics file moves it by far more than 0.01")
+CHECK_NOTE = ("same code, batches and fp16 as N11: the expected gap is far below 0.001 on the same GPU type (not yet "
+              "measured). A wrong trunk, tail, head or statistics file moves probabilities by far more than 0.01")
 
 
 def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, root=None, quiet: bool = True,
@@ -327,7 +327,9 @@ def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, roo
     file must have the hash its state records) go through predict_tails with the bundle checkpoint: the
     same batches of 4 studies and the same flip rule as N11 (the file's own "resolved" column). Written to
     agg_n10_tails_check.json: the largest and the mean absolute probability gap, the rounded number of
-    studies and `passed` (largest gap <= 0.01 and mean gap <= 0.001). Only the UID, "resolved" and the 12
+    studies, the rounded number of them with unresolved laterality (mirrored pass) and `passed` (largest gap
+    <= 0.01 and mean gap <= 0.001; a gap that is not finite is written as null and fails). A failed check
+    writes the summary and then raises TailError, so the step ends FAILED. Only the UID, "resolved" and the 12
     probability columns of the file are read; no label column, no metric, no per-study output. The UIDs
     are used in memory to find the cache rows and are never printed or written."""
     step = "n10_tails_check"
@@ -378,12 +380,15 @@ def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, roo
             torch.backends.cudnn.benchmark = True  # as n11._shared
         P, info = predict_tails(enc, {"units": {int(fold): u}}, caches, row_of, flip_row, eval_studies)
         gap = np.abs(P[0].astype(float) - ref[FINDINGS].to_numpy(float))
-        mx, mean = float(gap.max()), float(gap.mean())
-        s.update({"studies": agg.count(len(ref)), "max_abs_probability_gap": round(mx, 5),
-                  "mean_abs_probability_gap": round(mean, 6),
+        finite = bool(np.isfinite(gap).all())
+        mx, mean = (float(gap.max()), float(gap.mean())) if finite else (float("nan"), float("nan"))
+        s.update({"studies": agg.count(len(ref)),
+                  "studies_unresolved_laterality": agg.count(int((~ref["resolved"].astype(bool)).sum())),
+                  "max_abs_probability_gap": round(mx, 5) if finite else None,
+                  "mean_abs_probability_gap": round(mean, 6) if finite else None,
                   "tolerance": {"max_abs_probability_gap": CHECK_MAX_GAP, "mean_abs_probability_gap": CHECK_MEAN_GAP,
                                 "why": CHECK_NOTE},
-                  "passed": bool(np.isfinite(gap).all() and mx <= CHECK_MAX_GAP and mean <= CHECK_MEAN_GAP),
+                  "passed": bool(finite and mx <= CHECK_MAX_GAP and mean <= CHECK_MEAN_GAP),
                   "trunk_sha16": trunk_sha16(enc), "n11_commit": tl["commit"][:12],
                   "weights_file_sha16": u["weights_file_sha16"], "stage_a_stats_sha16": u["stats_sha16"],
                   "prediction_file_sha16": common.sha16(pp), **info["per_fold"][int(fold)],
@@ -392,6 +397,8 @@ def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, roo
                   "reads": "UID, resolved and the 12 probabilities of pred_b_lite.csv; no label, no metric",
                   "seconds": round(time.time() - t0, 1)})
         agg.write(step, s)
+        if not s["passed"]:  # the summary file is written; the step must not end OK
+            raise TailError("check: the replay does not reproduce N11's predictions (see agg_n10_tails_check.json)")
     common.summary(s)
     return s
 

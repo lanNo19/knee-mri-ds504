@@ -626,10 +626,10 @@ def test_check_tails_replays_n11s_predictions_and_writes_aggregates_only(check_e
     text = printed.out + printed.err + (paths.WORKING / "agg_n10_tails_check.json").read_text()
     assert not [u for u in check_env["uids"] if u in text] and not agg.UID_RE.search(text)
     assert s["passed"] is True and s["max_abs_probability_gap"] < 1e-5 and s["mean_abs_probability_gap"] < 1e-5
-    assert s["studies"] == 5 and s["fold"] == 0 and s["trunk_sha16"] == n10.trunk_sha16(fake_factory(ENC))
+    assert s["studies"] == 5 and s["studies_unresolved_laterality"] == "<5" and s["fold"] == 0 and s["trunk_sha16"] == n10.trunk_sha16(fake_factory(ENC))
     out = json.loads((paths.WORKING / "agg_n10_tails_check.json").read_text())
     agg._check(out)
-    assert set(out) == {"encoder", "fold", "bundle_commit", "studies", "max_abs_probability_gap", "mean_abs_probability_gap",
+    assert set(out) == {"encoder", "fold", "bundle_commit", "studies", "studies_unresolved_laterality", "max_abs_probability_gap", "mean_abs_probability_gap",
                         "tolerance", "passed", "trunk_sha16", "n11_commit", "weights_file_sha16", "stage_a_stats_sha16",
                         "prediction_file_sha16", "tail_sha16", "head_sha16", "amp_fp16", "amp_fp16_in_training", "device",
                         "reads", "seconds"}
@@ -648,7 +648,12 @@ def test_check_tails_fails_on_other_statistics_another_flip_rule_or_a_changed_fi
     good = sp.read_bytes()
     st = torch.load(sp)
     torch.save({p: (mu + 0.5, sd) for p, (mu, sd) in st.items()}, sp)
-    s = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    def failed(**kw):
+        with pytest.raises(safe_log.StepFailed):  # the summary is written first, then the step fails
+            n10.check_tails(ENC, fold=0, n=200, **{"encoder_factory": fake_factory, **kw})
+        return json.loads((paths.WORKING / "agg_n10_tails_check.json").read_text())
+
+    s = failed()
     assert s["passed"] is False and s["max_abs_probability_gap"] > 0.01
     sp.write_bytes(good)
     # another trunk
@@ -658,7 +663,7 @@ def test_check_tails_fails_on_other_statistics_another_flip_rule_or_a_changed_fi
             e.model["mid"].weight.mul_(1.3)
         return e
 
-    s2 = n10.check_tails(ENC, fold=0, n=200, encoder_factory=other)
+    s2 = failed(encoder_factory=other)
     assert s2["passed"] is False and s2["trunk_sha16"] != n10.trunk_sha16(fake_factory(ENC))
     # the prediction file is not the one the state records
     pp = check_env["unit"] / "pred_b_lite.csv"
@@ -670,8 +675,23 @@ def test_check_tails_fails_on_other_statistics_another_flip_rule_or_a_changed_fi
     # ... and with its hash recorded, the other flip rule for one study is a gap
     _edit_state(check_env["inp"], 0, lambda st: st["files_sha16"].update(
         {"pred_b_lite.csv": hashlib.sha256(pp.read_bytes()).hexdigest()[:16]}))
-    s3 = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    try:
+        s3 = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    except safe_log.StepFailed:
+        s3 = json.loads((paths.WORKING / "agg_n10_tails_check.json").read_text())
     assert s3["max_abs_probability_gap"] > 1e-4
+    # a prediction that is not finite: null in strict JSON, and a fail
+    df[FINDINGS[0]] = df[FINDINGS[0]].astype(float)
+    df.loc[1, FINDINGS[0]] = np.nan
+    df.to_csv(pp, index=False)
+    _edit_state(check_env["inp"], 0, lambda st: st["files_sha16"].update(
+        {"pred_b_lite.csv": hashlib.sha256(pp.read_bytes()).hexdigest()[:16]}))
+    with pytest.raises(safe_log.StepFailed):
+        n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    text = (paths.WORKING / "agg_n10_tails_check.json").read_text()
+    s4 = json.loads(text)
+    assert "NaN" not in text and s4["passed"] is False and s4["max_abs_probability_gap"] is None
+    assert s4["mean_abs_probability_gap"] is None
     # a study that is in no cache
     for p in PLANES:
         c = check_env["inp"] / f"knee-n4-{p}" / "private" / f"n4_{p}" / f"cache_{p}_studies.csv"

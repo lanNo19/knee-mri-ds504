@@ -610,7 +610,9 @@ The replay check (run it first; it must pass for the encoder that will be submit
 |---|---|---|---|---|---|---|
 | knee-n10-tails-check | GPU T4 x2 | **Off** | The bundle dataset (the version the submission will use); outputs of knee-n0, knee-n3-r, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n6a, knee-n11-a and knee-n11-b (and knee-n11-c, knee-n11-d if they ran). No competition data | offline cell 1, then `from knee.nb import n10; n10.check_tails("dinov2_vits14", fold=0, n=200)` (ConvNeXt-T: `"convnext_tiny"`; another fold: fold=k) | 5-10 min | agg_n10_tails_check.json: passed true (max_abs_probability_gap at most 0.01 and mean_abs_probability_gap at most 0.001); studies 200; amp_fp16 true. Keep trunk_sha16 |
 
-What the check does: it runs the fold's b-lite model (bundle checkpoint, the fold's tail and head, knee-n6a's statistics) on the first 200 studies of N11's own pred_b_lite.csv for that fold, from the N4 caches, and compares the probabilities. It reads the UID, "resolved" and the 12 probability columns of that private file. It reads no label, computes no metric and writes aggregates only. A fail means the trunk, the knee-n6a version, the tail or the head is not what N11 ran: stop and report.
+What the check does: it runs the fold's b-lite model (bundle checkpoint, the fold's tail and head, knee-n6a's statistics) on the first 200 studies of N11's own pred_b_lite.csv for that fold, from the N4 caches, and compares the probabilities. It reads the UID, "resolved" and the 12 probability columns of that private file. It reads no label, computes no metric and writes aggregates only. A fail (STEP n10_tails_check: FAILED; the agg file is still written, with passed false) means the trunk, the knee-n6a version, the tail or the head is not what N11 ran: stop and report. studies_unresolved_laterality is the rounded number of replayed studies that took the mirrored pass.
+
+Order: knee-n10-tails-check runs only after knee-n11-decide has written the decision record. It opens test-fold predictions of a trained model (rule R5). The code does not enforce this order.
 
 Only one GPU is used by the b-lite path.
 
@@ -625,4 +627,4 @@ Check in agg_n10.json before asking Ablay to submit:
 6. b_lite.amp_fp16 true, equal to amp_fp16_in_training of every fold. b_lite.test_overrides false.
 7. b_lite.trunk_passes_per_study between 1.0 and 2.0 (1.0 + the share of studies with unresolved laterality).
 8. series_tiers (all three N10 modes): per plane, how many test studies got a fluid-sensitive fat-suppressed series, a fluid-sensitive one, any other series, or none. Rounded counts. Compare the shares with training (N0). null = the count itself failed; the submission is not affected.
-9. b_lite.trunk_sha16 equals trunk_sha16 of the passed knee-n10-tails-check run for the same encoder (the same frozen trunk was submitted as was checked).
+9. Against agg_n10_tails_check.json of the passed check run for the same encoder (fold 0): b_lite.trunk_sha16 equals trunk_sha16; bundle_commit is equal; and b_lite.units.fold_0's stage_a_stats_sha16, weights_file_sha16, tail_sha16 and head_sha16 equal the check's fields of the same names. Equal = the submission ran the trunk, the knee-n6a statistics, the tail and the head that the check replayed.
