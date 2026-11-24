@@ -475,6 +475,7 @@ def test_smoke_reads_no_score(inputs, tmp_path, monkeypatch):
         assert sm["late_code_paths"] == {"feature_store": "float32", "head_only_step": True, "flipped_forward_finite": True,
                                          "checkpoint_round_trip": True, "run_json_lock": True}
         assert not set(b) & {"frozen0", "inner", "final"}
+        assert b["units_loaded"] == [f"{b['encoder']}_f{k}" for k in range(5)]  # every fold's Stage A unit loads
     assert set(s["environment"]) >= {"torch", "python", "device_name"}
     assert set(s["validation_table"]) == {f"fold_{k}" for k in range(5)}  # the table is checked for every fold
     assert set(s["validation_table"]["fold_3"]["inner_validation_groups"]) == {"LANG4", "LANG0"}
@@ -707,7 +708,8 @@ def _write_rows(p: Path, uids, fold, P, Y, extra: dict) -> None:
     df.to_csv(p, index=False)
 
 
-def _sessions(root: Path, encs=MAIN, strength=None, env_b=None, seed=5, n=70, fold_strength=None):
+def _sessions(root: Path, encs=MAIN, strength=None, env_b=None, seed=5, n=70, fold_strength=None, commit_b="c0ffee",
+              session_of=None, overrides=False):
     """Two sessions' outputs (a: folds 0-2, b: folds 3, 4) with hand-made inner and test files.
     strength: {arm: signal}; fold_strength: {(fold, arm): signal} overrides it for one fold."""
     from knee.nb import n11
@@ -718,14 +720,16 @@ def _sessions(root: Path, encs=MAIN, strength=None, env_b=None, seed=5, n=70, fo
     truth = {}
     for e in encs:
         for k in range(5):
-            sess = "a" if k < 3 else "b"
+            sess = (session_of or {}).get((e, k)) or ("a" if k < 3 else "b")
             ud = root / f"knee-n11-{sess}" / "private" / f"n11_{sess}" / f"{e}_f{k}"
             (root / f"knee-n11-{sess}" / "run.json").parent.mkdir(parents=True, exist_ok=True)
-            (root / f"knee-n11-{sess}" / "run.json").write_text(json.dumps({"commit": "c0ffee"}))
+            (root / f"knee-n11-{sess}" / "run.json").write_text(json.dumps(
+                {"commit": "c0ffee" if sess != "b" else commit_b, "config": {"test_overrides": overrides}}))
             uids, Y = val[VSET[k]]
             st = {"encoder": e, "fold": k, "session": sess, "schedule": "full", "inner_validation_set": VSET[k],
                   "environment": dict(ENV if sess == "a" or env_b is None else env_b), "frozen0": {"valid": True},
-                  "inner": {"complete": True, "chosen_lr": 2e-5, "keep_rule_arms": {}}, "files_sha16": {}}
+                  "inner": {"complete": True, "chosen_lr": 2e-5, "keep_rule_arms": {}}, "files_sha16": {},
+                  "final": {"complete": True}}
             for arm in n11.INNER_ARMS:
                 P = _sig(Y, (fold_strength or {}).get((k, arm), strength[arm]), rng)
                 _write_rows(ud / f"inner_{arm}.csv", uids, k, P, Y, {"val_set": VSET[k]})
@@ -808,6 +812,9 @@ def test_decide_rule_cases(tmp_path, monkeypatch):
     rec = n11.decide(root=tmp_path / "b", n_boot=40, quiet=True)
     assert rec["status"] == "decided" and all(r["folds_up"] == 3 for r in rec["encoders"].values())
     assert json.loads((tmp_path / "wd" / "agg_n11_decide.json").read_text())["sha256"] == rec["sha256"]
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "wv")  # and dev after it, with the record it wrote
+    s = n11.dev(tmp_path / "wd" / "agg_n11_decide.json", root=tmp_path / "b", n_boot=20, side_auc=False, quiet=True)
+    assert s["status"] == "ok" and all(v["decision_keep"] is False for v in s["encoders"].values())
     # the threshold: a noisy null seed raises it above a small gain
     _sessions(tmp_path / "c", strength={"b_lite": 0.95, "head_only_seed_100": 0.3})
     rec = n11.decision(n11.find_units(tmp_path / "c"), n_boot=40)
@@ -832,8 +839,82 @@ def test_decide_rule_cases(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         n11.decision(units, n_boot=10)
     shutil.copytree(tmp_path / "a" / "knee-n11-a", tmp_path / "a" / "knee-n11-a2")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # two folders for one unit that got equally far
         n11.find_units(tmp_path / "a")
+
+
+def test_t1_one_encoder_only_and_a_missing_score(tmp_path, monkeypatch):
+    """decide(encoders=...) reads one encoder when the other cannot be completed; dev follows the record."""
+    from knee import paths
+    from knee.nb import n11
+
+    root = tmp_path / "in"
+    _sessions(root)
+    lost = n11.find_units(root)[(MAIN[0], 4)]
+    st = json.loads((lost / "state.json").read_text())
+    st["inner"]["complete"] = False  # DINOv2 fold 4 did not finish its inner work
+    st.pop("final")
+    (lost / "state.json").write_text(json.dumps(st))
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "wd")
+    from knee import safe_log
+
+    with pytest.raises(safe_log.StepFailed):  # one failed encoder blocks the decision unless it is left out
+        n11.decide(root=root, n_boot=20, quiet=True)
+    rec = n11.decide(root=root, n_boot=30, quiet=True, encoders=(MAIN[1],))
+    assert rec["status"] == "decided" and rec["encoders_run"] == [MAIN[1]] and rec["n_null"] == 5
+    assert set(rec["encoders_left_out"]) == {MAIN[0]} and rec["development_delta1_reported"] is False
+    assert set(rec["prediction_files_sha16"]) == {f"{MAIN[1]}_f{k}" for k in range(5)}
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "wv")
+    s = n11.dev(rec, root=root, n_boot=20, side_auc=False, quiet=True)  # the other encoder's folders are still attached
+    assert s["status"] == "ok" and set(s["encoders"]) == {MAIN[1]} and s["delta1"]["status"].startswith("not reported")
+    # a diverged inner run (no score in the state) is named, not a TypeError
+    u = n11.find_units(root)[(MAIN[1], 0)]
+    st = json.loads((u / "state.json").read_text())
+    st["inner"]["keep_rule_arms"]["b_lite_2e-05"] = None
+    (u / "state.json").write_text(json.dumps(st))
+    with pytest.raises(ValueError, match="no finite inner score"):
+        n11.decision(n11.find_units(root), n_boot=10, encoders=(MAIN[1],))
+
+
+def test_t2_a_partial_session_plus_its_rerun_in_session_c(tmp_path):
+    from knee.nb import n11
+
+    root = tmp_path / "in"
+    _sessions(root, session_of={(MAIN[1], 1): "c", (MAIN[0], 2): "c"})  # two units rerun whole in session c
+    for e, k, state in ((MAIN[1], 1, {"frozen0": {"valid": True}}),  # session a stopped before this unit's inner work
+                        (MAIN[0], 2, {"frozen0": {"valid": True}, "inner": {"complete": True}})):  # and before this one's final fits
+        ud = root / "knee-n11-a" / "private" / "n11_a" / f"{e}_f{k}"
+        ud.mkdir(parents=True)
+        (ud / "state.json").write_text(json.dumps(state))
+    units = n11.find_units(root)
+    assert len(units) == 10 and units[(MAIN[1], 1)].parent.name == "n11_c" and units[(MAIN[0], 2)].parent.name == "n11_c"
+    assert units[(MAIN[1], 0)].parent.name == "n11_a"
+    rec = n11.decision(units, n_boot=30)
+    assert rec["status"] == "decided" and rec["sessions"] == ["a", "b", "c"] and rec["n_null"] == 10
+    assert rec["units"][f"{MAIN[1]}_f1"]["session"] == "c"
+    (root / "knee-n11-a" / "private" / "n11_a" / f"{MAIN[1]}_f1" / "state.json").write_text(
+        (units[(MAIN[1], 1)] / "state.json").read_text())  # two complete folders for one unit: refused
+    with pytest.raises(ValueError):
+        n11.find_units(root)
+
+
+def test_t3_other_commit_or_environment_gives_no_decision(tmp_path, monkeypatch):
+    from knee import paths
+    from knee.nb import n11
+
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "w")
+    for name, kw, differ in (("commit", {"commit_b": "beef"}, ["knee_commit"]), ("none", {"commit_b": None}, ["knee_commit"]),
+                             ("env", {"env_b": {**ENV, "kaggle_image_git_commit": "xyz"}}, ["kaggle_image_git_commit"])):
+        root = tmp_path / name
+        _sessions(root, **kw)
+        rec = n11.decision(n11.find_units(root), n_boot=10)
+        assert rec["status"] == "env_mismatch" and rec["env_differences"] == differ, name
+        assert all(v == {"keep": False} for v in rec["encoders"].values()) and "threshold" not in rec
+        with pytest.raises(ValueError):  # no decision: dev refuses
+            n11.dev(rec, root=root, quiet=True)
+    _sessions(tmp_path / "ov", overrides=True)
+    with pytest.raises(ValueError, match="test overrides"):
+        n11.decision(n11.find_units(tmp_path / "ov"), n_boot=10)
 
 
 def test_dev_needs_the_decision_and_matching_files(tmp_path, monkeypatch):
@@ -873,11 +954,16 @@ def test_dev_needs_the_decision_and_matching_files(tmp_path, monkeypatch):
                 ref += num / den / 12
             assert r[arm]["fold_stratified_macro_auc"] == pytest.approx(ref, abs=6e-5)
         assert r["label"] == n11.DEV_LABEL and len(r["head_only_seed_values"]) == 5 and r["decision_keep"] is True
+        for key in ("frozen0", "b_lite", "b_lite_minus_frozen0", "b_lite_minus_head_only"):  # paired study bootstrap
+            ci = r[key]["fold_stratified_interval"]
+            assert ci["lo"] <= r[key]["fold_stratified_macro_auc"] <= ci["hi"]
         assert r["b_lite_minus_frozen0"]["mean_of_fold_macros"] == pytest.approx(
             r["b_lite"]["mean_of_fold_macros"] - r["frozen0"]["mean_of_fold_macros"], abs=2e-4)
     d1 = s["delta1"]
     assert d1["label"] == n11.DEV_LABEL and d1["change"]["mean_of_fold_macros"] == pytest.approx(
         d1["b_lite"]["mean_of_fold_macros"] - d1["frozen0"]["mean_of_fold_macros"], abs=2e-4)
+    assert d1["change"]["fold_stratified_interval"]["lo"] <= d1["change"]["fold_stratified_macro_auc"] <= d1["change"]["fold_stratified_interval"]["hi"]
+    assert d1["change_interval_excludes_0"] in (True, False) and s["n_boot"] == 20
     assert set(s["side_discrimination"]) >= {"frozen0", "b_lite"} and s["side_discrimination"]["b_lite"]["label"] == n11.DEV_LABEL
     # a prediction file that is not the one the record lists is refused
     p = n11.find_units(root)[(MAIN[0], 3)] / "pred_b_lite.csv"
@@ -963,11 +1049,11 @@ def test_n11_cli_entries_match_the_runbook_card():
     spec.loader.exec_module(mk)
     card = (root / "notebooks" / "RUNBOOK.md").read_text().split("## Stage B-lite N11 (iteration 3, all five folds)")[1]
     gpu_inputs = [f"u/knee-{u}" for u in ("n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n5", "n6a")]
-    for name in ("n11-smoke", "n11-a", "n11-b"):
+    for name in ("n11-smoke", "n11-a", "n11-b", "n11-c"):
         assert mk.cell2(name).split("schedule=")[0] in card and f"expect={mk.EXPECT}" in mk.cell2(name)
         meta = mk.metadata("u", name)
         assert meta["enable_gpu"] is True and meta["enable_internet"] is True and meta["kernel_sources"] == gpu_inputs
-    assert 'session="a"' in mk.cell2("n11-a") and 'session="b"' in mk.cell2("n11-b") and "smoke=True" in mk.cell2("n11-smoke")
+    assert 'session="c"' in mk.cell2("n11-c") and 'session="a"' in mk.cell2("n11-a") and 'session="b"' in mk.cell2("n11-b") and "smoke=True" in mk.cell2("n11-smoke")
     assert mk.metadata("u", "n11-decide")["kernel_sources"] == ["u/knee-n11-a", "u/knee-n11-b"]
     assert mk.metadata("u", "n11-dev")["kernel_sources"] == ["u/knee-n11-a", "u/knee-n11-b", "u/knee-n11-decide"]
     for name in ("n11-decide", "n11-dev"):

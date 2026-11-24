@@ -1247,9 +1247,14 @@ def _task(task: dict) -> dict:
     try:
         sh = _shared(task)
         if task["phase"] == "smoke":
+            for k in range(sh.d.n_folds("s2")):  # every fold's unit loads (config, head, statistics, chain guard)
+                cur = k
+                _context(sh, k)
+            cur = folds[0]
             c = _context(sh, cur)
             c.micro = sh.micro = pick_micro(c)
             st = _base_block(c)
+            st["units_loaded"] = [_unit(enc, k) for k in range(sh.d.n_folds("s2"))]
             _smoke(c, st)
             return {"ok": True, "encoder": enc, "states": {cur: st}}
         feats = {}
@@ -1428,8 +1433,19 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
         else:
             jobs = [(e, devs[i % len(devs)], folds) for i, e in enumerate(encs)]
         s["processes"] = [f"{e} on {dv.split(':')[0]}: folds {', '.join(str(k) for k in fs)}" for e, dv, fs in jobs]
-        results = _map([{**base, "encoder": e, "device": dv, "folds": list(fs)} for e, dv, fs in jobs],
-                       parallel and len(jobs) >= 2)
+        try:
+            results = _map([{**base, "encoder": e, "device": dv, "folds": list(fs)} for e, dv, fs in jobs],
+                           parallel and len(jobs) >= 2)
+        except BaseException:  # the watchdog or a manual stop: what finished is still written, then the stop goes on
+            if not smoke:
+                s["units"] = {u: b for u, b in ((_unit(e, k), _load_state(_unit_dir(working, step, e, k)))
+                                                for e in encs for k in folds) if b}
+                s["status"] = "interrupted"
+                try:
+                    agg.write(step, s)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
         on_disk = {_unit(e, k): _load_state(_unit_dir(working, step, e, k)) for e in encs for k in folds}
         bad = {u: err for r in results if not r.get("ok") for u, err in (r.get("errors") or {}).items()}
         if any(r.get("invalid") for r in results) or _invalid_flag(working, step).exists():
@@ -1479,8 +1495,14 @@ def run(session: str | None = None, folds=None, schedule: str | None = None, roo
 # ---------------------------------------------------------------- decide (CPU; inner validation only)
 
 def find_units(root=None) -> dict:
-    """{(encoder, fold): folder} of the attached sessions' units. Two finished units for one encoder and fold
-    are refused. The smoke run's folder is not a session."""
+    """{(encoder, fold): folder} of the attached sessions' units. The smoke run's folder is not a session.
+    A unit rerun whole in a later session (knee-n11-c) replaces an unfinished one: the folder that got
+    further counts (final fits complete > inner work complete > neither). Two folders that got equally far
+    are refused."""
+    def rank(folder: Path) -> int:
+        b = _load_state(folder)
+        return 2 if (b.get("final") or {}).get("complete") else 1 if (b.get("inner") or {}).get("complete") else 0
+
     out: dict = {}
     for p in paths.glob_outputs(f"private/{NAME}_*/*_f*/state.json", Path(root) if root else None):
         if p.parent.parent.name == _step_name("smoke"):
@@ -1488,9 +1510,22 @@ def find_units(root=None) -> dict:
         enc, k = p.parent.name.rsplit("_f", 1)
         key = (enc, int(k))
         if key in out:
-            raise ValueError(f"two units for {enc} fold {k}: attach each session once")
+            a, b = rank(out[key]), rank(p.parent)
+            if a == b:
+                raise ValueError(f"two units for {enc} fold {k} that got equally far: attach each session once")
+            if a > b:
+                continue
         out[key] = p.parent
     return dict(sorted(out.items()))
+
+
+def _session_run(ud: Path) -> dict:
+    """run.json of the session a unit folder belongs to ({} if it is not there)."""
+    p = ud.parent.parent.parent / "run.json"
+    try:
+        return json.loads(p.read_text()) if p.exists() else {}
+    except ValueError:
+        return {}
 
 
 def _read_rows(p: Path) -> dict:
@@ -1511,7 +1546,7 @@ def _wmacro(P, Y, w=None) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float = MIN_GAIN) -> dict:
+def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float = MIN_GAIN, encoders=None) -> dict:
     """The keep rule of 12.2, per encoder, on inner validation only. units: find_units()'s result. Only
     state.json and the inner_<arm>.csv files are opened; the test-fold files' hashes are copied from the states.
 
@@ -1525,7 +1560,17 @@ def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float =
                 (c) the study-bootstrap interval of the mean difference excludes 0 (studies resampled inside
                 each distinct validation set, one draw used in every fold that has it, paired across arms).
     The sessions' environments must be equal field by field, else the status is "env_mismatch" and nothing
-    is kept. Returns the record with its time and sha256."""
+    is kept; the same when the sessions' knee commits differ or one is unknown (env_differences holds
+    "knee_commit"). A unit of a session that ran with test overrides is refused.
+    encoders: None = every encoder with a unit folder. Given (needs Ablay's OK: the plan defines the
+    one-encoder case only for the 23:00 trigger): only these are read, the record names the encoder left out,
+    and s uses the remaining units' differences (5 for one encoder).
+    Returns the record with its time and sha256."""
+    left_out = {}
+    if encoders is not None:
+        keep_e = set(encoders)
+        left_out = {e: "not read: left out by the encoders argument of decide" for e in sorted({e for e, _ in units} - keep_e)}
+        units = {key: ud for key, ud in units.items() if key[0] in keep_e}
     if not units:
         raise ValueError("decide: no unit found: attach both sessions' outputs")
     encs = sorted({e for e, _ in units}, key=lambda e: (e not in MAIN, MAIN.index(e) if e in MAIN else 0))
@@ -1538,6 +1583,10 @@ def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float =
             raise ValueError(f"decide: the inner work of {e} fold {k} is not complete")
     if len({b.get("schedule") for b in st.values()}) != 1:
         raise ValueError("decide: the units ran under different schedules")
+    runs = {key: _session_run(ud) for key, ud in units.items()}
+    if any((r.get("config") or {}).get("test_overrides") for r in runs.values()):
+        raise ValueError("decide: a unit's session ran with test overrides")
+    commits = sorted({str(r.get("commit")) for r in runs.values()})
     envs = [b.get("environment") for b in st.values()]
     if not all(isinstance(x, dict) for x in envs):
         raise ValueError("decide: a unit has no environment record")
@@ -1550,14 +1599,15 @@ def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float =
                  "min_gain": float(min_gain), "n_boot": int(n_boot), "limits": LIMITS,
                  "development_delta1_reported": all(e in encs for e in MAIN),
                  "sessions": sorted({str(b.get("session")) for b in st.values()}),
-                 "knee_commits": sorted({str(json.loads((ud.parent.parent.parent / "run.json").read_text()).get("commit"))
-                                         for ud in units.values() if (ud.parent.parent.parent / "run.json").exists()}),
+                 "knee_commits": commits, "encoders_left_out": left_out,
                  "units": {_unit(e, k): {"session": b.get("session"), "chosen_lr": b["inner"]["chosen_lr"],
                                          "inner_validation_set": b.get("inner_validation_set")}
                            for (e, k), b in st.items()},
                  "prediction_files_sha16": {_unit(e, k): {n: h for n, h in (b.get("files_sha16") or {}).items()
                                                           if n.startswith(("pred_", "b_lite_"))}
                                             for (e, k), b in st.items()}}
+    if len(commits) != 1 or "None" in commits:  # 12.1 item 9: the same commit in every session, and a known one
+        differ.append("knee_commit")
     if differ:
         rec.update({"status": "env_mismatch", "env_differences": differ,
                     "encoders": {e: {"keep": False} for e in encs}})
@@ -1573,6 +1623,8 @@ def decision(units: dict, n_boot: int = N_BOOT, seed: int = 0, min_gain: float =
                 raise ValueError("decide: an inner file is not the one its state records")
             files[key + (arm,)] = _read_rows(p)
             v = _wmacro(files[key + (arm,)]["P"], files[key + (arm,)]["Y"])
+            if st[key]["inner"]["keep_rule_arms"].get(logged[arm]) is None or not np.isfinite(v):
+                raise ValueError("decide: a unit has no finite inner score")
             if abs(v - float(st[key]["inner"]["keep_rule_arms"][logged[arm]])) > 2e-4:
                 raise ValueError("decide: an inner file's score differs from the score its state logged")
             score[key + (arm,)] = round(v, DECIMALS)
@@ -1644,18 +1696,33 @@ def _signed(rec: dict) -> dict:
     return rec
 
 
-def decide(root=None, n_boot: int = N_BOOT, seed: int = 0, quiet: bool = True, budget_h: float = 1.0) -> dict:
-    """The CPU decision step: both sessions' outputs attached, nothing else. Writes agg_n11_decide.json (the
-    decision record, with its time and sha256) and prints it. No test-fold file is opened."""
+def decide(root=None, n_boot: int = N_BOOT, seed: int = 0, quiet: bool = True, budget_h: float = 1.0,
+           encoders=None) -> dict:
+    """The CPU decision step: the sessions' outputs attached (a, b and, after a partial session, c), nothing
+    else. Writes agg_n11_decide.json (the decision record, with its time and sha256) and prints it. No
+    test-fold file is opened. encoders: see decision()."""
     rec: dict = {}
-    with common.notebook(f"{NAME}_decide", {"n_boot": int(n_boot), "seed": seed}, quiet=quiet, budget_h=budget_h):
-        rec = decision(find_units(root), n_boot=n_boot, seed=seed)
+    cfg = {"n_boot": int(n_boot), "seed": seed, "encoders": list(encoders) if encoders is not None else None}
+    with common.notebook(f"{NAME}_decide", cfg, quiet=quiet, budget_h=budget_h):
+        rec = decision(find_units(root), n_boot=n_boot, seed=seed, encoders=encoders)
         agg.write(f"{NAME}_decide", rec)
     common.summary(rec)
     return rec
 
 
 # ---------------------------------------------------------------- dev (CPU; after the decision)
+
+def _fold_draws(folds, n_boot: int, seed: int):
+    """Study-bootstrap weights inside each test fold, as intervals.within_fold_bootstrap draws them."""
+    f = np.asarray(folds)
+    parts = [np.flatnonzero(f == k) for k in np.unique(f) if k >= 0]
+    rng = np.random.default_rng(seed)
+    for _ in range(n_boot):
+        w = np.zeros(len(f))
+        for rows in parts:
+            w += np.bincount(rng.choice(rows, size=len(rows)), minlength=len(f))
+        yield w
+
 
 def _decision(decision_record, root=None) -> dict:
     """The written decision: decision()'s output as a dict, its JSON text, the path of its file, or (None)
@@ -1697,8 +1764,8 @@ def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, si
                             "keep": {e: dec["encoders"][e]["keep"] for e in dec["encoders_run"]}}}
     with common.notebook(f"{NAME}_dev", {"decision_sha256": dec["sha256"], "n_boot": int(n_boot), "seed": seed},
                          quiet=quiet, budget_h=budget_h):
-        units = find_units(root)
         encs = list(dec["encoders_run"])
+        units = {key: ud for key, ud in find_units(root).items() if key[0] in encs}
         want = dec["prediction_files_sha16"]
         if {_unit(e, k) for e, k in units} != set(want):
             raise ValueError("dev: the attached units are not the ones the decision was written on")
@@ -1711,9 +1778,10 @@ def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, si
                     data.setdefault(e, {}).setdefault(fname[len("pred_"):-len(".csv")], []).append(_read_rows(ud / fname))
         find = list(range(len(FINDINGS)))
         arms_of = {e: {a: {k: np.concatenate([x[k] for x in parts]) for k in ("uid", "P", "Y", "fold", "resolved")}
-                       for a, parts in data[e].items()} for e in encs}
+                       for a, parts in data.get(e, {}).items()} for e in encs}
         out: dict = {}
         ok_encs = []
+        draws: dict = {}
         for e in encs:
             A = arms_of[e]
             need = ("frozen0", "head_only_seed_0", "b_lite")
@@ -1732,27 +1800,41 @@ def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, si
                         "fold_stratified_macro_auc": metrics.macro(x["P"], x["Y"], x["fold"], find)}
 
             vals = {a: m(a) for a in need}
+            # study bootstrap inside each test fold (n9's secondary interval), one set of draws for every arm
+            draws[e] = np.array([[metrics.macro(A[a]["P"], A[a]["Y"], A[a]["fold"], find, w) for a in need]
+                                 for w in _fold_draws(A["frozen0"]["fold"], int(n_boot), seed)])
+            col = {a: draws[e][:, i] for i, a in enumerate(need)}
+            fs = "fold_stratified_macro_auc"
             seeds = sorted(a for a in A if a.startswith("head_only_seed_"))
             ho = [m(a)["mean_of_fold_macros"] for a in seeds]
             out[e] = {"label": DEV_LABEL, "studies": agg.count(len(A["frozen0"]["uid"])),
                       "decision_keep": dec["encoders"][e]["keep"],
-                      **{a: {k: _r(v) for k, v in vals[a].items()} for a in need},
-                      "b_lite_minus_frozen0": {k: _r(vals["b_lite"][k] - vals["frozen0"][k]) for k in vals["b_lite"]},
-                      "b_lite_minus_head_only": {k: _r(vals["b_lite"][k] - vals["head_only_seed_0"][k]) for k in vals["b_lite"]},
+                      **{a: {**{k: _r(v) for k, v in vals[a].items()}, "fold_stratified_interval": _pct(col[a])} for a in need},
+                      "b_lite_minus_frozen0": {**{k: _r(vals["b_lite"][k] - vals["frozen0"][k]) for k in vals["b_lite"]},
+                                               "fold_stratified_interval": _pct(col["b_lite"] - col["frozen0"])},
+                      "b_lite_minus_head_only": {**{k: _r(vals["b_lite"][k] - vals["head_only_seed_0"][k]) for k in vals["b_lite"]},
+                                                 "fold_stratified_interval": _pct(col["b_lite"] - col["head_only_seed_0"])},
                       "head_only_seed_values": [_r(v) for v in ho],
                       "head_only_seed_sd": _r(float(np.std(ho, ddof=1)), 5) if len(ho) >= 2 else None,
                       "head_only_seed_note": "mean of fold macros per final head-only seed: a noise description only"}
             ok_encs.append(e)
         s["encoders"] = out
+        s["interval"] = ("fold_stratified_interval: study bootstrap inside each test fold, paired across arms and "
+                         "encoders, percentile 2.5-97.5; descriptive (sites and fold models held fixed)")
+        s["n_boot"] = int(n_boot)
         s["metrics"] = {"mean_of_fold_macros": "mean over the S2 folds of each fold's macro AUC",
                         "fold_stratified_macro_auc": "pairs inside one S2 test fold, mean over the 12 findings"}
         if all(e in ok_encs for e in MAIN):
             if arms_of[DINO]["frozen0"]["uid"].tolist() != arms_of[CONV]["frozen0"]["uid"].tolist():
                 raise ValueError("dev: the two encoders hold different studies")
             d1 = {a: {k: out[DINO][a][k] - out[CONV][a][k] for k in s["metrics"]} for a in ("frozen0", "b_lite")}
+            dd = {"frozen0": draws[DINO][:, 0] - draws[CONV][:, 0], "b_lite": draws[DINO][:, 2] - draws[CONV][:, 2]}
+            ci = _pct(dd["b_lite"] - dd["frozen0"])
             s["delta1"] = {"what": "DINOv2 minus ConvNeXt-T", "label": DEV_LABEL,
-                           **{a: {k: _r(v) for k, v in d1[a].items()} for a in d1},
-                           "change": {k: _r(d1["b_lite"][k] - d1["frozen0"][k]) for k in s["metrics"]},
+                           **{a: {**{k: _r(v) for k, v in d1[a].items()}, "fold_stratified_interval": _pct(dd[a])} for a in d1},
+                           "change": {**{k: _r(d1["b_lite"][k] - d1["frozen0"][k]) for k in s["metrics"]},
+                                      "fold_stratified_interval": ci},
+                           "change_interval_excludes_0": bool(ci["lo"] is not None and (ci["lo"] > 0 or ci["hi"] < 0)),
                            "note": "a development Delta1 is not a new H1 result"}
         else:
             s["delta1"] = {"status": "not reported (needs both main encoders)"}

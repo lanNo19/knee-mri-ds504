@@ -63,6 +63,8 @@ NOTEBOOKS = {
     "n11-smoke": (True, False, False, N11_GPU_INPUTS, 3600),
     "n11-a": (True, False, False, N11_GPU_INPUTS, 43200),
     "n11-b": (True, False, False, N11_GPU_INPUTS, 43200),
+    # session c: only after a partial session, for the units it names (edit folds and encoders in cell 2)
+    "n11-c": (True, False, False, N11_GPU_INPUTS, 43200),
     "n11-decide": (False, False, False, ["n11-a", "n11-b"], 3600),
     "n11-dev": (False, False, False, ["n11-a", "n11-b", "n11-decide"], 3600),
 }
@@ -126,6 +128,9 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         s = name[-1]
         folds = {"a": "(0, 1, 2)", "b": "(3, 4)"}[s]
         return f'from knee.nb import n11; n11.run(session="{s}", folds={folds}, expect={EXPECT}, schedule="{N11_SCHEDULE}")'
+    if name == "n11-c":
+        return (f'from knee.nb import n11; n11.run(session="c", folds=(0,), encoders=("convnext_tiny",), '
+                f'expect={EXPECT}, schedule="{N11_SCHEDULE}")')
     if name == "n11-decide":
         return "from knee.nb import n11; n11.decide()"
     if name == "n11-dev":
