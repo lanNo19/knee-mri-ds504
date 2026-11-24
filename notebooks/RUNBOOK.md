@@ -481,6 +481,8 @@ N11 is Stage B-lite (it3_declaration_r3.md; Iteration plan, section 11; code kne
 |---|---|---|---|
 | knee-n11-smoke, knee-n11 | GPU T4 x2 | On (pip, and the encoder weights as in N5) | Outputs of knee-n0, **knee-n3-r**, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a. Exactly one output per upstream step. Never knee-n3, knee-n6a-smoke, a unit rerun of another fold, or an iteration-2 output. No competition data |
 
+Create knee-n11-smoke and knee-n11 as forks of knee-n5 and keep "Pin to original environment": check (b) compares fp16 features with N5's, so the image must be N5's. The smoke summary's environment (torch, timm) must equal the versions in knee-n5's run.json; if not, stop.
+
 Cell 1: COMMIT = the commit named in the planning log for N11 (the N11 code after its review). The declaration must be in the Iteration plan, section 11, before the first run (R3).
 
 Cell 2, knee-n11-smoke first (20 optimiser steps per encoder; reads no score):
@@ -500,20 +502,21 @@ Expected time: smoke 5-10 min. Full run 2.5-4.5 h with one GPU per encoder (2-3 
 Pass criteria, smoke (summary block and agg_n11_smoke.json):
 1. STEP n11_smoke: OK. status "ok (smoke: no score was read)".
 2. Per encoder: smoke.reads_no_score true; smoke.peak_memory_gb under 14; smoke.micro_batch_slices 192 (96 = 2 studies did not fit and 1 is used: say so).
-3. smoke.slices_per_s recorded for both. Under 300 for the slower encoder: the full run will use the short schedule by itself.
+3. smoke.slices_per_s recorded for both. Under 300 for the slower encoder: the full run may use the short schedule; the full run's own probe decides.
+5. smoke.late_code_paths: head_only_step, flipped_forward_finite, checkpoint_round_trip and run_json_lock all true; feature_store float16.
 4. trainable.parameters: dinov2_vits14 5.2-5.4M, convnext_tiny 4.7-4.9M (the code refuses other counts).
 
 Pass criteria, full run (summary block, agg_n11.json and run.json):
-1. STEP n11: OK. status "ok", errors empty. "STEP n11: FAILED - InvalidRun" = frozen0 check (b) failed: the run is invalid, nothing else is read, log it. A rerun changes no setting.
+1. STEP n11: OK. status "ok", errors empty. After status "failed in ...": Ablay reads private/n11/<encoder>_f0/error.log in his own browser; the agg still lists every inner run that finished. "STEP n11: FAILED - InvalidRun" = frozen0 check (b) failed: the run is invalid, nothing else is read, log it. A rerun changes no setting.
 2. frozen0 per encoder: frozen0.valid true; check_b.abs_difference at most 0.0005; check_a.max_abs_gap and check_a.min_cosine reported (fp16 noise is expected; min_cosine near 1).
 3. Counts: studies.training about 1,350; studies.inner_validation about 400 (the code refuses a group outside 300-500); trainable.parameters as in the smoke run; trainable.drop_path_max 0.
 4. schedule.name is "long" (12 epochs, rungs 3 and 12) or "short" (6 epochs, rungs 2 and 6), with schedule.slices_per_s for both encoders. "short" must be said with the result.
-5. Chosen rate recorded: run.json n11_chosen_encoder_lr.<encoder>.lr equals encoders.<encoder>.search.chosen_lr, and search.chosen_lr_in_run_json is true (the code refuses a test pass of a trained model otherwise).
+5. Chosen rate recorded: run.json n11_chosen_encoder_lr.<encoder>_f0.lr equals encoders.<encoder>.search.chosen_lr, and search.chosen_lr_in_run_json is true (the code refuses a test pass of a trained model otherwise).
 6. Search: search.rung0 has the three rates 5e-06, 2e-05 and 8e-05, each with its curve; search.rung1 has the chosen rate with resumed_from_rung0 true and a curve of 12 (or 6) epochs with train_loss, val_loss and val_macro_auc.
-7. All arms present per encoder: results.encoders.<encoder>.macro_auc has frozen0, head_only_seed_0 and b_lite_seed_0; head_only_seed_macro_aucs has 5 values; final.head_only has seed_0 to seed_4; final.b_lite has seed_0 (seed_1 only if seed1.ran is true, then for both encoders).
+7. All arms present per encoder: results.encoders.<encoder>.macro_auc has frozen0, head_only_seed_0 and b_lite_seed_0; head_only_seed_macro_aucs has 5 values; final.head_only has seed_0 to seed_4; final.b_lite has seed_0 (seed_1 only if seed1.ran is true, then for both encoders). seed1.ran false (cut, behind the budget, or seed1.failed true) must be said with the result.
 8. results.all_scored_test_studies_used true; leakage_assertion_passed true for both encoders.
 
-Cut order (only if the run is behind; each is an argument, recorded in cuts): `seed1=False`, then `side_auc=False`, then `rung1_tie=False`, then `search=False` (the registered 2e-5). Never cut: the frozen0 check, head-only, both encoders, the inner training-and-validation graph of the chosen rate. Parts can be rerun in the same session with `blocks=(...)` (probe, frozen0, search, final, seed1, combine).
+Cut order (only if the run is behind; each is an argument, recorded in cuts): `seed1=False`, then `side_auc=False`, then `rung1_tie=False`, then `search=False` (the registered 2e-5). Never cut: the frozen0 check, head-only, both encoders, the inner training-and-validation graph of the chosen rate. Parts can be rerun in the same session with `blocks=(...)` (probe, frozen0, search, final, seed1, combine). The search cannot be rerun after the final fits unless final is in the same call. After an invalid run only a call with frozen0 clears the flag.
 
 Rules for reading N11 (plan section 11, sections 6 to 8 of the declaration):
 1. results.encoders.<encoder>.reading and results.joint_reading are computed by the code in the order the plan wrote. Quote the rule with the number. Do not reread the numbers by hand.

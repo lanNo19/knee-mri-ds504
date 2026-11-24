@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import platform
 import re
 import sys
@@ -178,7 +179,9 @@ def write(name: str, payload: dict, folder: Path | None = None) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     fname = "run.json" if name == "run" else f"agg_{name}.json"
     p = folder / fname
-    p.write_text(text)
+    tmp = folder / f".{fname}.{os.getpid()}.tmp"  # same bytes, replaced in one step: a reader never sees half a file
+    tmp.write_text(text)
+    os.replace(tmp, p)
     return p
 
 

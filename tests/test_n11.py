@@ -158,23 +158,55 @@ def e2e(inputs):
     from knee.nb import n11
 
     work = inputs.parent / "w11"
-    seen = {"fit": [], "test": []}
+    seen = {"fit": [], "test": [], "rows": []}
     real_fit, real_test = heads.fit, n11.predict_test
+    where, in_test = ["-"], [0]
+
+    def spy_source(mp, cls):
+        real = cls.__call__
+
+        def call(self, rows, grad=False, flipped=False):
+            seen["rows"].append(SimpleNamespace(src=cls.__name__, stage=where[-1], in_test=bool(in_test[0]),
+                                                grad=bool(grad), flipped=bool(flipped), rows=np.asarray(rows).copy()))
+            return real(self, rows, grad=grad, flipped=flipped)
+
+        mp.setattr(cls, "__call__", call)
+
+    def spy_stage(mp, name):
+        real = getattr(n11, name)
+
+        def f(*a, **k):
+            where.append(name)
+            try:
+                return real(*a, **k)
+            finally:
+                where.pop()
+
+        mp.setattr(n11, name, f)
 
     def spy_fit(bank, cfg, train_idx, *a, **k):
         seen["fit"].append((np.asarray(train_idx).copy(), np.asarray(k.get("forbidden")).copy()))
         return real_fit(bank, cfg, train_idx, *a, **k)
 
     def spy_test(c, src, head, trained, lr=None):
+        in_test[0] += 1
+        try:
+            P = real_test(c, src, head, trained, lr)
+        finally:
+            in_test[0] -= 1
         seen["test"].append({"encoder": c.name, "trained": trained, "lr": lr,
-                             "recorded": lr is not None and n11.chosen_recorded(c.working, c.name, lr),
+                             "recorded": lr is not None and n11.chosen_recorded(c.working, c.unit, lr),
                              "rows": np.asarray(c.te_s).copy()})
-        return real_test(c, src, head, trained, lr)
+        return P
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(paths, "WORKING", work)
         mp.setattr(heads, "fit", spy_fit)
         mp.setattr(n11, "predict_test", spy_test)
+        for cls in (n11.EncSource, n11.FeatSource):
+            spy_source(mp, cls)
+        for name in ("_probe", "_frozen0", "_search", "_final", "_b_lite"):
+            spy_stage(mp, name)
         s = n11.run(root=inputs, n_boot=40, inner_val_range=None, encoder_factory=fake_factory,
                     min_slices_per_s=1e12, seed1=True, probe_micro=10, budget_h=1.0, quiet=True)
     return SimpleNamespace(s=s, work=work, seen=seen, d=stage.StageData(inputs))
@@ -206,7 +238,7 @@ def test_run_arms_checks_and_outputs(e2e):
     assert s["status"] == "ok", s.get("errors")
     assert s["schedule"]["name"] == "short" and s["schedule"]["forced"] is False  # the throughput rule fired
     assert s["schedule"]["config"] == {"epochs": 6, "rung0": 2}
-    assert s["seed1"]["ran"] is True
+    assert s["seed1"]["ran"] is True and set(s["environment"]) == {"torch", "timm"}
     res = s["results"]
     assert res["label"].startswith("development") and res["added_after_results"] is True
     te_s = d.split(0)[2]
@@ -214,6 +246,10 @@ def test_run_arms_checks_and_outputs(e2e):
     row_of = {u: i for i, u in enumerate(d.uids)}
     for e in MAIN:
         b = s["encoders"][e]
+        assert len(b["inner_validation_findings_with_both_classes"]) == 12  # names, not a rounded count
+        assert set(b["inner_validation_findings_with_both_classes"]) == set(FINDINGS)
+        assert b["inner_validation_group"] == n11.inner_group(d, d.split(0)[0]) and b["fold"] == 0
+        assert b["probe"]["steady_slices_per_s"] > 0 and b["probe"]["slices_per_s"] > 0
         # frozen0: this module's forward reproduces the head's saved predictions
         f0 = b["frozen0"]
         assert f0["valid"] is True and f0["check_b"]["passed"] is True
@@ -221,7 +257,7 @@ def test_run_arms_checks_and_outputs(e2e):
         assert f0["check_a"]["max_abs_gap"] < 0.02 and f0["check_a"]["min_cosine"] > 0.999
         ref = pd.read_csv(inputs_unit(e2e, e) / "predictions.csv").astype({UID: str})
         ref = ref[~ref["is_gold"]].set_index(UID).reindex(d.uids[te_s])[FINDINGS].to_numpy()
-        mine = pd.read_csv(e2e.work / "private" / "n11" / e / "pred_frozen0.csv").astype({UID: str})
+        mine = pd.read_csv(e2e.work / "private" / "n11" / f"{e}_f0" / "pred_frozen0.csv").astype({UID: str})
         assert [row_of[u] for u in mine[UID]] == te_s.tolist()  # scored test rows only; no gold row
         assert np.abs(mine[FINDINGS].to_numpy() - ref).max() < 2e-3
         m = res["encoders"][e]["macro_auc"]
@@ -247,8 +283,8 @@ def test_run_arms_checks_and_outputs(e2e):
         # scores: every arm, the differences, the reading
         r = res["encoders"][e]
         assert len(r["head_only_seed_macro_aucs"]) == 5 and r["head_only_seed_sd"] is not None
-        bl = pd.read_csv(e2e.work / "private" / "n11" / e / "pred_b_lite_seed_0.csv")[FINDINGS].to_numpy()
-        bl1 = pd.read_csv(e2e.work / "private" / "n11" / e / "pred_b_lite_seed_1.csv")[FINDINGS].to_numpy()
+        bl = pd.read_csv(e2e.work / "private" / "n11" / f"{e}_f0" / "pred_b_lite_seed_0.csv")[FINDINGS].to_numpy()
+        bl1 = pd.read_csv(e2e.work / "private" / "n11" / f"{e}_f0" / "pred_b_lite_seed_1.csv")[FINDINGS].to_numpy()
         assert m["b_lite_seed_0"]["estimate"] == pytest.approx(_macro(bl, Y), abs=6e-5)
         assert m["b_lite"] == pytest.approx((_macro(bl, Y) + _macro(bl1, Y)) / 2, abs=1e-4)
         assert r["b_lite_minus_frozen0"]["estimate"] == pytest.approx(m["b_lite"] - m["frozen0"]["estimate"], abs=2e-4)
@@ -280,7 +316,7 @@ def test_chosen_rate_is_recorded_before_any_trained_test_pass(e2e):
     run_json = json.loads((e2e.work / "run.json").read_text())
     for e in MAIN:
         chosen = e2e.s["encoders"][e]["search"]["chosen_lr"]
-        assert run_json["n11_chosen_encoder_lr"][e]["lr"] == chosen
+        assert run_json["n11_chosen_encoder_lr"][f"{e}_f0"]["lr"] == chosen
         calls = [c for c in e2e.seen["test"] if c["encoder"] == e]
         assert [c["trained"] for c in calls] == [False] + [True] * 7  # frozen0, head-only x 5, b-lite seeds 0 and 1
         assert all(c["recorded"] and c["lr"] == chosen for c in calls if c["trained"])
@@ -346,7 +382,11 @@ def test_smoke_reads_no_score(inputs, tmp_path, monkeypatch):
     for e in MAIN:
         sm = s["encoders"][e]["smoke"]
         assert sm["optimiser_steps"] == 20 and sm["slices_per_s"] > 0 and sm["reads_no_score"] is True
+        late = sm["late_code_paths"]  # what otherwise first runs hours into the full run
+        assert late == {"feature_store": "float32", "head_only_step": True, "flipped_forward_finite": True,
+                        "checkpoint_round_trip": True, "run_json_lock": True}
         assert set(s["encoders"][e]) & {"frozen0", "search", "final"} == set()
+    assert s["environment"]["torch"] and "n11_chosen_encoder_lr" not in json.loads((tmp_path / "w" / "run.json").read_text())
     assert (tmp_path / "w" / "agg_n11_smoke.json").exists() and not (tmp_path / "w" / "agg_n11.json").exists()
 
 
@@ -446,7 +486,7 @@ def test_trained_model_is_refused_on_the_test_fold_until_the_rate_is_recorded(ct
         n11.predict_test(ctx, ctx.src, head, trained=True, lr=2e-5)
     with pytest.raises(AssertionError):
         n11.predict_test(ctx, ctx.src, head, trained=True)
-    n11.record_chosen(ctx.working, ctx.name, {"lr": 2e-5, "reason": "test"})
+    n11.record_chosen(ctx.working, ctx.unit, {"lr": 2e-5, "reason": "test"})
     with pytest.raises(AssertionError):  # another rate than the recorded one
         n11.predict_test(ctx, ctx.src, head, trained=True, lr=8e-5)
     P = n11.predict_test(ctx, ctx.src, head, trained=True, lr=2e-5)
@@ -481,6 +521,10 @@ def test_tie_rules():
     # exactly 0.005 apart is a tie; 0.0051 is not (4 decimals)
     assert n11.select_rung0({lo: 0.70, mid: 0.755, hi: 0.76})["tied"] is True
     assert n11.select_rung0({lo: 0.70, mid: 0.7549, hi: 0.76})["tied"] is False
+    # three inside 0.005: the third is dropped by order, and the note says so
+    three = n11.select_rung0({lo: 0.758, mid: 0.757, hi: 0.76})
+    assert three["continue"] == [lo, hi] and "third rate" in three["note"]
+    assert "third rate" not in n11.select_rung0({lo: 0.70, mid: 0.757, hi: 0.76})["note"]
     # the cut "rung 1 for a tied pair": the fallback alone continues
     assert n11.select_rung0({lo: 0.70, mid: 0.757, hi: 0.76}, rung1_tie=False)["continue"] == [mid]
     assert n11.select_rung0({lo: 0.76, mid: 0.70, hi: 0.758}, rung1_tie=False)["continue"] == [lo]
@@ -548,6 +592,313 @@ def test_cuts_search_and_seed1(inputs, tmp_path, monkeypatch):
     r = s["results"]
     assert r["encoders"][MAIN[1]]["macro_auc"]["b_lite_is"] == "seed 0" and r["joint_reading"] == "not available"
     assert r["delta1_fold0"]["status"].startswith("not available") and r["side_discrimination"]["status"].startswith("cut")
+
+
+# ---------------------------------------------------------------- review r1: T1 to T5
+
+def test_t2_rows_each_stage_sees(e2e):
+    """Row spy on both feature sources for the full run: which studies each stage forwards, with or without a graph."""
+    d = e2e.d
+    tr, te, te_s = d.split(0)
+    from knee.nb import n11
+
+    itr, iva_all, iva = n11.inner_split(d, tr)
+    S = {k: set(v.tolist()) for k, v in (("tr", tr), ("te", te), ("te_s", te_s), ("itr", itr), ("iva", iva))}
+    gold = set(d.gold_rows().tolist())
+    log = e2e.seen["rows"]
+    assert {x.stage for x in log} == {"_probe", "_frozen0", "_search", "_final", "_b_lite"}
+    trained_on = {e: set() for e in ("_final", "_b_lite")}
+    for x in log:
+        rows = set(x.rows.tolist())
+        assert rows <= S["tr"] | S["te_s"] and not rows & gold  # never gold, never an unscored test study
+        if rows & S["te"]:  # test rows: only inside predict_test, or the frozen0 feature build
+            assert x.in_test or (x.stage == "_frozen0" and x.src == "EncSource" and not x.grad)
+        if x.flipped:
+            assert x.in_test or x.stage == "_frozen0"
+        if x.stage in ("_probe", "_search"):  # rung runs: inner training rows with a graph, validation rows without
+            assert x.src == "EncSource" and not x.in_test and not x.flipped
+            assert rows <= (S["itr"] if x.grad else S["iva"])
+        elif x.stage == "_frozen0":
+            assert not x.grad
+        elif x.in_test:
+            assert rows <= S["te_s"] and not x.grad
+        else:  # the final fits' training passes: the outer training rows only
+            assert rows <= S["tr"] and x.src == ("FeatSource" if x.stage == "_final" else "EncSource")
+            assert x.grad is (x.stage == "_b_lite")
+            trained_on[x.stage] |= rows
+    assert trained_on["_final"] == S["tr"] and trained_on["_b_lite"] == S["tr"]
+    assert any(x.grad for x in log if x.stage == "_search") and any(not x.grad for x in log if x.stage == "_search")
+    assert not any(x.stage == "_probe" and not x.grad for x in log)  # the probe makes no validation pass
+
+
+def test_t3_loop_equals_heads_fit_at_dropout_0(ctx):
+    """This module's loop on cached features against heads.fit: loss normalisation, pos_weight, batch order
+    and schedule in one comparison (same seed, 3 epochs, batch 17)."""
+    from dataclasses import replace
+
+    from knee import heads
+    from knee.nb import n11
+
+    c = copy.copy(ctx)
+    c.cfg = replace(ctx.cfg, dropout=0.0, batch_size=17)
+    rows = ctx.tr
+    torch.default_generator.manual_seed(0)  # the head heads.fit builds for seed 0
+    init = {k: v.clone() for k, v in heads.make_head(c.cfg, c.dim, 3).state_dict().items()}
+    ref = heads.fit(c.bank, c.cfg, rows, epochs=3, stats=c.stats, forbidden=c.forbid_outer, seed=0)
+    want = heads.predict(c.bank, ref.model, rows, c.cfg, c.stats, use_flip=False)
+    rt = torch.as_tensor(rows)
+    feat = n11.FeatSource(c.d.n, rows, {p: c.bank.x[p][rt] for p in c.planes}, [], {}, c.planes)
+    for micro in (2, 5, 16):
+        c.micro = micro
+        r = n11.new_run(c, feat, init, rows, 0.0, heads.MAX_EPOCHS, 0, with_encoder=False)
+        n11.run_epochs(c, r, 3)
+        assert r.step == ref.steps_run
+        got = n11.predict(c, feat, r.head, rows, use_flip=False)
+        assert np.abs(got - want).max() < 1e-5, micro
+
+
+def _hand_made(work: Path, d, arms: dict, listed: dict) -> None:
+    """Prediction files and a state per encoder: arms {encoder: {arm: P}}, listed {encoder: [arms in the state]}."""
+    te_s = d.split(0)[2]
+    for e, pa in arms.items():
+        ed = work / "private" / "n11" / f"{e}_f0"
+        ed.mkdir(parents=True, exist_ok=True)
+        for arm, P in pa.items():
+            df = pd.DataFrame(P, columns=FINDINGS)
+            df.insert(0, "s2_fold", 0)
+            df.insert(0, UID, d.uids[te_s])
+            df.to_csv(ed / f"pred_{arm}.csv", index=False)
+        st = {"frozen0": {"valid": "frozen0" in listed[e]},
+              "final": {"head_only": {a[len("head_only_"):]: {} for a in listed[e] if a.startswith("head_only")},
+                        "b_lite": {a[len("b_lite_"):]: {} for a in listed[e] if a.startswith("b_lite")}}}
+        (ed / "state.json").write_text(json.dumps(st))
+
+
+def test_t4_combine_on_hand_made_predictions(inputs, tmp_path):
+    from knee import stage
+    from knee.nb import n11
+
+    d = stage.StageData(inputs)
+    te_s = d.split(0)[2]
+    Y = d.eval_y[te_s]
+    rng = np.random.default_rng(7)
+
+    def pred(strength):
+        return 1 / (1 + np.exp(-(strength * (Y - 0.3) * 3 + rng.normal(0, 1, Y.shape))))
+
+    a, b = MAIN
+    arms = {e: {"frozen0": pred(0.8), **{f"head_only_seed_{k}": pred(1.0) for k in range(5)},
+                "b_lite_seed_0": pred(1.6), "b_lite_seed_1": pred(1.6)} for e in MAIN}
+    arms[b]["b_lite_seed_0"] = arms[b]["frozen0"].copy()  # identical arms: the paired difference is exactly 0
+    base = ["frozen0"] + [f"head_only_seed_{k}" for k in range(5)] + ["b_lite_seed_0"]
+    # 1. seed 1 listed for one encoder only (the other's file exists but its state does not list it): seed 0 for both
+    w1 = tmp_path / "w1"
+    _hand_made(w1, d, arms, {a: base + ["b_lite_seed_1"], b: base})
+    r = n11.combine(d, w1, MAIN, n_boot=30, side_auc=False)
+    assert r["status"] == "ok" and r["seed_1_ignored_for"] == [a]
+    for e in MAIN:
+        m, x = r["encoders"][e]["macro_auc"], r["encoders"][e]
+        ho = [_macro(arms[e][f"head_only_seed_{k}"], Y) for k in range(5)]
+        assert m["b_lite_is"] == "seed 0" and m["b_lite_seed_1"] is None
+        assert m["b_lite"] == pytest.approx(_macro(arms[e]["b_lite_seed_0"], Y), abs=6e-5)
+        assert x["head_only_seed_macro_aucs"] == pytest.approx(ho, abs=6e-5)
+        assert x["head_only_seed_sd"] == pytest.approx(np.std(ho, ddof=1), abs=2e-5)  # the sample SD of 5 seeds
+        f0 = _macro(arms[e]["frozen0"], Y)
+        assert x["stricter_baseline"] == ("frozen0" if f0 >= ho[0] else "head_only")
+        assert x["effect"]["estimate"] == pytest.approx(_macro(arms[e]["b_lite_seed_0"], Y) - max(f0, ho[0]), abs=1e-4)
+    z = r["encoders"][b]["b_lite_minus_frozen0"]
+    assert (z["estimate"], z["lo"], z["hi"]) == (0.0, 0.0, 0.0)  # the same draws for both arms
+    assert r["delta1_fold0"]["b_lite_is"] == "seed 0"
+    # 2. seed 1 listed for both: the mean of the two seeds' macro AUCs, for the reading and for Delta1
+    w2 = tmp_path / "w2"
+    _hand_made(w2, d, arms, {e: base + ["b_lite_seed_1"] for e in MAIN})
+    r = n11.combine(d, w2, MAIN, n_boot=30, side_auc=False)
+    assert "seed_1_ignored_for" not in r and r["delta1_fold0"]["b_lite_is"] == "the mean of seeds 0 and 1"
+    means = {e: (_macro(arms[e]["b_lite_seed_0"], Y) + _macro(arms[e]["b_lite_seed_1"], Y)) / 2 for e in MAIN}
+    for e in MAIN:
+        assert r["encoders"][e]["macro_auc"]["b_lite"] == pytest.approx(means[e], abs=1e-4)
+    f = {e: _macro(arms[e]["frozen0"], Y) for e in MAIN}
+    assert r["delta1_fold0"]["change"]["estimate"] == pytest.approx((means[a] - means[b]) - (f[a] - f[b]), abs=2e-4)
+    # 3. an arm the state does not list is never loaded, even if its file is there
+    w3 = tmp_path / "w3"
+    _hand_made(w3, d, arms, {a: base, b: [x for x in base if x != "b_lite_seed_0"]})
+    r = n11.combine(d, w3, MAIN, n_boot=30, side_auc=False)
+    assert set(r["encoders"]) == {a} and r["status"].startswith("ok (an encoder has no result")
+    assert r["joint_reading"] == "not available" and r["delta1_fold0"]["status"].startswith("not available")
+    # 4. a diverged fit: that encoder gets a status, the other one is still read
+    bad = {e: dict(v) for e, v in arms.items()}
+    bad[b]["b_lite_seed_0"] = np.full_like(Y, np.nan, dtype=float)
+    w4 = tmp_path / "w4"
+    _hand_made(w4, d, bad, {e: base for e in MAIN})
+    r = n11.combine(d, w4, MAIN, n_boot=30, side_auc=False)
+    assert r["encoders"][b] == {"status": "b-lite predictions not finite"} and "reading" in r["encoders"][a]
+    bad[a]["b_lite_seed_0"] = bad[b]["b_lite_seed_0"]
+    _hand_made(w4, d, bad, {e: base for e in MAIN})
+    assert n11.combine(d, w4, MAIN, n_boot=30, side_auc=False)["status"].startswith("not available")
+
+
+def _one(inputs, **kw):
+    """A run of one encoder under the short schedule without a search (the registered rate)."""
+    from knee.nb import n11
+
+    args = {"root": inputs, "encoders": (MAIN[1],), "n_boot": 20, "inner_val_range": None,
+            "encoder_factory": fake_factory, "search": False, "side_auc": False, "quiet": True, "probe_micro": 4,
+            "min_slices_per_s": 1e12}
+    return n11.run(**{**args, **kw})
+
+
+def test_t1_stale_files_and_search_after_final(inputs, tmp_path, monkeypatch):
+    from knee import paths, safe_log
+
+    work = tmp_path / "w"
+    monkeypatch.setattr(paths, "WORKING", work)
+    e = MAIN[1]
+    ed = work / "private" / "n11" / f"{e}_f0"
+    s = _one(inputs, seed1=True)
+    assert s["results"]["encoders"][e]["macro_auc"]["b_lite_is"] == "the mean of seeds 0 and 1"
+    assert (ed / "pred_b_lite_seed_1.csv").exists() and (ed / "b_lite_seed_1.pt").exists()
+    # a second full run in the same folder without seed 1: nothing of the first call is combined
+    s = _one(inputs, seed1=False)
+    assert s["status"] == "ok" and s["results"]["encoders"][e]["macro_auc"]["b_lite_is"] == "seed 0"
+    assert not (ed / "pred_b_lite_seed_1.csv").exists() and not (ed / "b_lite_seed_1.pt").exists()
+    assert set(s["encoders"][e]["final"]["b_lite"]) == {"seed_0"} and not list(ed.glob("rung0_*.pt"))
+    # a prediction file that the state does not list is not combined
+    shutil.copy(ed / "pred_b_lite_seed_0.csv", ed / "pred_b_lite_seed_1.csv")
+    s = _one(inputs, blocks=("combine",))
+    assert s["results"]["encoders"][e]["macro_auc"]["b_lite_is"] == "seed 0"
+    # the search cannot be rerun after the final fits
+    with pytest.raises(safe_log.StepFailed):
+        _one(inputs, blocks=("search",))
+    a = json.loads((work / "agg_n11.json").read_text())
+    assert a["status"].startswith("failed in") and a["errors"][e].startswith("AssertionError at n11.py")
+    assert set(a["encoders"][e]["final"]["b_lite"]) == {"seed_0"}  # the finished runs are still reported
+    assert "5e-06" not in json.dumps(a["encoders"][e]["search"]["rung0"])
+    # with "final" in the same call it may: the earlier final files go first, the record is a new one
+    s = _one(inputs, blocks=("search", "final", "combine"))
+    assert s["status"] == "ok" and not (ed / "pred_b_lite_seed_1.csv").exists()
+    rec = json.loads((work / "run.json").read_text())["n11_chosen_encoder_lr"][f"{e}_f0"]
+    assert rec["before_any_test_pass_of_a_trained_model"] is True and "copied_from" not in rec
+    # a later call that only reads the state copies the rate, without that claim
+    _one(inputs, blocks=("seed1", "combine"), seed1=True)
+    rec = json.loads((work / "run.json").read_text())["n11_chosen_encoder_lr"][f"{e}_f0"]
+    assert "copied_from" in rec and "before_any_test_pass_of_a_trained_model" not in rec
+
+
+def test_t5_two_processes(inputs, tmp_path, monkeypatch):
+    from knee import paths
+    from knee.nb import n11
+
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "w")
+    s = n11.run(root=inputs, n_boot=20, inner_val_range=None, encoder_factory=fake_factory, schedule="short",
+                blocks=("frozen0", "search", "final", "seed1", "combine"), search=False, seed1=False,
+                side_auc=False, processes=True, devices=["cpu", "cpu"], quiet=True)
+    assert s["status"] == "ok" and s["processes"] == "one per encoder"
+    rj = json.loads((tmp_path / "w" / "run.json").read_text())["n11_chosen_encoder_lr"]
+    assert set(rj) == {f"{e}_f0" for e in MAIN} and all(v["lr"] == 2e-5 for v in rj.values())
+    assert set(s["results"]["encoders"]) == set(MAIN) and "change" in s["results"]["delta1_fold0"]
+
+
+def test_t5_invalid_flag_stops_a_search_in_progress_and_stays(inputs, tmp_path, monkeypatch):
+    """One encoder fails check (b) while the other is in its search: the search stops before its next run.
+    The flag stays until a call reruns frozen0."""
+    from knee import paths, safe_log
+    from knee.nb import n11
+
+    work = tmp_path / "w"
+    monkeypatch.setattr(paths, "WORKING", work)
+    started, real_new, real_epochs = [], n11.new_run, n11.run_epochs
+
+    def new_run(*a, **k):
+        started.append(1)
+        return real_new(*a, **k)
+
+    def run_epochs(c, r, until, limit=None):  # the other encoder's process fails its check during this run
+        real_epochs(c, r, until, limit)
+        n11._invalid_flag(c.working).write_text("frozen0 check (b) failed\n")
+
+    monkeypatch.setattr(n11, "new_run", new_run)
+    monkeypatch.setattr(n11, "run_epochs", run_epochs)
+    with pytest.raises(safe_log.StepFailed):
+        _one(inputs, search=True, schedule="short", blocks=("frozen0", "search", "final", "combine"))
+    a = json.loads((work / "agg_n11.json").read_text())
+    assert a["status"].startswith("invalid") and set(a["encoders"][MAIN[1]]) == {"frozen0"} and "results" not in a
+    assert len(started) == 1  # the first rung-0 run only
+    monkeypatch.setattr(n11, "run_epochs", real_epochs)
+    for blocks in (("search",), ("final", "combine"), ("combine",)):  # the flag is not cleared by a later call
+        with pytest.raises(safe_log.StepFailed):
+            _one(inputs, schedule="short", blocks=blocks)
+        assert json.loads((work / "agg_n11.json").read_text())["status"].startswith("invalid")
+    assert len(started) == 1 and n11._invalid_flag(work).exists()
+    s = _one(inputs, schedule="short", blocks=("frozen0", "search", "final", "combine"))  # a new frozen0 check clears it
+    assert s["status"] == "ok" and not n11._invalid_flag(work).exists()
+
+
+def test_t5_a_failed_seed1_keeps_the_seed0_result(inputs, tmp_path, monkeypatch):
+    from knee import paths
+    from knee.nb import n11
+
+    work = tmp_path / "w"
+    monkeypatch.setattr(paths, "WORKING", work)
+    real = n11._b_lite
+
+    def b_lite(c, task, st, seed):
+        real(c, task, st, seed)
+        if seed == 1:  # after its files are written: they must be removed again
+            raise RuntimeError("synthetic failure in the seed-1 phase")
+
+    monkeypatch.setattr(n11, "_b_lite", b_lite)
+    s = _one(inputs, schedule="short", blocks=("frozen0", "search", "final", "seed1", "combine"), seed1=True)
+    e = MAIN[1]
+    assert s["status"] == "ok" and s["seed1"]["ran"] is False and s["seed1"]["failed"] is True
+    assert s["seed1"]["errors"][e].startswith("RuntimeError at") and "errors" not in s
+    assert s["results"]["encoders"][e]["macro_auc"]["b_lite_is"] == "seed 0"
+    assert set(s["encoders"][e]["final"]["b_lite"]) == {"seed_0"}
+    assert not (work / "private" / "n11" / f"{e}_f0" / "pred_b_lite_seed_1.csv").exists()
+
+
+def test_stage_a_unit_is_pinned_and_its_schedule_is_passed(inputs, tmp_path, monkeypatch):
+    from knee import heads
+    from knee.nb import n11
+
+    inp = tmp_path / "input"
+    shutil.copytree(inputs, inp)
+    cfg_path = inp / "n6a" / "private" / "n6a" / "units" / f"{MAIN[0]}_f0" / "config.json"
+    cj = json.loads(cfg_path.read_text())
+    seen = []
+    real = heads.fit
+    monkeypatch.setattr(heads, "fit", lambda *a, **k: (seen.append(k.get("schedule_epochs")), real(*a, **k))[1])
+    for value, passed in ((None, None), (30, None), (8, 8)):
+        cfg_path.write_text(json.dumps({**cj, **({} if value is None else {"schedule_epochs": value})}))
+        c = n11._context(_task(inp, tmp_path / "w"))
+        n11.inner_refit(c)
+        assert c.stage_a_schedule == passed and seen[-1] == passed
+    with pytest.raises(FileNotFoundError):  # the unit is looked up by fold: fold 1 has none here
+        n11._context({**_task(inp, tmp_path / "w"), "fold": 1})
+    (inp / "n6a" / "private" / "n6a").rename(inp / "n6a" / "private" / "n13_a1")  # an iteration-2 unit
+    with pytest.raises(AssertionError):
+        n11._context(_task(inp, tmp_path / "w"))
+
+
+def test_an_interrupt_is_not_swallowed(inputs, tmp_path, monkeypatch):
+    from knee.nb import n11
+
+    def stop(task):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(n11, "_context", stop)
+    with pytest.raises(KeyboardInterrupt):
+        n11._task({**_task(inputs, tmp_path / "w"), "phase": "main", "blocks": ["frozen0"]})
+    assert (tmp_path / "w" / "private" / "n11" / f"{MAIN[0]}_f0" / "error.log").exists()
+
+
+def test_agg_write_is_atomic_and_writes_the_same_bytes(tmp_path):
+    from knee import agg
+
+    payload = {"a": 0.5, "fold": 1, "counts": [10, "<5"], "note": "text"}
+    p = agg.write("x", payload, folder=tmp_path)
+    assert p.read_text() == json.dumps(payload, indent=1, sort_keys=False, default=agg._json_default)
+    assert [q.name for q in tmp_path.iterdir()] == ["agg_x.json"]  # no temporary file is left
+    assert agg.write("run", payload, folder=tmp_path).name == "run.json"
 
 
 # ---------------------------------------------------------------- the real split (needs timm; no download)

@@ -37,6 +37,8 @@ from __future__ import annotations
 import fcntl
 import json
 import math
+import os
+import tempfile
 import multiprocessing as mp
 import time
 import traceback
@@ -314,33 +316,57 @@ class FeatSource:
 
 # ---------------------------------------------------------------- one encoder's context
 
-def _enc_dir(working, enc: str) -> Path:
-    p = Path(working) / "private" / NAME / enc
+FINAL_FILES = ("pred_head_only_*.csv", "pred_b_lite_*.csv", "b_lite_seed_*.pt")  # what the final fits write
+RUN_FILES = ("state.json", "pred_*.csv", "b_lite_seed_*.pt", "rung0_*.pt")  # everything a unit writes
+
+
+def _unit(enc: str, fold: int = 0) -> str:
+    """A unit is one encoder on one outer fold (as Stage A's units): its folder and its run.json key."""
+    return f"{enc}_f{int(fold)}"
+
+
+def _enc_dir(working, enc: str, fold: int = 0) -> Path:
+    p = Path(working) / "private" / NAME / _unit(enc, fold)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def _load_state(working, enc: str) -> dict:
-    p = _enc_dir(working, enc) / "state.json"
+def _clean(working, enc: str, fold: int, patterns) -> None:
+    d = _enc_dir(working, enc, fold)
+    for pat in patterns:
+        for p in d.glob(pat):
+            p.unlink(missing_ok=True)
+
+
+def _load_state(working, enc: str, fold: int = 0) -> dict:
+    p = _enc_dir(working, enc, fold) / "state.json"
     return json.loads(p.read_text()) if p.exists() else {}
 
 
-def _save_state(working, enc: str, st: dict) -> None:
+def _save_state(working, enc: str, st: dict, fold: int = 0) -> None:
     text = json.dumps(st, indent=1, default=agg._json_default)
     agg._check(json.loads(text))  # the state becomes agg_n11.json's encoder block: aggregates only
-    (_enc_dir(working, enc) / "state.json").write_text(text)
+    p = _enc_dir(working, enc, fold) / "state.json"
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")  # atomic: a reader never sees half a file
+    tmp.write_text(text)
+    os.replace(tmp, p)
 
 
 def inner_split(d, tr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(inner training rows, the inner validation group's rows, its scored rows): the validation group is
     the largest g_lang group of the training set (ties: the first name in sorted order)."""
     g = d.g_lang[tr].astype(str)
-    names, cnt = np.unique(g, return_counts=True)
-    if len(names) < 2:
-        raise ValueError("the training set needs at least two site groups for an inner split")
-    G = names[int(np.argmax(cnt))]
+    G = inner_group(d, tr)
     iva_all = tr[g == G]
     return tr[g != G], iva_all, iva_all[d.scored[iva_all]]
+
+
+def inner_group(d, tr: np.ndarray) -> str:
+    """The g_lang value of the inner validation group (the largest group of the training set)."""
+    names, cnt = np.unique(d.g_lang[tr].astype(str), return_counts=True)
+    if len(names) < 2:
+        raise ValueError("the training set needs at least two site groups for an inner split")
+    return str(names[int(np.argmax(cnt))])
 
 
 def _context(task: dict):
@@ -351,27 +377,34 @@ def _context(task: dict):
     base = root or paths.INPUT
     enc_name, dev = task["encoder"], torch.device(task["device"])
     d = stage.StageData(root, task.get("expect"))
-    c = SimpleNamespace(d=d, name=enc_name, device=dev, amp=dev.type == "cuda", working=Path(task["working"]),
+    fold = int(task.get("fold") or 0)
+    c = SimpleNamespace(d=d, name=enc_name, fold=fold, unit=_unit(enc_name, fold), device=dev,
+                        amp=dev.type == "cuda", working=Path(task["working"]),
                         micro=int(task.get("micro") or MICRO), eval_studies=int(task.get("eval_studies") or 4))
-    c.tr, c.te, c.te_s = d.split(0)
+    c.tr, c.te, c.te_s = d.split(fold)
     c.gold = d.gold_rows()
     if d.is_gold[c.tr].any() or d.is_gold[c.te].any():
-        raise AssertionError("a gold study is in the fold-0 training or test set")
+        raise AssertionError("a gold study is in the fold's training or test set")
     c.itr, c.iva_all, c.iva = inner_split(d, c.tr)
+    c.iva_group = inner_group(d, c.tr)
     rng = task.get("inner_val_range")
     if rng and not rng[0] <= len(c.iva_all) <= rng[1]:
         raise AssertionError("the inner validation group is not about 400 studies")
     c.forbid_outer = np.concatenate([c.te, c.gold])  # every fit: test rows and gold rows
     c.forbid_inner = np.concatenate([c.iva_all, c.te, c.gold])  # the inner refit: validation rows too
-    ud = unit_files.unit_dirs(base).get((enc_name, 0))
+    ud = unit_files.unit_dirs(base).get((enc_name, fold))
     if ud is None:
-        raise FileNotFoundError("the fold-0 Stage A unit is not attached")
+        raise FileNotFoundError("the fold's Stage A unit is not attached")
+    if ud.parent.parent.name != "n6a":  # private/n6a/units/<encoder>_f<k>: never an iteration-2 unit or a rerun
+        raise AssertionError("the Stage A unit must be knee-n6a's")
     c.unit_dir = ud
-    c.chain = unit_files.check_units(d, {(enc_name, 0): ud})
+    c.chain = unit_files.check_units(d, {(enc_name, fold): ud})
     if not c.chain["s2_folds_match_units"]:
         raise unit_files.ChainError("the Stage A unit does not match the attached S2 folds")
     cj = json.loads((ud / "config.json").read_text())
     c.cfg, c.E = heads.config_from(cj["config"]), int(cj["E"])
+    se = cj.get("schedule_epochs")  # the unit's schedule length (n6._unit); the registered 30 is passed as None
+    c.stage_a_schedule = None if se is None or int(se) == heads.MAX_EPOCHS else int(se)
     c.planes = heads.PLANE_SETS[c.cfg.planes]
     c.caches, c.upstream_n4 = {}, {}
     for p in c.planes:
@@ -404,7 +437,8 @@ def inner_refit(c):
     """The head the inner runs start from: fold 0's Stage A config and E, seed 0, the cached N5 embeddings,
     the fixed Stage A statistics, on the inner training rows only. Forbidden: the validation group's rows,
     the test rows and the gold rows (the leakage guard raises if one reaches the fit)."""
-    r = heads.fit(c.bank, c.cfg, c.itr, epochs=c.E, stats=c.stats, forbidden=c.forbid_inner, seed=0)
+    r = heads.fit(c.bank, c.cfg, c.itr, epochs=c.E, stats=c.stats, forbidden=c.forbid_inner, seed=0,
+                  schedule_epochs=c.stage_a_schedule)
     state = {k: v.detach().cpu().clone() for k, v in r.model.state_dict().items()}
     if all(bool((state[k] == c.head_state[k]).all()) for k in state):
         raise AssertionError("the inner refit equals Stage A's head")
@@ -458,7 +492,7 @@ def new_run(c, src, head_state: dict, rows, lr_enc: float, schedule_epochs: int,
     r = SimpleNamespace(src=src, rows=np.asarray(rows), lr_enc=float(lr_enc), sched_epochs=int(schedule_epochs),
                         seed=int(seed), val_rows=None if val_rows is None else np.asarray(val_rows),
                         with_encoder=bool(with_encoder), step=0, epoch=0, history=[], slices=0, train_s=0.0,
-                        skipped=0)
+                        skipped=0, clock=None)
     dev = c.device
     r.head = heads.make_head(c.cfg, c.dim, len(c.planes))
     r.head.load_state_dict(head_state)
@@ -524,6 +558,9 @@ def batch_backward(c, r, b: np.ndarray, micro: int | None = None, limit: int | N
         z_sum += sum(z.detach().abs().mean() for z in zs) / len(zs)
         done += 1
         r.slices += len(mb) * c.S * len(c.planes)
+        if r.clock is not None:  # the probe: a time stamp per micro-batch
+            _sync(dev)
+            r.clock.append((time.time(), r.slices))
         if limit is not None and done >= limit:
             break
     return loss_sum, w_raw, z_sum, done
@@ -700,10 +737,12 @@ def select_rung0(scores: dict, rung1_tie: bool = True) -> dict:
     top = order[0]
     if len(order) > 1 and _tied(_score4(scores[top]), _score4(scores[order[1]])):
         pair = sorted([top, order[1]])
+        third = (len(order) > 2 and _tied(_score4(scores[top]), _score4(scores[order[2]])))
+        more = "; a third rate within 0.005 was dropped by order (score, then 2e-5, then the lower)" if third else ""
         if rung1_tie:
-            return {"continue": pair, "tied": True, "note": "top two within 0.005: both continue"}
+            return {"continue": pair, "tied": True, "note": "top two within 0.005: both continue" + more}
         return {"continue": [tie_fallback(pair)], "tied": True, "pair": pair,
-                "note": "top two within 0.005; rung 1 for the pair was cut: the tie fallback continues"}
+                "note": "top two within 0.005; rung 1 for the pair was cut: the tie fallback continues" + more}
     return {"continue": [top], "tied": False, "note": "the best rung-0 rate continues"}
 
 
@@ -763,7 +802,8 @@ def joint_reading(readings: dict) -> str:
 # ---------------------------------------------------------------- run.json: the chosen rate
 
 def record_chosen(working, enc: str, rec: dict) -> None:
-    """Write one encoder's chosen learning rate into run.json (both encoders' processes write it: locked)."""
+    """Write one unit's chosen learning rate into run.json under its key (_unit; both encoders' processes
+    write it: locked, and agg.write replaces the file atomically, so a reader never sees half a file)."""
     working = Path(working)
     lock = working / "private" / NAME / "run.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -786,16 +826,16 @@ def chosen_recorded(working, enc: str, lr: float) -> bool:
 def predict_test(c, src, head, trained: bool, lr: float | None = None) -> np.ndarray:
     """The fold-0 scored test studies, with flip averaging. A trained model is refused until the chosen
     learning rate stands in run.json."""
-    if trained and (lr is None or not chosen_recorded(c.working, c.name, lr)):
+    if trained and (lr is None or not chosen_recorded(c.working, c.unit, lr)):
         raise AssertionError("the chosen learning rate must be in run.json before a trained model sees the test fold")
     return predict(c, src, head, c.te_s, use_flip=True)
 
 
 def _save_pred(c, arm: str, P: np.ndarray) -> None:
     df = pd.DataFrame(P, columns=FINDINGS)
-    df.insert(0, "s2_fold", 0)
+    df.insert(0, "s2_fold", c.fold)
     df.insert(0, UID, c.d.uids[c.te_s])
-    df.to_csv(_enc_dir(c.working, c.name) / f"pred_{arm}.csv", index=False)
+    df.to_csv(_enc_dir(c.working, c.name, c.fold) / f"pred_{arm}.csv", index=False)
 
 
 # ---------------------------------------------------------------- an encoder's blocks
@@ -828,8 +868,9 @@ def _base_block(c, task: dict) -> dict:
                     "inner_validation": agg.count(len(c.iva_all)), "inner_validation_scored": agg.count(len(c.iva)),
                     "gold_excluded": agg.count(len(c.gold))},
         "inner_validation_positives": {f: agg.count(int(v)) for f, v in zip(FINDINGS, pos)},
-        "inner_validation_findings_with_both_classes": agg.count(
-            int(((pos > 0) & ((d.eval_y[c.iva] == 0).sum(0) > 0)).sum())),
+        "inner_validation_findings_with_both_classes": [f for f, a, b in zip(FINDINGS, pos, (d.eval_y[c.iva] == 0).sum(0))
+                                                        if a > 0 and b > 0],
+        "inner_validation_group": c.iva_group, "fold": c.fold, "stage_a_unit": "knee-n6a",
     }
 
 
@@ -879,8 +920,13 @@ def _probe(c, task: dict, st: dict) -> None:
     head0 = inner_refit(c)
     lr = LRS[0] if task.get("search", True) else REGISTERED_LR
     r = new_run(c, c.src, head0, c.itr, lr, LONG["epochs"], 0)
+    r.clock = []
     run_epochs(c, r, LONG["rung0"], limit=("micro", int(task.get("probe_micro") or PROBE_MICRO)))
+    last = r.clock[-101:]  # the last 100 micro-batches: without cold disk reads and cuDNN autotune
+    steady = ((last[-1][1] - last[0][1]) / max(last[-1][0] - last[0][0], 1e-6)) if len(last) >= 2 else None
     st["probe"] = {"slices_per_s": round(r.slices / max(r.train_s, 1e-6), 1), "slices": agg.count(r.slices),
+                   "steady_slices_per_s": round(steady, 1) if steady is not None else None,
+                   "steady_note": "the last 100 micro-batches; reported only, the rule uses slices_per_s",
                    "seconds": round(r.train_s, 1), "peak_memory_gb": _peak_gb(c.device),
                    "micro_batch_slices": c.micro * c.S * len(c.planes), "learning_rate": lr}
     st["micro"] = {"config": {"micro_batch_studies": c.micro}}
@@ -895,6 +941,52 @@ def _smoke(c, task: dict, st: dict) -> None:
                    "seconds": round(r.train_s, 1), "peak_memory_gb": _peak_gb(c.device),
                    "micro_batch_slices": c.micro * c.S * len(c.planes), "reads_no_score": True,
                    "skipped_step_share": round(r.skipped / max(r.step, 1), 4)}
+    # the code that otherwise first runs hours into the full run (review r1, S7), on 8 training studies:
+    # the stored features, one head-only step, a flipped forward, a checkpoint round trip, the run.json lock.
+    # Still no score: no validation or test row is touched and nothing is compared with a label.
+    import torch
+
+    rows = c.tr[:8]
+    feat, _ = _features(c, rows, rows)
+    h = new_run(c, feat, c.head_state, rows, 0.0, LONG["epochs"], 0, with_encoder=False)
+    run_epochs(c, h, 1, limit=("steps", 1))
+    h.head.eval()
+    flipped = [_logits(c, src, h.head, rows[:2], flipped=True) for src in (c.src, feat)]
+    with tempfile.TemporaryDirectory() as tmp:
+        ck = Path(tmp) / "ck.pt"
+        steps_before = r.step
+        save_checkpoint(c, r, ck)
+        load_checkpoint(c, r, ck)
+        record_chosen(tmp, "smoke", {"lr": REGISTERED_LR, "reason": "smoke: a dummy key in a temporary folder"})
+        locked = chosen_recorded(tmp, "smoke", REGISTERED_LR)
+    st["smoke"]["late_code_paths"] = {"feature_store": str(feat.x[c.planes[0]].dtype).replace("torch.", ""),
+                                      "head_only_step": bool(h.step == 1),
+                                      "flipped_forward_finite": bool(all(torch.isfinite(x).all() for x in flipped)),
+                                      "checkpoint_round_trip": bool(r.step == steps_before),
+                                      "run_json_lock": bool(locked)}
+
+
+def _features(c, rows, flip_rows) -> tuple[FeatSource, float]:
+    """The frozen encoder's features of `rows` (and, mirrored, of `flip_rows`) through this module's forward,
+    stored on the device (fp16 on a GPU, as N5 stores them). Returns the source and the seconds it took."""
+    import torch
+
+    dev = c.device
+    c.enc.reset()
+    rows, frows = np.asarray(rows), np.asarray(flip_rows, int)
+    x = {p: torch.empty((len(rows), c.S, c.dim), dtype=c.fdtype, device=dev) for p in c.planes}
+    _sync(dev)
+    t0 = time.time()
+    for i in range(0, len(rows), c.eval_studies):
+        for p, f in zip(c.planes, c.src(rows[i:i + c.eval_studies])):
+            x[p][i:i + f.shape[0]] = f.to(c.fdtype)
+    flip = {p: torch.empty((len(frows), c.S, c.dim), dtype=c.fdtype, device=dev) for p in c.planes if p in FLIP_PLANES}
+    for i in range(0, len(frows), c.eval_studies):
+        for p, f in zip(c.planes, c.src(frows[i:i + c.eval_studies], flipped=True)):
+            if p in flip:
+                flip[p][i:i + f.shape[0]] = f.to(c.fdtype)
+    _sync(dev)
+    return FeatSource(c.d.n, rows, x, frows, flip, c.planes), time.time() - t0
 
 
 def _frozen0(c, st: dict) -> FeatSource:
@@ -903,23 +995,9 @@ def _frozen0(c, st: dict) -> FeatSource:
     import torch
 
     d, dev = c.d, c.device
-    c.enc.reset()
     rows = np.unique(np.concatenate([c.tr, c.te_s]))
-    x = {p: torch.empty((len(rows), c.S, c.dim), dtype=c.fdtype, device=dev) for p in c.planes}
-    _sync(dev)
-    t0 = time.time()
-    for i in range(0, len(rows), c.eval_studies):
-        for p, f in zip(c.planes, c.src(rows[i:i + c.eval_studies])):
-            x[p][i:i + f.shape[0]] = f.to(c.fdtype)
     frows = c.te_s[d.flip_row[c.te_s] >= 0]
-    flip = {p: torch.empty((len(frows), c.S, c.dim), dtype=c.fdtype, device=dev) for p in c.planes if p in FLIP_PLANES}
-    for i in range(0, len(frows), c.eval_studies):
-        for p, f in zip(c.planes, c.src(frows[i:i + c.eval_studies], flipped=True)):
-            if p in flip:
-                flip[p][i:i + f.shape[0]] = f.to(c.fdtype)
-    _sync(dev)
-    secs = time.time() - t0
-    feat = FeatSource(d.n, rows, x, frows, flip, c.planes)
+    feat, secs = _features(c, rows, frows)
     # (a) features against the N5 embeddings, on 200 training studies (reported)
     k = min(CHECK_A_STUDIES, len(c.tr))
     sel = c.tr[np.unique(np.linspace(0, len(c.tr) - 1, k).round().astype(int))]
@@ -957,7 +1035,7 @@ def _frozen0(c, st: dict) -> FeatSource:
                      "mean_abs_z_training": _r(tot / max(cnt, 1)),
                      "forward_slices_per_s": round((len(rows) + len(frows)) * c.S * len(c.planes) / max(secs, 1e-6), 1),
                      "seconds": round(secs, 1)}
-    _save_state(c.working, c.name, st)
+    _save_state(c.working, c.name, st, c.fold)
     if not passed:
         _invalid_flag(c.working).write_text("frozen0 check (b) failed\n")
         raise InvalidRun("frozen0 check (b) failed: the run is invalid")
@@ -969,14 +1047,20 @@ def _search(c, task: dict, st: dict) -> None:
     """Successive halving over the encoder learning rate on the inner split (section 4)."""
     sch = task["schedule"]
     total, r0 = int(sch["epochs"]), int(sch["rung0"])
-    ed = _enc_dir(c.working, c.name)
+    ed = _enc_dir(c.working, c.name, c.fold)
     _abort_if_invalid(c.working)
+    if "final" in set(task.get("blocks") or ()):  # the final fits are rerun in this call: their files go first
+        _clean(c.working, c.name, c.fold, FINAL_FILES)
+        st.pop("final", None)
+    elif st.get("final") or any(True for pat in FINAL_FILES[:2] for _ in ed.glob(pat)):
+        raise AssertionError("the search cannot be rerun after the final fits unless the same call reruns final")
     _guard(c.itr, c.iva, c.forbid_outer)
     head0 = inner_refit(c)
     prev = st.get("search") or {}
     s = {"refit": {"E": c.E, "seed": 0, "differs_from_stage_a_head": True,
                    "forbidden": "validation group rows, test rows, gold rows"},
          "strategy": "successive halving, reduction factor 3; known bias: rung 0 favours fast learners",
+         "curve_note": "training loss: dropout on, during the epoch; validation loss: dropout off, at the epoch's end",
          "rung0": {}, "rung1": {}}
     st["search"] = s
     ck = {}
@@ -988,7 +1072,7 @@ def _search(c, task: dict, st: dict) -> None:
             ck[lr] = ed / f"rung0_{_lr_key(lr)}.pt"
             save_checkpoint(c, r, ck[lr])
             s["rung0"][_lr_key(lr)] = {"val_macro_auc": _r(r.history[-1]["val_macro_auc"]), **_fit_summary(r)}
-            _save_state(c.working, c.name, st)
+            _save_state(c.working, c.name, st, c.fold)
         sel = select_rung0({lr: s["rung0"][_lr_key(lr)]["val_macro_auc"] for lr in LRS}, task.get("rung1_tie", True))
     else:  # the cut: the registered rate; rung-0 values of an earlier call of this session are kept
         s["rung0"] = prev.get("rung0") or {}
@@ -1004,7 +1088,7 @@ def _search(c, task: dict, st: dict) -> None:
         final_scores[lr] = r.history[-1]["val_macro_auc"]
         s["rung1"][_lr_key(lr)] = {"val_macro_auc": _r(final_scores[lr]), "resumed_from_rung0": lr in ck,
                                    **_fit_summary(r)}
-        _save_state(c.working, c.name, st)
+        _save_state(c.working, c.name, st, c.fold)
     chosen, why = select_final(sel["continue"], final_scores)
     if not task.get("search", True):
         why = "the search was cut: the registered 2e-5"
@@ -1012,12 +1096,12 @@ def _search(c, task: dict, st: dict) -> None:
     s["graph"] = "the 12-epoch training-and-validation graph is rung1[chosen_lr].curve"
     for p in ck.values():  # the rung checkpoints are not needed any more
         p.unlink(missing_ok=True)
-    _save_state(c.working, c.name, st)
-    record_chosen(c.working, c.name, {"lr": float(chosen), "reason": why,
+    _save_state(c.working, c.name, st, c.fold)
+    record_chosen(c.working, c.unit, {"lr": float(chosen), "reason": why,
                                       "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                       "before_any_test_pass_of_a_trained_model": True})
     s["chosen_lr_in_run_json"] = True
-    _save_state(c.working, c.name, st)
+    _save_state(c.working, c.name, st, c.fold)
 
 
 def _chosen(c, st: dict) -> float:
@@ -1025,10 +1109,9 @@ def _chosen(c, st: dict) -> float:
     if s.get("chosen_lr") is None:
         raise AssertionError("no chosen learning rate: run the search block first")
     lr = float(s["chosen_lr"])
-    if not chosen_recorded(c.working, c.name, lr):  # a later call of run() rewrote run.json: record it again
-        record_chosen(c.working, c.name, {"lr": lr, "reason": s.get("chosen_reason"),
+    if not chosen_recorded(c.working, c.unit, lr):  # a later call of run() rewrote run.json: record it again
+        record_chosen(c.working, c.unit, {"lr": lr, "reason": s.get("chosen_reason"),
                                           "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                          "before_any_test_pass_of_a_trained_model": True,
                                           "copied_from": "state.json of the search block"})
     return lr
 
@@ -1046,10 +1129,10 @@ def _b_lite(c, task: dict, st: dict, seed: int) -> None:
     P = predict_test(c, c.src, r.head, trained=True, lr=lr)  # the test fold, once, at the last epoch
     _save_pred(c, f"b_lite_seed_{seed}", P)
     torch.save({"tail": c.enc.tail_state(), "head": r.head.state_dict()},
-               _enc_dir(c.working, c.name) / f"b_lite_seed_{seed}.pt")
+               _enc_dir(c.working, c.name, c.fold) / f"b_lite_seed_{seed}.pt")
     st.setdefault("final", {}).setdefault("b_lite", {})[f"seed_{seed}"] = {
         "encoder_lr": lr, **_fit_summary(r), "test_seconds": round(time.time() - t0, 1)}
-    _save_state(c.working, c.name, st)
+    _save_state(c.working, c.name, st, c.fold)
 
 
 def _final(c, task: dict, st: dict, feat: FeatSource) -> None:
@@ -1058,36 +1141,39 @@ def _final(c, task: dict, st: dict, feat: FeatSource) -> None:
     _abort_if_invalid(c.working)
     lr = _chosen(c, st)
     _guard(c.tr, None, c.forbid_outer)
+    _clean(c.working, c.name, c.fold, FINAL_FILES)  # no arm of an earlier call survives a new final block
     st["final"] = {"head_only": {}, "b_lite": {},
-                   "note": "training loss per epoch only; the test fold is scored once, at the last epoch"}
+                   "note": "training loss per epoch only (dropout on); the test fold is scored once, at the last epoch",
+                   "feature_note": "b-lite sees unrounded float32 features, head-only the fp16-stored frozen0 "
+                                   "features (a relative difference of about 5e-4)"}
     for k in HEAD_ONLY_SEEDS:
         r = new_run(c, feat, c.head_state, c.tr, 0.0, total, k, with_encoder=False)
         run_epochs(c, r, total)
         _save_pred(c, f"head_only_seed_{k}", predict_test(c, feat, r.head, trained=True, lr=lr))
         st["final"]["head_only"][f"seed_{k}"] = _fit_summary(r)
-    _save_state(c.working, c.name, st)
+    _save_state(c.working, c.name, st, c.fold)
     _b_lite(c, task, st, 0)
     st["final"]["drift"] = {"mean_abs_z_frozen0": st["frozen0"]["mean_abs_z_training"],
                             "mean_abs_z_b_lite_last_epoch": st["final"]["b_lite"]["seed_0"]["mean_abs_z_last_epoch"],
                             "what": "mean absolute z of the training features under the fixed Stage A statistics"}
-    _save_state(c.working, c.name, st)
+    _save_state(c.working, c.name, st, c.fold)
 
 
 def _task(task: dict) -> dict:
     """One encoder's part of a phase, in its own process when two GPUs exist. Returns only safe fields."""
-    enc, working = task["encoder"], Path(task["working"])
+    enc, working, fold = task["encoder"], Path(task["working"]), int(task.get("fold") or 0)
     if task.get("spawned"):
         safe_log.worker_init()
         paths.WORKING = working
         try:
             import torch
 
-            torch.set_num_threads(2)  # two processes share 4 CPU cores
+            torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))  # two processes share the CPU cores (4 on Kaggle)
         except Exception:  # noqa: BLE001
             pass
     try:
         phase, want = task["phase"], set(task["blocks"])
-        st = _load_state(working, enc) if phase != "smoke" else {}
+        st = _load_state(working, enc, fold) if phase != "smoke" else {}
         c = _context(task)
         if not task.get("micro"):
             c.micro = pick_micro(c, c.head_state)
@@ -1110,14 +1196,16 @@ def _task(task: dict) -> dict:
             _b_lite(c, task, st, 1)
         st["leakage_assertion_passed"] = True
         if phase != "smoke":
-            _save_state(working, enc, st)
+            _save_state(working, enc, st, fold)
         return {"ok": True, "encoder": enc, "state": st}
     except BaseException as e:  # noqa: BLE001 - only the type and the location leave the process
         try:
-            (_enc_dir(working, enc) / "error.log").write_text(
+            (_enc_dir(working, enc, fold) / "error.log").write_text(
                 "".join(traceback.format_exception(type(e), e, e.__traceback__)))
         except Exception:  # noqa: BLE001
             pass
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):  # the watchdog or a manual stop ends the whole step
+            raise
         return {"ok": False, "encoder": enc, "invalid": isinstance(e, InvalidRun),
                 "error": safe_log.describe(type(e), e.__traceback__)}
     finally:
@@ -1142,6 +1230,8 @@ def _map(tasks: list, parallel: bool) -> list:
         for t, f in zip(tasks, futs):
             try:
                 out.append(f.result())
+            except (KeyboardInterrupt, SystemExit):  # the watchdog or a manual stop: never swallowed
+                raise
             except BaseException as e:  # noqa: BLE001 - a crashed worker
                 out.append({"ok": False, "encoder": t["encoder"], "error": safe_log.describe(type(e), e.__traceback__)})
     return out
@@ -1165,8 +1255,8 @@ def _pct(vals) -> dict:
     return {"lo": _r(lo), "hi": _r(hi), "valid_share": _r(float(ok.mean()), 3)}
 
 
-def _load_pred(working, enc: str, arm: str, n: int, row_of: dict):
-    p = _enc_dir(working, enc) / f"pred_{arm}.csv"
+def _load_pred(working, enc: str, arm: str, n: int, row_of: dict, fold: int = 0):
+    p = _enc_dir(working, enc, fold) / f"pred_{arm}.csv"
     if not p.exists():
         return None
     df = pd.read_csv(p)
@@ -1177,16 +1267,25 @@ def _load_pred(working, enc: str, arm: str, n: int, row_of: dict):
     return P
 
 
-def combine(d, working, encs, n_boot: int = N_BOOT, seed: int = 0, side_auc: bool = True) -> dict:
+def listed_arms(st: dict) -> list:
+    """The arms an encoder's state lists as finished: only these are loaded (a prediction file left by an
+    earlier call is never combined)."""
+    fin = st.get("final") or {}
+    arms = ["frozen0"] if (st.get("frozen0") or {}).get("valid") else []
+    arms += [f"head_only_seed_{k}" for k in HEAD_ONLY_SEEDS if f"seed_{k}" in (fin.get("head_only") or {})]
+    return arms + [f"b_lite_seed_{k}" for k in (0, 1) if f"seed_{k}" in (fin.get("b_lite") or {})]
+
+
+def combine(d, working, encs, n_boot: int = N_BOOT, seed: int = 0, side_auc: bool = True, fold: int = 0) -> dict:
     """Scores, paired study bootstraps and the readings from the arms' saved fold-0 predictions.
 
     Rows: fold 0's scored test studies (gold is never in the test set), the same for every arm and both
     encoders, so every difference is paired. Metric: macro AUC over the 12 findings, report labels."""
     row_of = {u: i for i, u in enumerate(d.uids)}
-    te_s = d.split(0)[2]
+    te_s = d.split(fold)[2]
     Y, find = d.eval_y, list(range(len(FINDINGS)))
-    arms = ["frozen0"] + [f"head_only_seed_{k}" for k in HEAD_ONLY_SEEDS] + ["b_lite_seed_0", "b_lite_seed_1"]
-    P = {e: {a: _load_pred(working, e, a, d.n, row_of) for a in arms} for e in encs}
+    P = {e: {a: _load_pred(working, e, a, d.n, row_of, fold) for a in listed_arms(_load_state(working, e, fold))}
+         for e in encs}
     P = {e: {a: v for a, v in pa.items() if v is not None} for e, pa in P.items()}
     need = ["frozen0", "head_only_seed_0", "b_lite_seed_0"]
     done = [e for e in encs if all(a in P[e] for a in need)]
@@ -1198,8 +1297,15 @@ def combine(d, working, encs, n_boot: int = N_BOOT, seed: int = 0, side_auc: boo
                                   "2: b-lite beats frozen0 and head-only by 0.02 or more, both paired intervals exclude 0 = helps",
                                   "3: b-lite below both by 0.02 or more = lowered", "4: otherwise small or mixed",
                                   "the first line that fits is the reading; joint: helps only if both; mixed if they disagree"]}
+    for e in list(done):  # a diverged fit: no number for that encoder, the other one is still read
+        if any(not np.isfinite(v[te_s]).all() for v in P[e].values()):
+            out["encoders"][e] = {"status": "b-lite predictions not finite"}
+            done.remove(e)
     if not done:
-        return {**out, "status": "not available (no encoder has all three arms)"}
+        return {**out, "status": "not available (no encoder has all three arms with finite predictions)"}
+    # seed 1 is used only if every encoder has it (else the two encoders' numbers would not be comparable)
+    if not all("b_lite_seed_1" in P[e] for e in done):
+        out["seed_1_ignored_for"] = [e for e in done if P[e].pop("b_lite_seed_1", None) is not None]
     have = np.ones(d.n, bool)
     for e in done:
         for v in P[e].values():
@@ -1279,7 +1385,7 @@ def combine(d, working, encs, n_boot: int = N_BOOT, seed: int = 0, side_auc: boo
                                            n_boot, seed)
     else:
         out["side_discrimination"] = {"status": "cut (the cut order's second item)"}
-    out["status"] = "ok"
+    out["status"] = "ok" if len(done) == len(encs) else "ok (an encoder has no result: see its status)"
     return out
 
 
@@ -1309,6 +1415,7 @@ def _summary(s: dict) -> dict:
 
     out = {"status": s.get("status"), "errors": s.get("errors"), "schedule": g(s, "schedule", "name"),
            "throughput_slices_per_s": g(s, "schedule", "slices_per_s"), "seed1": g(s, "seed1", "ran"),
+           "seed1_failed": g(s, "seed1", "failed"), "environment": s.get("environment"),
            "diagnostic_only": "nothing is kept; every number is a development number (R6, R8)",
            "encoders": {}, "joint_reading": g(s, "results", "joint_reading"),
            "delta1_fold0": {k: g(s, "results", "delta1_fold0", k) for k in ("frozen0", "b_lite", "change", "reading")},
@@ -1319,6 +1426,7 @@ def _summary(s: dict) -> dict:
     for e, b in enc.items():
         out["encoders"][e] = {
             "trainable_parameters": g(b, "trainable", "parameters"), "peak_memory_gb": g(b, "probe", "peak_memory_gb"),
+            "steady_slices_per_s": g(b, "probe", "steady_slices_per_s"), "result_status": g(res, e, "status"),
             "smoke": b.get("smoke"),
             "frozen0_valid": g(b, "frozen0", "valid"), "check_a_max_abs_gap": g(b, "frozen0", "check_a", "max_abs_gap"),
             "check_b_abs_difference": g(b, "frozen0", "check_b", "abs_difference"),
@@ -1338,12 +1446,17 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
         processes: bool | None = None, seed1: bool | None = None, side_auc: bool = True, rung1_tie: bool = True,
         search: bool = True, schedule: str | None = None, min_slices_per_s: float = MIN_SLICES_PER_S,
         deadline_utc: str | None = None, inner_val_range=INNER_VAL_RANGE, encoder_factory=None,
-        eval_studies: int = 4, probe_micro: int = PROBE_MICRO) -> dict:
-    """Stage B-lite on outer fold 0 (see the module docstring). expect: the upstream hash prefixes of the card.
+        eval_studies: int = 4, probe_micro: int = PROBE_MICRO, fold: int = 0) -> dict:
+    """Stage B-lite on one outer fold (the declaration: fold 0; see the module docstring). expect: the upstream
+    hash prefixes of the card. fold: the outer fold (default 0, the declared one); a unit's files are in
+    private/n11/<encoder>_f<fold>/ and its run.json key is <encoder>_f<fold>.
 
     smoke: 20 optimiser steps per encoder; reads no score; reports memory and slices/s (step n11_smoke).
     blocks: which of ("probe", "frozen0", "search", "final", "seed1", "combine") run (default all); a later
-      call in the same session reuses private/n11/<encoder>/state.json and the saved predictions.
+      call in the same session reuses private/n11/<encoder>_f<fold>/state.json and the predictions that the
+      state lists. A full run (all blocks) first deletes what an earlier call wrote. The search cannot be
+      rerun after the final fits unless "final" is in the same call. The invalid flag of a failed frozen0
+      check stays until a call reruns "frozen0".
     The cut order, first to last (defaults = the declaration, nothing cut):
       seed1      None = b-lite seed 1 runs for both encoders only if it is projected to end before 0.8 x
                  budget_h (and before deadline_utc); True forces it; False cuts it.
@@ -1368,10 +1481,11 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
     cfg = {"encoders": list(encs), "blocks": sorted(want), "smoke": bool(smoke), "n_boot": int(n_boot), "seed": seed,
            "budget_h": budget_h, "seed1": seed1, "side_auc": side_auc, "rung1_tie": rung1_tie, "search": search,
            "schedule": schedule, "min_slices_per_s": min_slices_per_s, "deadline_utc": deadline_utc,
-           "eval_studies": eval_studies, "test_overrides": overrides}
+           "eval_studies": eval_studies, "fold": int(fold), "test_overrides": overrides}
     s: dict = {"written_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": SCOPE,
                "plan": "iteration plan section 11 (it3_declaration_r3)", "added_after_results": True,
-               "descriptive": True, "label": DEV_LABEL, "display": DISPLAY}
+               "descriptive": True, "label": DEV_LABEL, "display": DISPLAY, "fold": int(fold),
+               "environment": {k: agg._version(k) for k in ("torch", "timm")}}
     with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
         t0 = time.time()
         working = paths.WORKING
@@ -1384,7 +1498,19 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
                      "search": not search}
         base = {"root": str(root) if root else None, "expect": expect, "working": str(working),
                 "factory": encoder_factory, "inner_val_range": list(inner_val_range) if inner_val_range else None,
-                "eval_studies": eval_studies, "search": search, "rung1_tie": rung1_tie, "probe_micro": probe_micro}
+                "eval_studies": eval_studies, "search": search, "rung1_tie": rung1_tie, "probe_micro": probe_micro,
+                "fold": int(fold)}
+
+        def state(e: str) -> dict:
+            return _load_state(working, e, fold)
+
+        def invalid_stop(bad: dict | None = None) -> None:
+            """Nothing else is read: only each encoder's frozen0 checks are written."""
+            s["encoders"] = {e: {"frozen0": state(e).get("frozen0")} for e in encs}
+            s["status"] = "invalid: frozen0 check (b) failed; nothing else is read"
+            s["errors"] = bad or {}
+            agg.write(name, s)
+            raise InvalidRun("frozen0 check (b) failed: the run is invalid")
 
         def tasks(phase: str, **extra) -> list:
             return [{**base, "encoder": e, "device": devs[i % len(devs)], "phase": phase,
@@ -1396,13 +1522,12 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
                     s.setdefault("encoders", {})[r["encoder"]] = r["state"]
             bad = {r["encoder"]: r.get("error") for r in results if not r.get("ok")}
             invalid = any(r.get("invalid") for r in results) or _invalid_flag(working).exists()
-            if invalid:  # nothing else is read: only each encoder's frozen0 checks are written
-                s["encoders"] = {e: {"frozen0": _load_state(working, e).get("frozen0")} for e in encs}
-                s["status"] = "invalid: frozen0 check (b) failed; nothing else is read"
-                s["errors"] = bad
-                agg.write(name, s)
-                raise InvalidRun("frozen0 check (b) failed: the run is invalid")
+            if invalid:
+                invalid_stop(bad)
             if bad:
+                if not smoke:  # every inner run that finished before the failure is still reported (R10)
+                    for e in encs:
+                        s.setdefault("encoders", {})[e] = state(e)
                 s["errors"] = bad
                 s["status"] = f"failed in {what}"
                 agg.write(name, s)
@@ -1416,12 +1541,16 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
             s["status"] = "ok (smoke: no score was read)"
             agg.write(name, s)
         else:
-            _invalid_flag(working).unlink(missing_ok=True)
             sched_file = Path(working) / "private" / NAME / "schedule.json"
-            # 1. the throughput rule
-            if want == set(BLOCKS):  # a full run starts from an empty state
+            if "frozen0" in want:  # only a new frozen0 check clears an invalid run
+                _invalid_flag(working).unlink(missing_ok=True)
+            elif _invalid_flag(working).exists():
+                invalid_stop()
+            if want == set(BLOCKS):  # a full run starts from nothing: no state, prediction or weight of an earlier call
                 for e in encs:
-                    (_enc_dir(working, e) / "state.json").unlink(missing_ok=True)
+                    _clean(working, e, fold, RUN_FILES)
+                sched_file.unlink(missing_ok=True)
+            # 1. the throughput rule
             sch = None
             if "probe" in want:
                 collect(_map(tasks("probe", schedule=LONG), parallel), "probe")
@@ -1443,14 +1572,14 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
                 sch = dict(SCHEDULES[s["schedule"]["name"]])
             elif want & {"frozen0", "search", "final", "seed1"}:
                 raise ValueError("no schedule: run the probe block or pass schedule")
-            micro = {e: ((_load_state(working, e).get("micro") or {}).get("config") or {}).get("micro_batch_studies")
+            micro = {e: ((state(e).get("micro") or {}).get("config") or {}).get("micro_batch_studies")
                      for e in encs}
             # 2. frozen0, the search and the final fits
             if want & {"frozen0", "search", "final"}:
                 collect(_map(tasks("main", schedule=sch), parallel), "frozen0, search and final fits")
             # 3. b-lite seed 1, for both encoders or neither (the first cut)
             if "seed1" in want:
-                st = {e: _load_state(working, e) for e in encs}
+                st = {e: state(e) for e in encs}
                 fit = [((st[e].get("final") or {}).get("b_lite") or {}).get("seed_0") or {} for e in encs]
                 secs = [f.get("train_seconds", 0.0) + f.get("test_seconds", 0.0) for f in fit]
                 need_s = 1.15 * (max(secs) if parallel else sum(secs))
@@ -1466,13 +1595,22 @@ def run(root=None, expect: dict | None = None, encoders: tuple[str, ...] = MAIN,
                                       "budget (the first cut); forced or cut by the seed1 argument",
                               "argument": seed1}
                 if go:
-                    collect(_map(tasks("seed1", schedule=sch), parallel), "b-lite seed 1")
+                    try:
+                        collect(_map(tasks("seed1", schedule=sch), parallel), "b-lite seed 1")
+                    except N11Error:  # seed 1 is the first cut: its failure must not cost the seed-0 result
+                        s["seed1"].update({"ran": False, "failed": True, "errors": s.pop("errors", None)})
+                        for e in encs:  # for both encoders or neither
+                            _clean(working, e, fold, ("pred_b_lite_seed_1.csv", "b_lite_seed_1.pt"))
+                            st_e = state(e)
+                            ((st_e.get("final") or {}).get("b_lite") or {}).pop("seed_1", None)
+                            _save_state(working, e, st_e, fold)
             for e in encs:
-                s.setdefault("encoders", {})[e] = _load_state(working, e)
+                s.setdefault("encoders", {})[e] = state(e)
             # 4. scores, intervals and readings
             if "combine" in want:
-                s["results"] = combine(d, working, encs, n_boot=n_boot, seed=seed, side_auc=side_auc)
-                s["status"] = "ok" if s["results"].get("status") == "ok" else "ok (blocks so far; results not available)"
+                s["results"] = combine(d, working, encs, n_boot=n_boot, seed=seed, side_auc=side_auc, fold=fold)
+                rs = str(s["results"].get("status"))
+                s["status"] = "ok" if rs == "ok" else f"results: {rs}"
             else:
                 s["status"] = "ok (blocks so far)"
             s["seconds"] = round(time.time() - t0, 1)
