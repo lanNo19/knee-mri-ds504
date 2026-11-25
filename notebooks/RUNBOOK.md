@@ -510,6 +510,81 @@ The decision (Claude, outside Kaggle, from inner scores only; no test-fold numbe
    the common ending once, as the last line. No sentence names a count as the one to use.
 7. No outcome changes a model or computes a test-fold number. No submission.
 
+## Dropout-ceiling check (it2d; added after the results)
+
+Declaration: it2d_dropout_r2.md in the planning folder (r2, after review r1), written before any of these
+runs. Code: knee.nb.n13d, a new module (tests: tests/test_n13_dropout.py). n13.py, n13s.py, n6.py and
+heads.py are unchanged. The four arms run at commit a886594. The later commit changes only the local decide step.
+Finding behind it: the head search drew dropout from 0 to 0.5 and the range end was never extended; two
+units chose 0.500. Question: does dropout above the searched range (0.6, 0.7) score higher on inner
+validation than each unit's chosen dropout?
+
+Each arm fits, per unit, the unit's chosen Stage A configuration at its chosen batch size on its inner
+folds, as arm bc does (seed 0, 30 epochs, patience 5, all 32 slices). Only the dropout of the head differs
+(one dropout on the 12 per-finding pooled vectors, in training only): dc keeps the chosen one (the base;
+it repeats bc), p5 uses 0.5 in every unit (the range end; descriptive and for the words only), p6 uses
+0.6, p7 uses 0.7. Each unit's chosen dropout is checked against the values read on 25 Nov (3 decimals)
+with its batch size and best inner score, before any fit.
+No arm refits on an outer training set, predicts a test fold or writes a unit folder.
+
+Rules for the four notebooks:
+1. Create each notebook as a fork of knee-n13-bc (CPU, image 20261117-122508). Keep "Pin to
+   original environment". The inputs stay as they are. Then replace the COMMIT line and replace cell 2.
+2. Cell 1 is the usual one (the pip install from GitHub), so Internet is On. Its first line, the same
+   in all four: `COMMIT = "a88659486b5ba3bb4aeba189fb605899b57aeddd"`. A fork keeps the old COMMIT
+   line: replace it. Check after the run: knee_commit in each summary equals it.
+3. Accelerator None (CPU). A GPU session is refused by the code.
+4. Inputs, exactly these four, as knee-n13-bc: knee-n0, knee-n5, knee-n3-r and knee-n6a. Nothing else.
+5. Cell 2 is the exact text of the table below. "p6" and "p5" look alike: read the arm name twice.
+6. The four run at the same time (with one GPU session that is the five-session limit). budget_h is the
+   soft stop of a session: after it no inner fit starts, a running fit ends with its epoch, and the
+   session ends with status "partial" and every finished unit in its summary. Latest start 20:30; a
+   session that starts late gets a smaller budget_h.
+7. A worker crash is not retried inside the session. Every unit still queued is then listed in
+   units_missing with error "worker crashed". Do not restart the session.
+8. Never attach an output of these arms to N7, N9 or N10. They hold no unit folder.
+
+| Notebook | Accelerator | Inputs | Cell 2 | Expected time | Pass |
+|---|---|---|---|---|---|
+| knee-n13-dc | None (CPU) | knee-n0, knee-n5, knee-n3-r, knee-n6a | `from knee.nb import n13d; n13d.run_dropout("dc", budget_h=3.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 35-45 min (bc took 36 min) | STEP n13_dc: OK; status "ok"; all_units_ok and leakage_assertion_passed true; added_after_results, test_overrides and chosen_ref_checked true; units_finished holds 10 units and units_missing none; settings.config.dropout "chosen"; each unit ok with config.batch_size equal to batch_chosen, dropout.config.dropout_used equal to dropout_chosen (0.472, 0.0, 0.5, 0.053, 0.0 for DINOv2 folds 0-4; 0.472, 0.5, 0.386, 0.0, 0.222 for ConvNeXt-T, at 3 decimals), step_ratio 1.0, schedule_epochs 30, patience 5, seed 0, device cpu; environment present; no head.pt and no predictions.csv in the output |
+| knee-n13-p5 | None (CPU) | the same | `from knee.nb import n13d; n13d.run_dropout("p5", budget_h=3.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 35-45 min | as knee-n13-dc, but STEP n13_p5, settings.config.dropout 0.5 and each unit's dropout_used 0.5 |
+| knee-n13-p6 | None (CPU) | the same | `from knee.nb import n13d; n13d.run_dropout("p6", budget_h=3.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 35-45 min | as knee-n13-dc, but STEP n13_p6, settings.config.dropout 0.6 and each unit's dropout_used 0.6 |
+| knee-n13-p7 | None (CPU) | the same | `from knee.nb import n13d; n13d.run_dropout("p7", budget_h=3.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 35-45 min | as knee-n13-dc, but STEP n13_p7, settings.config.dropout 0.7 and each unit's dropout_used 0.7 |
+
+A session that ends "partial": report it. Its missing units can run in knee-n13-<arm>-r: a fork of the
+arm's notebook, the same COMMIT, the same cell 2 plus `rerun=1, folds=(<k>,), encoders=("<encoder>",)`,
+on the same image. An encoder with fewer than 5 finished folds in an arm (or in dc) gets no verdict
+for that arm.
+
+The decision (Claude, outside Kaggle, from inner scores only; no test-fold number exists for these arms):
+1. Download the four agg_n13_<arm>_inner.json files (and each rerun's) into a new directory. The
+   batch-floor check's agg_n13_bc_inner.json gives the rerun check; iteration 2's
+   agg_n13_base0_inner.json and agg_n13_null_inner.json give s.
+2. `n13d.decide_dropout(dc, p6, p7, bc, base0, null, p5=p5)`: each argument a summary dict or the list
+   [original, rerun, ...]; p5, p6, p7 and bc may be None. It is a pure function. The planning folder's
+   it2d_decision/run_decide_dropout.py calls it and writes agg_n13_dropout_decide.json through the
+   aggregate checker: the dropout values sit under "config" keys.
+3. A status with no verdict at all, checked in this order on every arm summary given (p5 too):
+   "no_base" (dc did not run); "leakage_check_failed"; "chosen_ref_not_checked"; "commit_mismatch"
+   (more than one knee_commit, or not a886594); "env_mismatch" (the arms ran on different images).
+4. status "partial": at least one of the four comparisons (p6 and p7 against dc, per encoder) has
+   "no verdict"; a missing p5 never blocks one. status "decided": four verdicts, each "higher dropout
+   scored higher", "higher dropout scored lower" or "no difference shown": gain = mean over the 5 folds
+   of (arm minus dc) at 4 decimals; higher when gain > 0.005 and higher in at least 4 of 5 folds; lower
+   when gain < -0.005 and lower in at least 4 of 5 folds; a fold at 0.0000 is neither; a tie at 0.0050 is
+   inside "no difference shown".
+5. A "scored higher" is compared with p5 by the same rule: "the ceiling mattered" only when arm minus p5
+   meets it too; "inside the searched range" when it does not; without a whole p5 the open point says
+   the cause is not shown. These words change no verdict.
+6. Descriptive, never in a verdict: rerun_check (dc minus bc per unit; a unit above 0.0005 is listed and
+   the slide says so), p5_minus_dc, by_chosen_dropout (units with chosen dropout at least 0.4 and the
+   others), units, mean_inner_score and median_best_epoch.
+7. The slide sentences: `n13d.dropout_slide_sentences(record)`. One per encoder and arm (a no-verdict
+   sentence says what finished), then the summary lines, then the rerun-noise sentence if any, then the
+   common ending once, as the last line. With no verdict in all four comparisons: only the summary line,
+   no common ending. No sentence names a dropout as the one to use.
+8. No outcome changes a model or computes a test-fold number. No submission.
+
 ## If a run fails
 
 The summary block shows `STEP <name>: FAILED - <ErrorType> at <file>:<line> in <function>()`.

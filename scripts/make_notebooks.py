@@ -115,6 +115,13 @@ NOTEBOOKS = {
     "n13-s16b": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 18000),
     "n13-s8": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 18000),
     "n13-s4": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 18000),
+    # N13d, the dropout-ceiling check (it2d_dropout_r2.md; RUNBOOK "Dropout-ceiling check"): CPU, four sessions at
+    # the same time, added after the results. Forks of knee-n13-bc with "Pin to original environment" kept and
+    # the same four inputs. Cell 1 of these four is pinned to DROPOUT_COMMIT (below), whatever --commit says.
+    "n13-dc": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 14400),
+    "n13-p5": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 14400),
+    "n13-p6": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 14400),
+    "n13-p7": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 14400),
 }
 
 
@@ -218,6 +225,8 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return f'from knee.nb import n13; n13.run("{name[4:]}", budget_h=6.0, expect={EXPECT})'
     if name in SLICE_NOTEBOOKS:  # budget_h: the soft stop; lower it if the session starts late
         return f'from knee.nb import n13s; n13s.run_slices("{name[4:]}", budget_h=4.0, expect={EXPECT})'
+    if name in DROPOUT_NOTEBOOKS:  # budget_h: the soft stop; lower it if the session starts late
+        return f'from knee.nb import n13d; n13d.run_dropout("{name[4:]}", budget_h=3.0, expect={EXPECT})'
     raise KeyError(name)
 
 
@@ -233,8 +242,17 @@ SLICE_COMMIT = "ecf264fcc11b780e53940b29de86e5a0fc512ae2"
 SLICE_NOTEBOOKS = ("n13-s32", "n13-s16", "n13-s16b", "n13-s8", "n13-s4")
 
 
+# The dropout-ceiling arms (declaration it2d_dropout_r2.md): the commit of the four sessions (n13d.DROPOUT_ARM_COMMIT).
+# The later commit changes only the local decide step, so the arms are never regenerated at another commit.
+DROPOUT_COMMIT = "a88659486b5ba3bb4aeba189fb605899b57aeddd"
+DROPOUT_NOTEBOOKS = ("n13-dc", "n13-p5", "n13-p6", "n13-p7")
+
+
 def commit_for(name: str, commit: str) -> str:
-    """The commit of a notebook's cell 1: the pinned one for the batch-floor and slice-count arms, else the caller's."""
+    """The commit of a notebook's cell 1: the pinned one for the batch-floor, slice-count and dropout-ceiling arms,
+    else the caller's."""
+    if name in DROPOUT_NOTEBOOKS:
+        return DROPOUT_COMMIT
     if name in SLICE_NOTEBOOKS:
         return SLICE_COMMIT
     return BATCH_COMMIT if name in BATCH_NOTEBOOKS else commit
