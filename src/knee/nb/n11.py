@@ -30,6 +30,8 @@ Steps (each its own Kaggle notebook):
   dev()             CPU. Refuses to run without a "decided" record; checks the prediction files' hashes
                     against it; computes the registered S2 metrics, Delta1 and N14-C2's side AUC, each
                     labelled as a development number (R6).
+  dev_findings()    CPU. The same gate and the same prediction files as dev(): the per-finding AUCs of the
+                    three arms on the S2 test folds and each fold's macro AUC. Descriptive only (R8).
 
 Schedules are counted in twelfths of a fit's optimiser steps: epochs = round(16,200 / the fold's training
 size) (halved: half of it), warm-up = 1 twelfth, cosine to 0 at the end, rung 0 ends after 3 twelfths, the
@@ -102,6 +104,9 @@ LIMITS = ["the folds share most training studies and two folds share a validatio
           "each fold is judged on one small site", "s is a lower bound on the seed noise of a fine-tuned fit"]
 SCOPE = "Stage B-lite on all five folds, iteration 3 (plan section 12): added after the results (R10)"
 PLAN = "iteration plan section 12 (it3_amendment_r3)"
+DEV_ARMS = ("frozen0", "head_only_seed_0", "b_lite")  # the arms dev() and dev_findings() compare
+FINDINGS_NOTE = "12 intervals are shown without a multiplicity correction; they describe, they decide nothing (R8)"
+FINDING_PAIRS = {"meniscus_pair": ("Medial Meniscus", "Lateral Meniscus"), "oa_pair": ("Medial OA", "Lateral OA")}
 CURVE_NOTE = "training loss: dropout on, over the twelfth; validation loss: dropout off, at the twelfth's end"
 
 
@@ -1956,6 +1961,44 @@ def _decision(decision_record, root=None) -> dict:
     return d
 
 
+def _dev_head(dec: dict) -> dict:
+    """The first keys of a development summary: the label and the decision it was computed under."""
+    return {"label": DEV_LABEL, "display": DISPLAY, "descriptive": True, "added_after_results": True, "plan": PLAN,
+            "decision": {"status": dec["status"], "sha256": dec["sha256"], "written_at_utc": dec.get("written_at_utc"),
+                         "keep": {e: dec["encoders"][e]["keep"] for e in dec["encoders_run"]}}}
+
+
+def _dev_arms(dec: dict, root=None) -> tuple[list, dict]:
+    """(encoders, {encoder: {arm: rows}}) of the test-fold prediction files the decision record lists, the
+    five folds joined. Refused when the attached units are not the record's or a file's hash differs."""
+    encs = list(dec["encoders_run"])
+    units = {key: ud for key, ud in find_units(root).items() if key[0] in encs}
+    want = dec["prediction_files_sha16"]
+    if {_unit(e, k) for e, k in units} != set(want):
+        raise ValueError("dev: the attached units are not the ones the decision was written on")
+    data: dict = {}
+    for (e, k), ud in units.items():
+        for fname, h in want[_unit(e, k)].items():
+            if sha16(ud / fname) != h:
+                raise ValueError("dev: a prediction file is not the one the decision record lists")
+            if fname.startswith("pred_"):
+                data.setdefault(e, {}).setdefault(fname[len("pred_"):-len(".csv")], []).append(_read_rows(ud / fname))
+    return encs, {e: {a: {k: np.concatenate([x[k] for x in parts]) for k in ("uid", "P", "Y", "fold", "resolved")}
+                      for a, parts in data.get(e, {}).items()} for e in encs}
+
+
+def _dev_arms_status(A: dict):
+    """None if an encoder's arms can be scored, else the status dev() reports for it. Arms that hold
+    different studies are refused."""
+    if not all(a in A and len(set(A[a]["fold"].tolist())) == N_OUTER for a in DEV_ARMS):
+        return "an arm or a fold is missing"
+    if any(not np.isfinite(A[a]["P"]).all() for a in A):
+        return "b-lite predictions not finite"
+    if any(A[a]["uid"].tolist() != A["frozen0"]["uid"].tolist() for a in A):
+        raise ValueError("dev: the arms of an encoder hold different studies")
+    return None
+
+
 def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, side_auc: bool = True,
         quiet: bool = True, budget_h: float = 1.0) -> dict:
     """The S2 development numbers of B-lite (12.3), run only after the decision is written.
@@ -1967,40 +2010,21 @@ def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, si
     head-only seeds' SD; Delta1 (both encoders only) and N14-C2's side AUC. Every number is a development
     number (R6), whatever the decision (R10)."""
     dec = _decision(decision_record, root)
-    s: dict = {"label": DEV_LABEL, "display": DISPLAY, "descriptive": True, "added_after_results": True, "plan": PLAN,
-               "decision": {"status": dec["status"], "sha256": dec["sha256"], "written_at_utc": dec.get("written_at_utc"),
-                            "keep": {e: dec["encoders"][e]["keep"] for e in dec["encoders_run"]}}}
+    s: dict = _dev_head(dec)
     with common.notebook(f"{NAME}_dev", {"decision_sha256": dec["sha256"], "n_boot": int(n_boot), "seed": seed},
                          quiet=quiet, budget_h=budget_h):
-        encs = list(dec["encoders_run"])
-        units = {key: ud for key, ud in find_units(root).items() if key[0] in encs}
-        want = dec["prediction_files_sha16"]
-        if {_unit(e, k) for e, k in units} != set(want):
-            raise ValueError("dev: the attached units are not the ones the decision was written on")
-        data: dict = {}
-        for (e, k), ud in units.items():
-            for fname, h in want[_unit(e, k)].items():
-                if sha16(ud / fname) != h:
-                    raise ValueError("dev: a prediction file is not the one the decision record lists")
-                if fname.startswith("pred_"):
-                    data.setdefault(e, {}).setdefault(fname[len("pred_"):-len(".csv")], []).append(_read_rows(ud / fname))
+        encs, arms_of = _dev_arms(dec, root)
         find = list(range(len(FINDINGS)))
-        arms_of = {e: {a: {k: np.concatenate([x[k] for x in parts]) for k in ("uid", "P", "Y", "fold", "resolved")}
-                       for a, parts in data.get(e, {}).items()} for e in encs}
         out: dict = {}
         ok_encs = []
         draws: dict = {}
         for e in encs:
             A = arms_of[e]
-            need = ("frozen0", "head_only_seed_0", "b_lite")
-            if not all(a in A and len(set(A[a]["fold"].tolist())) == N_OUTER for a in need):
-                out[e] = {"status": "an arm or a fold is missing"}
+            need = DEV_ARMS
+            status = _dev_arms_status(A)
+            if status:
+                out[e] = {"status": status}
                 continue
-            if any(not np.isfinite(A[a]["P"]).all() for a in A):
-                out[e] = {"status": "b-lite predictions not finite"}
-                continue
-            if any(A[a]["uid"].tolist() != A["frozen0"]["uid"].tolist() for a in A):
-                raise ValueError("dev: the arms of an encoder hold different studies")
 
             def m(a, A=A):
                 x = A[a]
@@ -2064,5 +2088,116 @@ def dev(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, si
             s["side_discrimination"] = {"status": "cut" if not side_auc else "not available"}
         s["status"] = "ok" if len(ok_encs) == len(encs) else "ok (an encoder has no result: see its status)"
         agg.write(f"{NAME}_dev", s)
+    common.summary(s)
+    return s
+
+
+# ---------------------------------------------------------------- dev_findings (CPU; after the decision)
+
+def _findings_tag() -> dict:
+    return {"label": DEV_LABEL, "descriptive": True, "added_after_results": True, "note": FINDINGS_NOTE}
+
+
+def _side_of_0(ci: dict) -> str:
+    if ci.get("lo") is None or ci.get("hi") is None:
+        return "undefined"
+    return "above_0" if ci["lo"] > 0 else "below_0" if ci["hi"] < 0 else "includes_0"
+
+
+def finding_groups() -> dict:
+    """{group: finding names}: the meniscus pair, the OA pair and every other finding. {} if a pair's name is
+    not one of labels.FINDINGS (then only the all-findings summary is written)."""
+    if not all(f in FINDINGS for names in FINDING_PAIRS.values() for f in names):
+        return {}
+    paired = {f for names in FINDING_PAIRS.values() for f in names}
+    return {**{g: list(names) for g, names in FINDING_PAIRS.items()}, "all_other": [f for f in FINDINGS if f not in paired]}
+
+
+def findings_block(A: dict, n_boot: int = N_BOOT, seed: int = 0) -> dict:
+    """One encoder's per-finding block. A: {arm: rows} as dev() loads them (DEV_ARMS, the same studies in
+    the same order). The bootstrap weights are dev()'s (_fold_draws on the same folds and seed), so the
+    mean over the 12 findings of a draw is dev()'s draw of the fold-stratified macro AUC."""
+    fold = A["frozen0"]["fold"]
+    Y = A["frozen0"]["Y"]
+    folds = [int(k) for k in np.unique(fold) if k >= 0]
+    nf = len(FINDINGS)
+    fs = {a: [metrics.stratified_auc(A[a]["P"][:, j], A[a]["Y"][:, j], fold)[0] for j in range(nf)] for a in DEV_ARMS}
+    per_fold = {a: np.array([[metrics.auc(A[a]["P"][fold == k, j], A[a]["Y"][fold == k, j])[0] for k in folds]
+                             for j in range(nf)]) for a in DEV_ARMS}  # finding x fold; NaN = a class is missing
+    draws = np.array([[[metrics.stratified_auc(A[a]["P"][:, j], A[a]["Y"][:, j], fold, w)[0] for j in range(nf)]
+                       for a in DEV_ARMS] for w in _fold_draws(fold, int(n_boot), seed)])  # draw x arm x finding
+    col = {a: draws[:, i, :] for i, a in enumerate(DEV_ARMS)}
+
+    def mean_folds(a, j):
+        v = per_fold[a][j]
+        return float(np.mean(v[np.isfinite(v)])) if np.isfinite(v).any() else float("nan")
+
+    out_f: dict = {}
+    side: dict = {}
+    for j, name in enumerate(FINDINGS):
+        used = [k for i, k in enumerate(folds) if np.isfinite(per_fold["frozen0"][j, i])]
+        val = {a: {"fold_stratified_auc": fs[a][j], "mean_of_fold_aucs": mean_folds(a, j)} for a in DEV_ARMS}
+        b = {"positives": agg.count(int((Y[:, j] == 1).sum())), "folds": used, "n_folds": len(used),
+             **{a: {k: _r(v) for k, v in val[a].items()} for a in DEV_ARMS}}
+        for key, base in (("b_lite_minus_frozen0", "frozen0"), ("b_lite_minus_head_only", "head_only_seed_0")):
+            ci = _pct(col["b_lite"][:, j] - col[base][:, j])
+            b[key] = {**{k: _r(val["b_lite"][k] - val[base][k]) for k in val["b_lite"]},
+                      "fold_stratified_interval": ci, "interval_side": _side_of_0(ci)}
+        side[name] = b["b_lite_minus_frozen0"]["interval_side"]
+        out_f[name] = b
+
+    find = list(range(nf))
+    pf: dict = {}
+    for k in folds:
+        m = fold == k
+        v = {a: metrics.macro(A[a]["P"][m], A[a]["Y"][m], np.zeros(int(m.sum()), int), find) for a in DEV_ARMS}
+        pf[f"fold_{k}"] = {**{a: _r(x) for a, x in v.items()}, "b_lite_minus_frozen0": _r(v["b_lite"] - v["frozen0"])}
+
+    def tally(names) -> dict:
+        return {c: [f for f in names if side[f] == c] for c in ("above_0", "below_0", "includes_0", "undefined")}
+
+    return {**_findings_tag(), "studies": agg.count(len(A["frozen0"]["uid"])), "findings": out_f,
+            "per_fold_macro": {**_findings_tag(), **pf,
+                               "null_means": "a finding lacks a class in this fold (dev() leaves such a fold out of its mean)"},
+            "summary": {**_findings_tag(),
+                        "of": "the interval of b_lite minus frozen0 (fold-stratified AUC), per finding; the number "
+                              "of findings on a side is the length of its list",
+                        "all_findings": tally(FINDINGS),
+                        "groups": {g: {"findings": names, **tally(names)} for g, names in finding_groups().items()}}}
+
+
+def dev_findings(decision_record=None, root=None, n_boot: int = N_BOOT, seed: int = 0, quiet: bool = True,
+                 budget_h: float = 1.0) -> dict:
+    """The per-finding error analysis of iteration 3 on the S2 test folds, from dev()'s prediction files and
+    behind dev()'s gate (a "decided" record with an intact sha256; every file's hash as the record lists it).
+
+    Per encoder and finding, for frozen0, head-only seed 0 and b-lite: the fold-stratified AUC (pairs inside
+    one test fold) and the mean over folds of the fold's AUC (a fold where the finding lacks a class is left
+    out; "folds" lists the folds used); b-lite minus each baseline, with dev()'s study-bootstrap interval of
+    the fold-stratified difference; the rounded number of positive studies. Per encoder: each fold's macro
+    AUC per arm, and which findings' intervals of b-lite minus frozen0 lie above 0, below 0 or include 0.
+    Writes agg_n11_dev_findings.json (aggregates only). Descriptive: nothing is decided from it (R8)."""
+    dec = _decision(decision_record, root)
+    s: dict = {**_dev_head(dec), "note": FINDINGS_NOTE}
+    with common.notebook(f"{NAME}_dev_findings", {"decision_sha256": dec["sha256"], "n_boot": int(n_boot), "seed": seed},
+                         quiet=quiet, budget_h=budget_h):
+        encs, arms_of = _dev_arms(dec, root)
+        out: dict = {}
+        for e in encs:
+            status = _dev_arms_status(arms_of[e])
+            out[e] = {"status": status} if status else {**findings_block(arms_of[e], n_boot, seed),
+                                                         "decision_keep": dec["encoders"][e]["keep"]}
+        s["encoders"] = out
+        s["arms"] = list(DEV_ARMS)
+        s["interval"] = ("fold_stratified_interval: study bootstrap inside each test fold, paired across arms, "
+                         "percentile 2.5-97.5; descriptive (sites and fold models held fixed)")
+        s["n_boot"] = int(n_boot)
+        s["metrics"] = {"fold_stratified_auc": "one finding, pairs inside one S2 test fold",
+                        "mean_of_fold_aucs": "mean over the S2 folds that have both classes of the finding (n_folds of them)",
+                        "per_fold_macro": "one fold's mean AUC over the 12 findings",
+                        "positives": "studies with the finding present, all folds, rounded to 5"}
+        ok = all("status" not in v for v in out.values())
+        s["status"] = "ok" if ok else "ok (an encoder has no result: see its status)"
+        agg.write(f"{NAME}_dev_findings", s)
     common.summary(s)
     return s

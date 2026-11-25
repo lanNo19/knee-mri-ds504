@@ -77,6 +77,8 @@ NOTEBOOKS = {
     "n11-d": (True, False, False, N11_GPU_INPUTS, 43200),
     "n11-decide": (False, False, False, ["n11-a", "n11-b"], 3600),
     "n11-dev": (False, False, False, ["n11-a", "n11-b", "n11-decide"], 3600),
+    # per-finding description of the same prediction files, behind dev()'s gate (descriptive, R8)
+    "n11-dev-findings": (False, False, False, ["n11-a", "n11-b", "n11-decide"], 3600),
 }
 
 
@@ -151,6 +153,8 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return "from knee.nb import n11; n11.decide()"
     if name == "n11-dev":
         return "from knee.nb import n11; n11.dev()"
+    if name == "n11-dev-findings":
+        return "from knee.nb import n11; n11.dev_findings()"
     raise KeyError(name)
 
 
