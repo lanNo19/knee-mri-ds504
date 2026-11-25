@@ -79,6 +79,15 @@ NOTEBOOKS = {
     "n11-dev": (False, False, False, ["n11-a", "n11-b", "n11-decide"], 3600),
     # per-finding description of the same prediction files, behind dev()'s gate (descriptive, R8)
     "n11-dev-findings": (False, False, False, ["n11-a", "n11-b", "n11-decide"], 3600),
+    # N11x (the learning-rate extension of iteration 3, it3_lr_extension_r3; RUNBOOK "Learning-rate extension
+    # N11x"). GPU steps: the same inputs as n11-a and nothing of iteration 3 (R9: its numbers are constants in
+    # the code). The CPU selection attaches the session and iteration 3's sessions (their state.json is read,
+    # as n11-decide reads it). The refinement point runs only by the selection's refinement.rate.
+    "n11x-smoke": (True, False, False, N11_GPU_INPUTS, 3600),
+    "n11x-inner": (True, False, False, N11_GPU_INPUTS, 25200),
+    "n11x-smoke-select": (False, False, False, ["n11x-smoke", "n11-a", "n11-b"], 1800),
+    "n11x-select": (False, False, False, ["n11x-inner", "n11-a", "n11-b"], 3600),
+    "n11x-refine": (True, False, False, N11_GPU_INPUTS, 14400),
 }
 
 
@@ -155,6 +164,17 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return "from knee.nb import n11; n11.dev()"
     if name == "n11-dev-findings":
         return "from knee.nb import n11; n11.dev_findings()"
+    if name == "n11x-smoke":  # budget_h per session type: the declaration, section 9 (no default in the code)
+        return f'from knee.nb import n11; n11.run_lrx("smoke", smoke=True, budget_h=0.5, expect={EXPECT})'
+    if name == "n11x-inner":  # option A: both new rates, one per GPU, five folds
+        return f'from knee.nb import n11; n11.run_lrx("inner", budget_h=5.8, expect={EXPECT})'
+    if name == "n11x-smoke-select":
+        return "from knee.nb import n11; n11.select_lrx(smoke=True)"
+    if name == "n11x-select":
+        return "from knee.nb import n11; n11.select_lrx()"
+    if name == "n11x-refine":  # edit rates: refinement.rate of agg_n11x_select.json; budget_h: min(3.4, quota - 0.4)
+        return (f'from knee.nb import n11; n11.run_lrx("refine", rates=(1.6e-4,), split_folds=True, replay=False, '
+                f'budget_h=3.4, expect={EXPECT})')
     raise KeyError(name)
 
 

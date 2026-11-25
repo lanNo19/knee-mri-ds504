@@ -648,3 +648,102 @@ Check in agg_n10.json before asking Ablay to submit:
 7. b_lite.trunk_passes_per_study between 1.0 and 2.0 (1.0 + the share of studies with unresolved laterality).
 8. series_tiers (all three N10 modes): per plane, how many test studies got a fluid-sensitive fat-suppressed series, a fluid-sensitive one, any other series, or none. Rounded counts. Compare the shares with training (N0). null = the count itself failed; the submission is not affected.
 9. Against agg_n10_tails_check.json of the passed check run for the same encoder (fold 0): b_lite.trunk_sha16 equals trunk_sha16; bundle_commit is equal; and b_lite.units.fold_0's stage_a_stats_sha16, weights_file_sha16, tail_sha16 and head_sha16 equal the check's fields of the same names. Equal = the submission ran the trunk, the knee-n6a statistics, the tail and the head that the check replayed.
+
+## Learning-rate extension N11x (iteration 3; it3_lr_extension_r3)
+
+N11x extends the encoder learning-rate search of DINOv2 B-lite by two grid points, 3.2e-4 and 1.28e-3 (code knee.nb.n11: run_lrx, select_lrx; tests tests/test_n11x.py). Every number is "added after the results" (R10). The text of it3_lr_extension_r3.md must be in the plan before the first run (R3). Every score here is an inner validation score. No test-fold file is read or written.
+
+Order: 1. knee-n11x-smoke (and knee-n11x-smoke-select). 2. knee-n11x-inner. 3. knee-n11x-select. 4. knee-n11x-refine, only if the selection and the quota rule allow it.
+
+| Notebook | Accelerator | Internet | Inputs |
+|---|---|---|---|
+| knee-n11x-smoke, knee-n11x-inner, knee-n11x-refine | GPU T4 x2 | On | Outputs of knee-n0, **knee-n3-r**, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a: the same as knee-n11-a. NOT knee-n11-a or knee-n11-b (R9: iteration 3's numbers are constants in the code, EXT_REF) |
+| knee-n11x-smoke-select | None (CPU) | On | Outputs of knee-n11x-smoke, knee-n11-a and knee-n11-b. Nothing else |
+| knee-n11x-select | None (CPU) | On | Outputs of knee-n11x-inner, knee-n11-a and knee-n11-b (and knee-n11x-refine once it ran). Nothing else |
+
+Create the GPU notebooks as forks of knee-n11-a and keep "Pin to original environment": the selection compares the environment with iteration 3's field by field. Cell 1: COMMIT = the reviewed commit of branch it3-lrx named in the planning log (the same in all N11x notebooks).
+
+budget_h has no default. Use the declaration's value (section 9): smoke 0.5; inner session (option A) the smaller of 5.8 and (quota minus 0.6); option C and the refinement point the smaller of 3.4 and (quota minus 0.4). Read the quota before every session start.
+
+### 1. knee-n11x-smoke
+
+```python
+from knee.nb import n11; n11.run_lrx("smoke", smoke=True, budget_h=0.5, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+```
+
+Expected time: about 0.4 h. It runs both processes on all five folds with fits of 12 optimiser steps, validation on the first 32 validation studies, one forced invalid run (fold 2 of the first process, twelfth 2), the replay without a stop flag, the end-of-session write, and the selection on its own output. The start checks are the real ones. No score of it is read.
+
+What to read (summary block and agg_n11x_smoke.json):
+1. STEP n11x_smoke: OK. status "ok (smoke: no score is meaningful)". smoke_passed true.
+2. smoke_checks, the declaration's pass criteria as booleans: c1 both processes list five folds (the page's "Successful" is read by eye); c2 the start check passed in every fold of both processes; c3 the replay stored three gaps; c4 the forced run is invalid with its twelfth and reason; c5 every other run has 12 records and a finite end score; c6 micro-batches of 2 studies; c7 the selection ran in smoke mode.
+3. c7_environment_equals_iteration3 is null here (nothing of iteration 3 is attached). Run knee-n11x-smoke-select and read environment.differences: it must be an empty list.
+
+```python
+from knee.nb import n11; n11.select_lrx(smoke=True)
+```
+
+4. start_check: per rate and fold, abs_difference at most 0.0005. These are real numbers: a fail here is a fail of the inner session.
+
+If it does not pass: fix, test locally, one new smoke run. After the second smoke: start check failing in one or two folds = the inner session runs and those folds keep 8e-5 for that rate; in three or more = no inner session; environment still different = the inner session runs, labelled "across environments", and no fold can move. No third smoke run.
+
+### 2. knee-n11x-inner
+
+```python
+from knee.nb import n11; n11.run_lrx("inner", budget_h=5.8, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+```
+
+Expected time: 5.1 h planned, 5.6 h bound (up to 0.4 h more if the early-stop rule fires). GPU 0 runs 3.2e-4, GPU 1 runs 1.28e-3, each on folds 0-4. The watchdog stops the step at 1.1 x budget_h.
+
+Option C (quota from 3.8 to 6.2 h): `n11.run_lrx("inner", rates=(3.2e-4,), split_folds=True, budget_h=<the smaller of 3.4 and quota minus 0.4>, expect=...)`.
+
+Inside the session, in this order:
+1. Every process, every fold: the head refit and the start check (the refit head's validation score against iteration 3's, tolerance 0.0005). Nothing is trained before this.
+2. The second process: the replay (fold 0 at 8e-5 to the quarter mark).
+3. The runs, one twelfth at a time.
+
+What to read (summary block, agg_n11x_inner.json, agg_n11x_inner_0.00032.json, agg_n11x_inner_0.00128.json):
+1. STEP n11x_inner: OK, whatever the status. The status says what happened.
+2. start_check.<lr key>.fold_k: val_macro_auc, reference, abs_difference, passed.
+3. replay: val_macro_auc, reference_val_macro_auc, max_abs_gap, passed, above_half_the_band.
+4. overview.<lr key>.fold_k: status, valid, val_macro_auc (end of schedule), quarter_val_macro_auc, best (twelfth k and its score: reported, never used), invalid (twelfth k and reason), skipped_step_share, train_seconds.
+5. Curves: units.<lr key>.dinov2_vits14_f<k>.ext.run.curve (train_loss, val_loss, val_macro_auc, 12 points) and per_twelfth (skipped share, non-finite flag, train seconds).
+6. Do not compute anything from the private files (inner_start.csv, inner_b_lite_<lr key>.csv).
+
+Stop rules (the code applies them; the status names them):
+1. Three or more failed start checks in a process: the session stop flag (private/n11x_STOP) is written and nothing trains. status "stopped: the start check failed in three or more folds". The cause is looked for once; one new session may start under the declaration's section 9.
+2. One or two failed start checks: the runs go on; that fold cannot pick that rate, and the rate has no five-fold mean.
+3. Replay gap above 0.005: the stop flag is written and every process stops at its next twelfth. status "inconclusive: reused and new scores cannot be compared at 0.005". No fold moves, no refinement point, no further GPU run.
+4. An invalid run (a non-finite training or validation loss, a skipped-step share above 0.05, a non-finite end score) stops at that twelfth and is reported. Only that fold and rate are affected.
+5. Early-stop rule: 1.28e-3 invalid in folds 0 and 1, both at or before twelfth 3: that process runs 6.4e-4 on all five folds (agg_n11x_inner_0.00064.json; swapped in the summary).
+6. Soft stop at budget_h: status "partial", out_of_time true, everything written. runs_missing lists what did not finish. The selection accepts a partial session.
+
+### 3. knee-n11x-select (after the inner session has ended)
+
+```python
+from knee.nb import n11; n11.select_lrx()
+```
+
+What to read (summary block = agg_n11x_select.json, the signed selection record):
+1. STEP n11x_select: OK. status "selected". Keep sha256 and written_at_utc: the record exists before any final fit (R5).
+2. status "inconclusive" (inconclusive_because names why: replay_gap_above_tolerance, no_replay_record, across_environments, environment_not_compared, reference_mismatch) or "stopped_at_start_check": all five picks are 8e-5 and refinement.may_run is false.
+3. iteration3.constants_equal_the_states true. False = a constant in EXT_REF differs from iteration 3's state: stop and report.
+4. picks: one rate per fold (Rule S). folds.fold_k: scores of all rates, runs (valid, eligible, why_not_eligible), steps, best_twelfth.
+5. rule_d: means, c1, c2, cur, r_star, line, words (words_as_shown carries the label after a stop), schedule_sentence, mean_curve. Rule D describes; it never overrides a pick.
+6. missing: the runs that did not finish. refinement: r_star, neighbour, rate, may_run.
+7. graphs.g1 and graphs.g2: the data of the two graphs. intervals: descriptive only.
+
+### 4. knee-n11x-refine (only if refinement.may_run is true, no fold moved, quota at least 3.7 h, start by Wed 17:00)
+
+```python
+from knee.nb import n11; n11.run_lrx("refine", rates=(1.6e-4,), split_folds=True, replay=False, budget_h=3.4, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+```
+
+Write refinement.rate of the selection record into rates. Then rerun the selection with knee-n11x-refine attached: `n11.select_lrx(describe=("refine",))`. A refinement point is never eligible: the picks do not change.
+
+Rules for reading N11x:
+1. A fold's pick is the highest of several scores on one site. Its validation score is never reported as a performance number.
+2. Nothing of N11x is attached to N7 or N9 (R9).
+
+TODO D2 (not in this delivery): final fits at each fold's pick (knee-n11x-final).
+TODO D2: development numbers of the refit model (knee-n11x-dev).
+TODO D2: the N10 source switch (tails="n11x"), its tails check and the submission notebook.
