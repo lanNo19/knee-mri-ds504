@@ -369,10 +369,11 @@ predict) are the same in this branch, so it reads N13's units unchanged.
 
 ## Batch-floor check (it2b; added after the results)
 
-Declaration: it2b_batch_floor_r1.md in the planning folder, written before any of these runs. Code:
-knee.nb.n13, the section "the batch-floor check" (tests: tests/test_n13_batch.py). Finding behind it:
-the head search chose a batch size on its floor (16) in 6 of 10 units and the floor was never extended.
-Question: does a batch size below the floor score higher on inner validation?
+Declaration: it2b_batch_floor_r2.md in the planning folder (r2, after review r1), written before any of
+these runs. Code: knee.nb.n13, the section "the batch-floor check" (tests: tests/test_n13_batch.py).
+The three arms run at commit 39c3c6f. Later commits change only the local decide step.
+Finding behind it: the head search chose a batch size on its floor (16) in 6 of 10 units and the floor
+was never extended. Question: does a batch size below the floor score higher on inner validation?
 
 Each arm fits, per unit, the unit's chosen Stage A configuration on its inner folds, as n6's inner
 fits do (seed 0, 30 epochs, patience 5). Only the batch size differs: bc keeps the chosen one (the
@@ -380,17 +381,26 @@ base), b8 uses 8, b4 uses 4. base0 is not the base: it fits the default configur
 No arm refits on an outer training set, predicts a test fold or writes a unit folder.
 
 Rules for the three notebooks:
-1. Accelerator None (CPU). A GPU session is refused by the code. Internet On (cell 1 is the usual one).
-2. Inputs: knee-n0, knee-n5, knee-n3-r and knee-n6a. Nothing else. From knee-n6a the code reads only
-   agg_n6a_<encoder>_f<k>.json (the chosen configurations) and checks each unit's batch size and best
-   inner score against the values read on 25 Nov. Never knee-n6a-smoke, never a second knee-n6a.
-3. One image for all three: create them as forks of one CPU notebook and keep "Pin to original
-   environment" (rule 6 of iteration 2). decide_batch gives no verdict when their environments differ.
-4. The three run at the same time. budget_h is the soft stop of a session: after it no inner fit
+1. Cell 1 is the usual one (the pip install from GitHub), so Internet is On. Its first line, the same
+   in all three: `COMMIT = "39c3c6fc7626e047ed643d5253e8ce9e662302af"`. A fork keeps the old COMMIT
+   line: replace it. Check after the run: knee_commit in each summary equals it.
+2. Create each notebook as a fork of knee-n13-base0 (CPU, image 20261117-122508). Keep "Pin to
+   original environment". Then add the input knee-n6a, replace the COMMIT line and replace cell 2.
+   The three then share iteration 2's image, the one s was measured on.
+3. Accelerator None (CPU). A GPU session is refused by the code.
+4. Inputs, exactly these four: knee-n0, knee-n5, knee-n3-r and knee-n6a. Nothing else. From knee-n6a
+   the code reads only agg_n6a_<encoder>_f<k>.json (the chosen configurations) and checks each unit's
+   batch size and best inner score against the values read on 25 Nov. Never knee-n6a-smoke, never a
+   second knee-n6a. Without knee-n6a the code stops before any fit.
+5. Cell 2 is the exact text of the table below. "bc" and "b4" look alike: read the arm name twice.
+6. The three run at the same time. budget_h is the soft stop of a session: after it no inner fit
    starts, a running fit ends with its epoch, and the session ends with status "partial" and every
    finished unit in its summary. A session that starts later than 15:30 gets a smaller budget_h, so
    that it ends by 22:00 (budget_h = hours until 21:30).
-5. Never attach an output of these arms to N7, N9 or N10. They hold no unit folder.
+7. A worker crash is not retried inside the session. Every unit still queued is then listed in
+   units_missing with error "worker crashed". Do not restart the session. Start knee-n13-<arm>-r at
+   once (see below) for the missing units.
+8. Never attach an output of these arms to N7, N9 or N10. They hold no unit folder.
 
 | Notebook | Accelerator | Inputs | Cell 2 | Expected time | Pass |
 |---|---|---|---|---|---|
@@ -398,25 +408,38 @@ Rules for the three notebooks:
 | knee-n13-b8 | None (CPU) | the same | `from knee.nb import n13; n13.run("b8", budget_h=6.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 45-60 min (at most about 3 h) | as knee-n13-bc, but STEP n13_b8, settings.config.batch_size 8, each unit's config.batch_size 8 and step_ratio 2 to 4.1 (chosen batch / 8) |
 | knee-n13-b4 | None (CPU) | the same | `from knee.nb import n13; n13.run("b4", budget_h=6.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 1 h to 1 h 15 min (at most about 3.5 h) | as knee-n13-bc, but STEP n13_b4, settings.config.batch_size 4, each unit's config.batch_size 4 and step_ratio 4 to 8.3 |
 
-A session that ends "partial": report it. Its missing units can run in knee-n13-<arm>-r with the same
-cell 2 plus `rerun=1, folds=(<k>,), encoders=("<encoder>",)`, on the same image, only if it ends by
-22:00. An encoder with fewer than 5 finished folds in an arm (or in bc) gets no verdict for that arm.
+A session that ends "partial": report it. Its missing units (stopped, failed or "worker crashed") can
+run in knee-n13-<arm>-r: a fork of the arm's notebook, the same COMMIT, the same cell 2 plus
+`rerun=1, folds=(<k>,), encoders=("<encoder>",)`, on the same image, only if it ends by 22:00.
+An encoder with fewer than 5 finished folds in an arm (or in bc) gets no verdict for that arm.
 
 The decision (Claude, outside Kaggle, from inner scores only; no test-fold number exists for these arms):
 1. Download agg_n13_bc_inner.json, agg_n13_b8_inner.json and agg_n13_b4_inner.json (and each rerun's)
-   into a new directory, beside iteration 2's agg_n13_base0_inner.json and agg_n13_null_inner.json.
+   into a new directory. Iteration 2's agg_n13_base0_inner.json and agg_n13_null_inner.json give s.
 2. `n13.decide_batch(bc, b8, b4, base0, null)`: each argument a summary dict or the list
-   [original, rerun, ...]; b8 or b4 may be None. It is a pure function.
+   [original, rerun, ...]; b8 or b4 may be None. It is a pure function. The planning folder's
+   it2b_decision/run_decide_batch.py calls it and writes the record.
 3. Write its output with `agg.write("n13_batch_decide", record, folder=<dir>)`: agg_n13_batch_decide.json.
    The checker runs on it: the batch sizes used sit under "config" keys.
-4. status "env_mismatch": the new arms ran on different images; there is no verdict. status "no_base":
-   bc did not run. status "partial": at least one encoder and arm has "no verdict". status "decided":
-   four verdicts, each "the floor mattered" or "no support", by iteration 2's rule with bc as the base
-   (gain above 0.005 at 4 decimals and higher in at least 4 of 5 folds; s = 0.0030 from base0 and null).
-5. same_environment_as_iteration2 false is reported, not a stop: s then comes from another image.
-6. Report beside it, as descriptive: units (per-unit scores, E, steps per epoch), by_chosen_batch
-   (units on the floor and above it) and bc_minus_stage_a.
-7. No outcome changes a model, reruns the head search or computes a test-fold number.
+4. A status with no verdict at all, checked in this order on every arm summary given:
+   "no_base" (bc did not run); "leakage_check_failed" (a summary's leakage_assertion_passed is not
+   true); "chosen_ref_not_checked" (a summary's chosen_ref_checked is not true); "commit_mismatch"
+   (more than one knee_commit, or not 39c3c6f); "env_mismatch" (the arms ran on different images).
+5. status "partial": at least one encoder and arm has "no verdict". status "decided": four verdicts,
+   each "the floor mattered" or "no support", by iteration 2's rule with bc as the base (gain above
+   0.005 at 4 decimals and higher in at least 4 of 5 folds; s = 0.0030 from base0 and null).
+6. After "env_mismatch": which arm is rerun is decided from the environment fields only. The rerun
+   replaces the arm whole: give the rerun's summary in the arm's place and the first run as
+   `replaced={"<arm>": <summary>}` (the script: move its file into <dir>/replaced/). Both are reported.
+7. same_environment_as_iteration2 false is reported, not a stop: s then comes from another image.
+8. bc against Stage A (bc_minus_stage_a, never in the rule): a unit reproduces when |bc minus Stage A's
+   best inner score| is at most 0.006. Units outside are listed, the verdict is still given, and the
+   slide sentence says so (bc_minus_stage_a.words).
+9. The slide sentences: `n13.batch_slide_sentences(record)`. One per encoder and arm, from words,
+   words_margin and words_limits.
+10. Report beside it, as descriptive: units (per-unit scores, E, steps per epoch) and by_chosen_batch
+    (units on the floor and above it). The graph and both tables go on a backup slide only.
+11. No outcome changes a model, reruns the head search or computes a test-fold number.
 
 ## If a run fails
 

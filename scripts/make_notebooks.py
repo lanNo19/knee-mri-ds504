@@ -102,6 +102,8 @@ NOTEBOOKS = {
     # N13, the batch-floor check (it2b_batch_floor_r1.md; RUNBOOK "Batch-floor check"): CPU, three sessions at
     # the same time, added after the results. Inputs as the iteration-2 arms (knee-n0, knee-n5, knee-n3-r) plus
     # knee-n6a, whose per-unit summaries hold the chosen configurations. bc is the base (the chosen batch size).
+    # Cell 1 of these three is pinned to BATCH_COMMIT (below), whatever --commit says. By hand: forks of
+    # knee-n13-base0 with "Pin to original environment" kept, knee-n6a added (RUNBOOK "Batch-floor check").
     "n13-bc": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 25200),
     "n13-b8": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 25200),
     "n13-b4": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 25200),
@@ -209,6 +211,17 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
     raise KeyError(name)
 
 
+# The batch-floor arms (declaration it2b_batch_floor_r2.md): the reviewed commit of the three sessions.
+# Later commits change only the local decide step, so the arms are never regenerated at another commit.
+BATCH_COMMIT = "39c3c6fc7626e047ed643d5253e8ce9e662302af"
+BATCH_NOTEBOOKS = ("n13-bc", "n13-b8", "n13-b4")
+
+
+def commit_for(name: str, commit: str) -> str:
+    """The commit of a notebook's cell 1: the pinned one for the batch-floor arms, else the caller's."""
+    return BATCH_COMMIT if name in BATCH_NOTEBOOKS else commit
+
+
 CELL1_OFFLINE = (
     "import glob, subprocess, sys\n"
     'W = sorted(glob.glob("/kaggle/input/*/private/bundle/wheels") + glob.glob("/kaggle/input/notebooks/*/*/private/bundle/wheels")'
@@ -286,7 +299,7 @@ def main(argv=None):
         d = Path(a.out) / name
         d.mkdir(parents=True, exist_ok=True)
         code = cell2(name, a.dread_file, a.dread_provenance_ok, a.without_n6b)
-        (d / "notebook.ipynb").write_text(json.dumps(notebook_json(a.commit, code, offline=name in OFFLINE), indent=1))
+        (d / "notebook.ipynb").write_text(json.dumps(notebook_json(commit_for(name, a.commit), code, offline=name in OFFLINE), indent=1))
         (d / "kernel-metadata.json").write_text(json.dumps(
             metadata(a.user, name, a.dread_file, a.bundle_dataset, a.without_n6b, a.n7_cpu), indent=1))
         (d / "timeout_s").write_text(f"{NOTEBOOKS[name][4]}\n")

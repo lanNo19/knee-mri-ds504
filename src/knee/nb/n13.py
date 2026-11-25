@@ -844,17 +844,36 @@ def _env_differences(envs: list) -> list:
     return [f for f in fields if len({json.dumps(e.get(f), sort_keys=True) for e in envs}) > 1]
 
 
-def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
-    """The rule of the batch-floor check (it2b_batch_floor_r1.md), on inner scores only (R4, R5).
+# ---- the local decide step of the batch-floor check (declaration r2, after review r1) ----
+# Everything from here on runs outside Kaggle only. The three arms ran at ARM_COMMIT; nothing that
+# n13.run("<arm>") reaches was changed after that commit (tests/test_n13_batch.py proves it on the text).
+BATCH_DECLARATION = "it2b_batch_floor_r2.md: r2, after review r1; the arms ran at ARM_COMMIT, the decide step later"
+ARM_COMMIT = "39c3c6fc7626e047ed643d5253e8ce9e662302af"  # the reviewed commit of the three Kaggle sessions
+REPRO_TOL = 0.006  # bc reproduces Stage A's best inner score in a unit when |bc - Stage A| <= 0.006 (2 s)
+ENC_WORDS = {"dinov2_vits14": "DINOv2", "convnext_tiny": "ConvNeXt-T"}
+WORDS_LIMITS = "One seed. Learning rate not re-tuned for the smaller batch."
+WORDS_CANNOT = "Gains under 0.005 cannot be shown by this check."
+WORDS_FLOOR = "The batch-size floor was reached and not extended."
+
+
+def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN, arm_commit: str | None = ARM_COMMIT,
+                 replaced: dict | None = None) -> dict:
+    """The rule of the batch-floor check (it2b_batch_floor_r2.md), on inner scores only (R4, R5).
 
     Inputs: each arm's summary, agg_n13_<arm>_inner.json as a dict, or the list [original, rerun, ...]
     (merged()). bc, b8, b4: the three new arms; b8 or b4 may be None (not run), and a new arm may be
     partial. base0, null: iteration 2's summaries, complete, used only for s (they fit the default
     configuration at batch 48, so they are not the base of any difference here).
-    Environment: the environments of every bc, b8 and b4 session must be equal field by field (the Kaggle
-    image's commit and build date, python, torch, CUDA, cuDNN, device). If not: status "env_mismatch"
-    and no verdict; rerun the arms on one image. A difference from iteration 2's environment is only
-    reported (same_environment_as_iteration2): s then comes from another image.
+    Enforced on every bc, b8 and b4 summary given (reruns too), in this order, each with its own status
+    and no verdict:
+      "no_base"                 bc did not run;
+      "leakage_check_failed"    a summary's leakage_assertion_passed is not true;
+      "chosen_ref_not_checked"  a summary's chosen_ref_checked is not true (not the 25 Nov configurations);
+      "commit_mismatch"         the summaries hold more than one knee commit, or not arm_commit
+                                (default ARM_COMMIT; None skips only the comparison with arm_commit);
+      "env_mismatch"            the environments differ in any field (the Kaggle image's commit and build
+                                date, python, torch, CUDA, cuDNN, device).
+    A difference from iteration 2's environment is only reported (same_environment_as_iteration2).
     The rule is iteration 2's keep rule with no new number, every comparison at 4 decimals:
       s         = sample SD (n - 1) of the 10 differences null - base0; it must be S_DECLARED at 4 decimals;
       threshold = max(min_gain, 2 s / sqrt(5)), at 4 decimals;
@@ -863,8 +882,15 @@ def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
       verdict   = "the floor mattered" if gain > threshold and folds_up >= 4, else "no support".
     An encoder with fewer than 5 folds finished in the arm and in bc gets "no verdict" for that arm: its
     finished folds are listed with their differences, and no gain is given.
-    Also, descriptive: the per-unit table, the units split by chosen batch size (on the floor of 16, or
-    above it), and bc minus Stage A's best inner score. The batch sizes used sit under "config" keys."""
+    Sentences per encoder and arm: words (the outcome), words_margin (only for a positive gain that does
+    not meet the rule) and words_limits; batch_slide_sentences() joins them.
+    Reproduction of Stage A by bc (never in the rule; the verdict is still given): a unit reproduces when
+    |bc - Stage A's best inner score| <= REPRO_TOL at 4 decimals. Units outside are listed and the slide
+    sentence says so (bc_minus_stage_a).
+    replaced: {arm: the summaries of a whole arm that was rerun after an environment mismatch}; they are
+    only reported (replaced_runs, R10) and the rerun is given in their place.
+    Also, descriptive: the per-unit table and the units split by chosen batch size (on the floor of 16,
+    or above it). The batch sizes used sit under "config" keys."""
     arms = {"bc": _batch_arm("bc", bc), "b8": _batch_arm("b8", b8), "b4": _batch_arm("b4", b4)}
     it2 = {"base0": merged(base0), "null": merged(null)}
     for label, m in it2.items():
@@ -882,8 +908,21 @@ def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
     given = [x for a in (bc, b8, b4) if a is not None for x in ([a] if isinstance(a, dict) else list(a))]
     envs = [e for m in ran.values() for e in m["environments"]]
     envs2 = [e for m in it2.values() for e in m["environments"] if isinstance(e, dict)]
+    commits = sorted({str(c) for m in ran.values() for c in m["knee_commits"]})
+    old_runs = {}
+    for label, summaries in sorted((replaced or {}).items()):
+        if label not in BATCH_ARMS:
+            raise ValueError("decide_batch: replaced names the arms bc, b8 or b4")
+        m = _batch_arm(label, summaries)
+        if m is None:
+            continue
+        old_runs[label] = {
+            "steps": m["steps"], "environments": m["environments"], "knee_commits": m["knee_commits"],
+            "inner_scores": {f"{e}_f{k}": u["inner_score"] for (e, k), u in sorted(m["units"].items()) if u.get("ok")},
+            "why": "environment mismatch; the arm to rerun was chosen from the environment fields only",
+            "use": "reported only (R10); the rerun replaces the arm whole in the rule"}
     record = {"rule": "it2b batch-floor rule (n13.decide_batch): iteration 2's keep rule, base = the bc arm",
-              "plan": BATCH_PLAN, "added_after_results": True,
+              "plan": BATCH_PLAN, "declaration": BATCH_DECLARATION, "added_after_results": True,
               "decided_from": "inner validation scores only (R4, R5); no test-fold number exists for these arms",
               "min_gain": float(min_gain), "s": s, "s_declared": S_DECLARED,
               "s_source": "iteration 2: sample SD of the 10 null minus base0 differences (defaults, batch 48, seeds 0 and 100)",
@@ -892,42 +931,68 @@ def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
                   "steps": m["steps"], "config": {"batch_size": batch_settings(label)["config"]["batch_size"]},
                   "units_finished": sorted(f"{e}_f{k}" for (e, k), u in m["units"].items() if u.get("ok"))})
                   for label, m in arms.items()},
-              "same_knee_commit": len({c for m in ran.values() for c in m["knee_commits"]}) == 1,
-              "chosen_ref_checked": all(bool(x.get("chosen_ref_checked")) for x in given),
+              "same_knee_commit": len(commits) == 1, "knee_commits": commits, "arm_commit_declared": arm_commit,
+              "knee_commit_is_declared": None if arm_commit is None else commits == [arm_commit],
+              "chosen_ref_checked": all(x.get("chosen_ref_checked") is True for x in given),
+              "leakage_assertion_passed": all(x.get("leakage_assertion_passed") is True for x in given),
+              "replaced_runs": old_runs,
               "limits": ["one seed (0); one setting changed at the chosen point, not a new search",
-                         "the learning rate is not rescaled: a smaller batch is also more optimiser steps (step_ratio)",
+                         "the learning rate is not rescaled or re-tuned: a smaller batch is also more optimiser steps (step_ratio)",
+                         "gains under 0.005 cannot be shown by this check",
                          "four comparisons (2 arms x 2 encoders) against one base, no correction",
-                         "s was measured on the default configuration at batch 48, not at batch 8 or 4"]}
-    empty = {e: {arm: {"verdict": NO_VERDICT, "reason": None, "gain": None, "threshold": threshold,
-                       "folds_up": None, "folds": [], "per_fold": {}} for arm in ("b8", "b4")} for e in MAIN}
+                         "s was measured on the default configuration at batch 48, not at batch 8 or 4",
+                         ("if s is too small at batch 4, 'the floor mattered' is called too easily: the error is "
+                          "toward admitting an open edge, not toward closing it")]}
+
+    def stop(status: str, reason: str, **extra) -> dict:
+        enc = {e: {arm: {"verdict": NO_VERDICT, "reason": reason, "gain": None, "threshold": threshold,
+                         "folds_up": None, "folds": [], "per_fold": {},
+                         "words": f"Batch {BATCH_ARMS[arm]}, {ENC_WORDS[e]}: no verdict ({reason}).",
+                         "words_margin": None, "words_limits": WORDS_FLOOR}
+                   for arm in ("b8", "b4")} for e in MAIN}
+        return {"status": status, **extra, "encoders": enc, **record}
+
     if arms["bc"] is None:
-        for e in MAIN:
-            for arm in empty[e]:
-                empty[e][arm]["reason"] = "the bc arm (the base) did not run"
-        return {"status": "no_base", "encoders": empty, **record}
+        return stop("no_base", "the bc arm (the base) did not run")
+    if not record["leakage_assertion_passed"]:
+        return stop("leakage_check_failed", "an arm's leakage check did not pass",
+                    leakage_failed_steps=[x.get("step") for x in given if x.get("leakage_assertion_passed") is not True])
+    if not record["chosen_ref_checked"]:
+        return stop("chosen_ref_not_checked", "an arm did not check its configurations against 25 Nov",
+                    chosen_ref_unchecked_steps=[x.get("step") for x in given if x.get("chosen_ref_checked") is not True])
+    if len(commits) != 1 or record["knee_commit_is_declared"] is False:
+        return stop("commit_mismatch", "the arms did not run at one knee commit" if len(commits) != 1
+                    else "the arms did not run at the declared knee commit",
+                    knee_commits_by_step={str(x.get("step")): str(x.get("knee_commit")) for x in given})
     differ = _env_differences(envs)
     if differ:
-        for e in MAIN:
-            for arm in empty[e]:
-                empty[e][arm]["reason"] = "the arms' environments differ"
-        return {"status": "env_mismatch", "env_differences": differ,
-                "environments": {label: m["environments"] for label, m in ran.items()},
-                "encoders": empty, **record}
+        return stop("env_mismatch", "the arms' environments differ", env_differences=differ,
+                    environments={label: m["environments"] for label, m in ran.items()})
     differ2 = _env_differences([envs[0], *envs2]) if envs2 else ["no environment record in iteration 2's summaries"]
 
     def score(label, e, k):
         u = (arms[label] or {"units": {}})["units"].get((e, k))
         return float(u["inner_score"]) if u and u.get("ok") else None
 
-    def words(arm, e, rec):
-        b = BATCH_ARMS[arm]
+    def words(arm, e, rec) -> tuple:
+        """(outcome, margin, limits): one sentence set per encoder and arm (declaration r2, section 7)."""
+        b, name = BATCH_ARMS[arm], ENC_WORDS[e]
         if rec["verdict"] == NO_VERDICT:
-            return f"Batch {b}, {e}: no verdict ({rec['reason']})."
-        tail = f"{e}: gain {rec['gain']:+.4f}, higher in {rec['folds_up']} of 5 folds; threshold {threshold:.4f}"
+            return f"Batch {b}, {name}: no verdict ({rec['reason']}).", None, WORDS_FLOOR
+        g, up = rec["gain"] + 0.0, rec["folds_up"]  # + 0.0: a rounded -0.0 prints as +0.0000
         if rec["verdict"] == MATTERED:
-            return (f"Open edge: batch {b} scored higher than the chosen batch on inner validation ({tail}). "
-                    "The head search was not rerun.")
-        return f"Batch {b} did not score higher than the chosen batch on inner validation ({tail})."
+            outcome = (f"Open edge: batch {b} scored {g:+.4f} above the chosen batch on inner validation "
+                       f"({name}, {up} of 5 folds). The head search was not rerun.")
+            return outcome, None, WORDS_LIMITS
+        if g > 0:
+            outcome = (f"Batch {b} scored {g:.4f} higher than the chosen batch on inner validation "
+                       f"({name}, {up} of 5 folds).")
+            margin = (f"This does not meet the declared margin (more than {threshold:g} and {MIN_FOLDS_UP} of 5 "
+                      "folds), so it is not counted as an effect.")
+            return outcome, margin, f"{WORDS_LIMITS} {WORDS_CANNOT}"
+        outcome = (f"Batch {b} did not score higher than the chosen batch on inner validation "
+                   f"({name}: gain {g:+.4f}, higher in {up} of 5 folds).")
+        return outcome, None, f"{WORDS_LIMITS} {WORDS_CANNOT}"
 
     out_e: dict = {}
     for e in MAIN:
@@ -947,7 +1012,7 @@ def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
                 up = sum(1 for k in folds if round(diffs[k], DECIMALS) > 0)
                 rec.update(gain=gain, gain_unrounded=gain_raw, folds_up=up,
                            verdict=MATTERED if (gain > threshold and up >= MIN_FOLDS_UP) else NO_SUPPORT)
-            rec["words"] = words(arm, e, rec)
+            rec["words"], rec["words_margin"], rec["words_limits"] = words(arm, e, rec)
             out_e[e][arm] = rec
 
     table, split = {}, {}
@@ -967,6 +1032,8 @@ def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
                                            else None)}
             row["bc_minus_stage_a"] = (round(base - row["stage_a_best_inner_score"], DECIMALS)
                                        if base is not None and row["stage_a_best_inner_score"] is not None else None)
+            row["bc_reproduces_stage_a"] = (None if row["bc_minus_stage_a"] is None
+                                            else bool(abs(row["bc_minus_stage_a"]) <= REPRO_TOL))
             table[f"{e}_f{k}"] = row
     for arm in ("b8", "b4"):
         split[arm] = {}
@@ -977,13 +1044,44 @@ def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
             vals = [table[uid][arm]["minus_bc"] for uid in uids]
             split[arm][name] = {"units": uids, "mean_minus_bc": round(float(np.mean(vals)), DECIMALS) if vals else None,
                                 "units_up": [uid for uid in uids if table[uid][arm]["minus_bc"] > 0]}
-    gaps = [row["bc_minus_stage_a"] for row in table.values() if row["bc_minus_stage_a"] is not None]
+    gaps = {uid: row["bc_minus_stage_a"] for uid, row in table.items() if row["bc_minus_stage_a"] is not None}
+    outside = [uid for uid, v in gaps.items() if abs(v) > REPRO_TOL]  # at 4 decimals: 0.0060 is inside
+    repro_words = []
+    for side, uids in (("lower", [u for u in outside if gaps[u] < 0]), ("higher", [u for u in outside if gaps[u] > 0])):
+        if uids:
+            x = abs(float(np.mean([gaps[u] for u in uids])))
+            repro_words.append(f"The chosen configuration scored {x:.4f} {side} when refit on CPU in {len(uids)} of "
+                               f"{len(gaps)} units (mean over those units; tolerance {REPRO_TOL:g}).")
+    repro = {"descriptive": True, "used_in_rule": False, "tolerance": REPRO_TOL,
+             "tolerance_source": "2 s; the same check on trial 0 (base0 minus Stage A's trial 0) gave at most 0.0018",
+             "what": "bc minus Stage A's best inner score per unit: same configuration, seeds and inner rows",
+             "mean": round(float(np.mean(list(gaps.values()))), DECIMALS) if gaps else None,
+             "max_abs_difference": max(abs(v) for v in gaps.values()) if gaps else None,
+             "units_checked": sorted(gaps), "units_outside": outside,
+             "units_outside_difference": {uid: gaps[uid] for uid in outside},
+             "reproduces": bool(gaps) and not outside,
+             "cause": "T4 (Stage A) against CPU (bc): dropout random stream and arithmetic; a small negative mean "
+                      "is expected from selection among 30 trials",
+             "consequence": "none for the rule: the verdict is still given, because b8 and b4 are compared with bc "
+                            "by the same code on the same image; a unit outside is listed and the slide says so",
+             "words": " ".join(repro_words) or None}
     verdicts = [out_e[e][arm]["verdict"] for e in MAIN for arm in ("b8", "b4")]
     return {"status": "decided" if NO_VERDICT not in verdicts else "partial",
             "environment": envs[0], "same_environment_as_iteration2": not differ2,
             "env_differences_from_iteration2": differ2, "encoders": out_e, "units": table,
             "by_chosen_batch": {"descriptive": True, "note": "no verdict from this split; for a unit above the floor "
                                 "batch 8 or 4 is a larger change", **split},
-            "bc_minus_stage_a": {"descriptive": True, "mean": round(float(np.mean(gaps)), DECIMALS) if gaps else None,
-                                 "note": "Stage A's score is the best of 30 trials on a T4: favoured by selection"},
+            "bc_reproduces_stage_a": repro["reproduces"], "bc_minus_stage_a": repro,
             **record}
+
+
+def batch_slide_sentences(record: dict) -> list:
+    """The slide sentences of a decide_batch record: one per encoder and arm (outcome, margin, limits),
+    then the reproduction sentence when a bc unit is outside the tolerance."""
+    out = []
+    for e in MAIN:
+        for arm in ("b8", "b4"):
+            rec = record["encoders"][e][arm]
+            out.append(" ".join(p for p in (rec.get("words"), rec.get("words_margin"), rec.get("words_limits")) if p))
+    extra = (record.get("bc_minus_stage_a") or {}).get("words")
+    return out + ([extra] if extra else [])

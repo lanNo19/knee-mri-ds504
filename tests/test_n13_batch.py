@@ -1,12 +1,15 @@
-"""The batch-floor check (it2b_batch_floor_r1.md): n13's arms bc, b8 and b4 and n13.decide_batch.
+"""The batch-floor check (it2b_batch_floor_r2.md): n13's arms bc, b8 and b4 and n13.decide_batch.
 
 Synthetic data, CPU. The arms fit the unit's chosen Stage A configuration on its inner folds with n6's
 inner fits; only the batch size differs. The arms a1, base0 and null must be what they were at commit
 79e95c5 (the commit this branch started from): one test runs them from that commit's tree and from
 this tree and compares every output file. It skips when git or the commit is not available.
+The three Kaggle sessions ran at commit 39c3c6f (ARM): another test shows that everything n13.run("<arm>")
+reaches is textually that commit's, so the later commits changed the local decide step only.
 """
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import os
@@ -25,6 +28,7 @@ torch = pytest.importorskip("torch")
 
 REPO = Path(__file__).resolve().parents[1]
 REF = "79e95c5"  # the commit this branch started from
+ARM = "39c3c6fc7626e047ed643d5253e8ce9e662302af"  # the commit the three Kaggle arms ran at
 MAIN = ("dinov2_vits14", "convnext_tiny")
 FIND = list(range(12))
 # synthetic chosen configurations; the batch size and best score of each unit are CHOSEN_REF's
@@ -401,7 +405,7 @@ def _it2(arm, scores, env=ENV):
             "knee_commit": "9ecea01", "units": units}
 
 
-def _b(arm, diffs=None, env=ENV, stopped=(), step=None, only=None, commit="feedbee"):
+def _b(arm, diffs=None, env=ENV, stopped=(), step=None, only=None, commit=ARM):
     """A batch-arm summary shaped as batch_summary writes it: BC plus diffs {encoder: [5 differences]}."""
     from knee.nb import n13
 
@@ -465,13 +469,37 @@ def test_decide_batch_verdicts_by_the_declared_rule(tmp_path):
     assert (c8["verdict"], c8["gain"], c8["folds_up"]) == ("no support", 0.006, 3)  # the gain alone is not enough
     assert (d4["verdict"], d4["gain"], d4["folds_up"]) == ("no support", 0.005, 5)  # a 4-decimal tie is not above
     assert (c4["verdict"], c4["gain"], c4["folds_up"]) == ("no support", -0.0028, 1)
-    assert d8["words"].startswith("Open edge: batch 8 scored higher") and "not rerun" in d8["words"]
-    assert c4["words"].startswith("Batch 4 did not score higher") and "-0.0028" in c4["words"]
+    # one sentence set per encoder and arm (declaration r2, section 7)
+    limits, cannot = "One seed. Learning rate not re-tuned for the smaller batch.", "Gains under 0.005 cannot be shown by this check."
+    margin = "This does not meet the declared margin (more than 0.005 and 4 of 5 folds), so it is not counted as an effect."
+    edge = ("Open edge: batch 8 scored +0.0058 above the chosen batch on inner validation (DINOv2, 4 of 5 folds). "
+            "The head search was not rerun.")
+    assert (d8["words"], d8["words_margin"], d8["words_limits"]) == (edge, None, limits)
+    assert (c8["words"], c8["words_margin"], c8["words_limits"]) == (  # positive, under the margin (3 folds)
+        "Batch 8 scored 0.0060 higher than the chosen batch on inner validation (ConvNeXt-T, 3 of 5 folds).",
+        margin, f"{limits} {cannot}")
+    assert (d4["words"], d4["words_margin"]) == (  # positive, under the margin (the tie): never "did not score higher"
+        "Batch 4 scored 0.0050 higher than the chosen batch on inner validation (DINOv2, 5 of 5 folds).", margin)
+    none = ("Batch 4 did not score higher than the chosen batch on inner validation (ConvNeXt-T: gain -0.0028, "
+            "higher in 1 of 5 folds).")
+    assert (c4["words"], c4["words_margin"], c4["words_limits"]) == (none, None, f"{limits} {cannot}")  # gain <= 0
+    assert n13.batch_slide_sentences(r) == [
+        f"{d8['words']} {limits}", f"{d4['words']} {margin} {limits} {cannot}",
+        f"{c8['words']} {margin} {limits} {cannot}", f"{c4['words']} {limits} {cannot}"]
+    # the enforced flags, the commits and the declaration are in the record
+    assert r["leakage_assertion_passed"] is True and r["chosen_ref_checked"] is True and r["replaced_runs"] == {}
+    assert r["knee_commits"] == [ARM] == [n13.ARM_COMMIT] and r["knee_commit_is_declared"] is True
+    assert r["declaration"].startswith("it2b_batch_floor_r2.md") and r["plan"] == n13.BATCH_PLAN
+    assert "gains under 0.005 cannot be shown by this check" in r["limits"] and len(r["limits"]) == 6
     # the per-unit table and the split by chosen batch size (descriptive)
     u = r["units"]["dinov2_vits14_f0"]
     assert u["batch_chosen"] == 33 and u["bc"]["inner_score"] == 0.724 and u["bc"]["minus_bc"] is None
     assert (u["b8"]["inner_score"], u["b8"]["minus_bc"], u["b4"]["minus_bc"]) == (0.732, 0.008, 0.005)
     assert u["bc_minus_stage_a"] == round(0.7240 - 0.7249, 4) and r["bc_minus_stage_a"]["descriptive"] is True
+    rp = r["bc_minus_stage_a"]  # bc reproduces Stage A's best inner score inside 0.006 in every unit
+    assert (rp["tolerance"], rp["used_in_rule"], rp["reproduces"], rp["units_outside"], rp["words"]) == (0.006, False, True, [], None)
+    assert r["bc_reproduces_stage_a"] is True and u["bc_reproduces_stage_a"] is True and len(rp["units_checked"]) == 10
+    assert rp["max_abs_difference"] == 0.0022 and rp["mean"] == -0.0013 and "T4" in rp["cause"]
     above = ["dinov2_vits14_f0", "convnext_tiny_f0", "convnext_tiny_f3", "convnext_tiny_f4"]
     sp = r["by_chosen_batch"]
     assert sp["descriptive"] is True and sp["b8"]["chosen_above_floor"]["units"] == above
@@ -559,7 +587,6 @@ def test_decide_batch_environment_and_input_checks(tmp_path):
     part = _b("b8", up, stopped={("dinov2_vits14", 2)})
     fill = _b("b8", up, only={("dinov2_vits14", 2)}, step="n13_b8_r", env=other)
     assert _decide([part, fill], _b("b4", up))["status"] == "env_mismatch"
-    assert _decide(_b("b8", up, commit="0ther"), _b("b4", up))["same_knee_commit"] is False
     # refused inputs
     wrong_batch = _b("b8", up)
     wrong_batch["units"]["dinov2_vits14_f1"]["config"]["batch_size"] = 16
@@ -585,6 +612,214 @@ def test_decide_batch_environment_and_input_checks(tmp_path):
             n13.decide_batch(*args)
 
 
+
+def _all_none(r, status, reason):
+    assert r["status"] == status and "units" not in r and "bc_minus_stage_a" not in r
+    recs = [v[a] for v in r["encoders"].values() for a in ("b8", "b4")]
+    assert all((x["verdict"], x["gain"], x["folds_up"], x["reason"]) == ("no verdict", None, None, reason) for x in recs)
+    assert all(x["words"].endswith(f"no verdict ({reason}).") and x["words_limits"] == "The batch-size floor was reached and not extended."
+               for x in recs)
+    return r
+
+
+def test_decide_batch_enforces_leakage_flag_chosen_ref_and_one_commit(tmp_path):
+    from knee.nb import n13
+
+    up = {"dinov2_vits14": UP4, "convnext_tiny": UP4}
+
+    def edited(arm, **fields):
+        return {**_b(arm, up if arm != "bc" else None), **fields}
+
+    # the leakage flag of every arm summary given (a rerun's too) must be true
+    for bad in (False, None):
+        r = _all_none(_decide(edited("b8", leakage_assertion_passed=bad), _b("b4", up)),
+                      "leakage_check_failed", "an arm's leakage check did not pass")
+        assert r["leakage_failed_steps"] == ["n13_b8"] and r["leakage_assertion_passed"] is False
+    agg.write("n13_batch_decide", r, folder=tmp_path / "leak")
+    r = _decide(_b("b8", up), _b("b4", up), bc=edited("bc", leakage_assertion_passed=False))
+    assert r["status"] == "leakage_check_failed" and r["leakage_failed_steps"] == ["n13_bc"]
+    part = _b("b8", up, stopped={("dinov2_vits14", 2)})
+    fill = {**_b("b8", up, only={("dinov2_vits14", 2)}, step="n13_b8_r"), "leakage_assertion_passed": False}
+    assert _decide([part, fill], _b("b4", up))["leakage_failed_steps"] == ["n13_b8_r"]
+    # chosen_ref_checked: the arm checked its configurations against the values read on 25 Nov
+    for bad in (False, None):
+        r = _all_none(_decide(_b("b8", up), edited("b4", chosen_ref_checked=bad)),
+                      "chosen_ref_not_checked", "an arm did not check its configurations against 25 Nov")
+        assert r["chosen_ref_unchecked_steps"] == ["n13_b4"] and r["chosen_ref_checked"] is False
+    agg.write("n13_batch_decide", r, folder=tmp_path / "ref")
+    # one knee commit across the arm files, and it is the declared one
+    r = _all_none(_decide(_b("b8", up, commit="0ther"), _b("b4", up)), "commit_mismatch",
+                  "the arms did not run at one knee commit")
+    assert r["same_knee_commit"] is False and r["knee_commits"] == sorted(["0ther", ARM])
+    assert r["knee_commits_by_step"] == {"n13_bc": ARM, "n13_b8": "0ther", "n13_b4": ARM}
+    agg.write("n13_batch_decide", r, folder=tmp_path / "commit")
+    old = [_b(a, up if a != "bc" else None, commit="9ecea01") for a in ("bc", "b8", "b4")]
+    r = _all_none(n13.decide_batch(*old, _it2("base0", BASE0), _it2("null", NULL)), "commit_mismatch",
+                  "the arms did not run at the declared knee commit")
+    assert r["same_knee_commit"] is True and r["knee_commit_is_declared"] is False and r["arm_commit_declared"] == ARM
+    r = n13.decide_batch(*old, _it2("base0", BASE0), _it2("null", NULL), arm_commit=None)  # only that comparison is skipped
+    assert r["status"] == "decided" and r["knee_commit_is_declared"] is None
+    fill = _b("b8", up, only={("dinov2_vits14", 2)}, step="n13_b8_r", commit="0ther")  # a rerun at another commit
+    assert _decide([part, fill], _b("b4", up))["status"] == "commit_mismatch"
+    # the order: no base, leakage, chosen_ref, commit, environment
+    other = {**ENV, "torch": "2.12.0+cpu"}
+    worst = {**_b("b8", up, env=other, commit="0ther"), "leakage_assertion_passed": False, "chosen_ref_checked": False}
+    assert _decide(worst, _b("b4", up))["status"] == "leakage_check_failed"
+    assert _decide({**worst, "leakage_assertion_passed": True}, _b("b4", up))["status"] == "chosen_ref_not_checked"
+    worst.update(leakage_assertion_passed=True, chosen_ref_checked=True)
+    assert _decide(worst, _b("b4", up))["status"] == "commit_mismatch"
+    assert _decide(_b("b8", up, env=other), _b("b4", up))["status"] == "env_mismatch"
+    r0 = n13.decide_batch(None, worst, _b("b4", up), _it2("base0", BASE0), _it2("null", NULL))
+    assert r0["status"] == "no_base" and r0["encoders"]["dinov2_vits14"]["b8"]["words_limits"].startswith("The batch-size floor")
+
+
+def test_decide_batch_bc_against_stage_a_tolerance_and_slide_sentence(tmp_path):
+    from knee.nb import n13
+
+    assert n13.REPRO_TOL == 0.006
+    up = {"dinov2_vits14": UP4, "convnext_tiny": DOWN}
+    flat = [0.0] * 5
+    # DINOv2 fold 0 is -0.0009 from Stage A: a shift of -0.0051 is the tie (-0.0060, inside), -0.0052 is outside
+    tie = _decide(_b("b8", up), _b("b4", up), bc=_b("bc", {"dinov2_vits14": [-0.0051, 0, 0, 0, 0], "convnext_tiny": flat}))
+    assert tie["units"]["dinov2_vits14_f0"]["bc_minus_stage_a"] == -0.006 and tie["bc_reproduces_stage_a"] is True
+    assert tie["bc_minus_stage_a"]["units_outside"] == [] and tie["bc_minus_stage_a"]["words"] is None
+    assert len(n13.batch_slide_sentences(tie)) == 4
+    low = _decide(_b("b8", up), _b("b4", up), bc=_b("bc", {"dinov2_vits14": [-0.0052, 0, 0, -0.0100, 0], "convnext_tiny": flat}))
+    rp = low["bc_minus_stage_a"]
+    assert low["status"] == "decided" and low["bc_reproduces_stage_a"] is False and rp["reproduces"] is False
+    assert rp["units_outside"] == ["dinov2_vits14_f0", "dinov2_vits14_f3"]  # listed; the verdict is still given
+    assert rp["units_outside_difference"] == {"dinov2_vits14_f0": -0.0061, "dinov2_vits14_f3": -0.0115}
+    assert rp["words"] == ("The chosen configuration scored 0.0088 lower when refit on CPU in 2 of 10 units "
+                           "(mean over those units; tolerance 0.006).")
+    assert low["units"]["dinov2_vits14_f0"]["bc_reproduces_stage_a"] is False
+    assert low["units"]["dinov2_vits14_f1"]["bc_reproduces_stage_a"] is True
+    assert all(low["encoders"][e][a]["verdict"] != "no verdict" for e in MAIN for a in ("b8", "b4"))
+    assert n13.batch_slide_sentences(low)[4] == rp["words"] and len(n13.batch_slide_sentences(low)) == 5
+    agg.write("n13_batch_decide", low, folder=tmp_path / "low")
+    assert max(len(x) for x in _strings(json.loads((tmp_path / "low" / "agg_n13_batch_decide.json").read_text()))) <= 200
+    # a unit above Stage A by more than the tolerance is listed too, with its own sentence
+    both = _decide(_b("b8", up), _b("b4", up), bc=_b("bc", {"dinov2_vits14": [-0.0052, 0, 0, 0, 0],
+                                                            "convnext_tiny": [0, 0, 0.0090, 0, 0]}))
+    assert both["bc_minus_stage_a"]["units_outside"] == ["dinov2_vits14_f0", "convnext_tiny_f2"]
+    assert both["bc_minus_stage_a"]["words"] == (
+        "The chosen configuration scored 0.0061 lower when refit on CPU in 1 of 10 units (mean over those units; "
+        "tolerance 0.006). The chosen configuration scored 0.0074 higher when refit on CPU in 1 of 10 units "
+        "(mean over those units; tolerance 0.006).")
+    # a missing bc unit is not checked (and not called a failure); no bc unit at all: nothing reproduces
+    part = _decide(_b("b8", up), _b("b4", up), bc=_b("bc", stopped={("convnext_tiny", 1)}))
+    assert part["units"]["convnext_tiny_f1"]["bc_reproduces_stage_a"] is None
+    assert len(part["bc_minus_stage_a"]["units_checked"]) == 9 and part["bc_reproduces_stage_a"] is True
+    none = _decide(_b("b8", up), _b("b4", up), bc=_b("bc", stopped={(e, k) for e in MAIN for k in range(5)}))
+    assert none["bc_reproduces_stage_a"] is False and none["bc_minus_stage_a"]["mean"] is None
+    assert none["bc_minus_stage_a"]["max_abs_difference"] is None and none["status"] == "partial"
+
+
+def test_decide_batch_words_for_every_outcome_and_a_replaced_arm(tmp_path):
+    from knee.nb import n13
+
+    zero = [0.001, -0.001, 0.0, 0.0, 0.0]  # gain exactly 0: "did not score higher", printed +0.0000
+    neg0 = [-0.00004, 0.0, 0.0, 0.0, 0.0]  # rounds to -0.0: printed +0.0000, never -0.0000
+    r = _decide(_b("b8", {"dinov2_vits14": zero, "convnext_tiny": neg0}),
+                _b("b4", {"dinov2_vits14": UP4, "convnext_tiny": [0.004] * 5}, stopped={("dinov2_vits14", 4)}))
+    e = r["encoders"]
+    assert e["dinov2_vits14"]["b8"]["words"] == (
+        "Batch 8 did not score higher than the chosen batch on inner validation (DINOv2: gain +0.0000, higher in 1 of 5 folds).")
+    assert "gain +0.0000, higher in 0 of 5 folds" in e["convnext_tiny"]["b8"]["words"]
+    assert e["convnext_tiny"]["b4"]["words"] == (  # the review's case: small, in 5 of 5 folds, not an effect
+        "Batch 4 scored 0.0040 higher than the chosen batch on inner validation (ConvNeXt-T, 5 of 5 folds).")
+    assert e["convnext_tiny"]["b4"]["verdict"] == "no support" and e["convnext_tiny"]["b4"]["words_margin"] is not None
+    nv = e["dinov2_vits14"]["b4"]
+    assert (nv["words"], nv["words_margin"], nv["words_limits"]) == (
+        "Batch 4, DINOv2: no verdict (fewer than 5 folds finished in the arm and in bc).", None,
+        "The batch-size floor was reached and not extended.")
+    lines = n13.batch_slide_sentences(r)
+    assert lines[1] == f"{nv['words']} The batch-size floor was reached and not extended." and len(lines) == 4
+    assert all("did not score higher" not in x for x in lines[1:2] + lines[3:])
+    rn = _decide(_b("b8", {"dinov2_vits14": zero, "convnext_tiny": neg0}), None)
+    assert rn["encoders"]["convnext_tiny"]["b4"]["words"] == "Batch 4, ConvNeXt-T: no verdict (the arm did not run)."
+    # an arm rerun whole after an environment mismatch: the first run is reported, the rerun enters the rule
+    up = {"dinov2_vits14": UP4, "convnext_tiny": UP4}
+    other = {**ENV, "kaggle_image_build_date": "20261124-000000"}
+    first = _b("b8", {"dinov2_vits14": DOWN, "convnext_tiny": DOWN}, env=other)
+    assert _decide(first, _b("b4", up))["status"] == "env_mismatch"
+    rr = _decide(_b("b8", up), _b("b4", up), replaced={"b8": first, "b4": None})
+    assert rr["status"] == "decided" and rr["encoders"]["dinov2_vits14"]["b8"]["verdict"] == "the floor mattered"
+    old = rr["replaced_runs"]
+    assert list(old) == ["b8"] and old["b8"]["steps"] == ["n13_b8"] and old["b8"]["environments"] == [other]
+    assert old["b8"]["inner_scores"]["dinov2_vits14_f0"] == round(BC["dinov2_vits14"][0] + DOWN[0], 4)
+    assert len(old["b8"]["inner_scores"]) == 10 and "reported only" in old["b8"]["use"]
+    agg.write("n13_batch_decide", rr, folder=tmp_path)
+    with pytest.raises(ValueError):
+        _decide(_b("b8", up), _b("b4", up), replaced={"b2": first})
+    with pytest.raises(ValueError):  # the replaced file must be that arm's
+        _decide(_b("b8", up), _b("b4", up), replaced={"b4": first})
+
+
+# ---------------------------------------------------------------- the arm run path is commit 39c3c6f's
+
+DECIDE_ONLY = {"decide_batch"}  # changed after ARM
+DECIDE_NEW = {"BATCH_DECLARATION", "ARM_COMMIT", "REPRO_TOL", "ENC_WORDS", "WORDS_LIMITS", "WORDS_CANNOT",
+              "WORDS_FLOOR", "batch_slide_sentences"}  # added after ARM
+
+
+def _top(src: str) -> list:
+    """[(names, text)] of a module's top-level statements, in order."""
+    out = []
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names = {node.name}
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        else:
+            names = set()
+        out.append((frozenset(names), ast.get_source_segment(src, node)))
+    return out
+
+
+def _refs(text: str) -> set:
+    tree = ast.parse(text)
+    return ({n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)})
+
+
+def test_everything_reachable_from_an_arm_run_is_textually_commit_39c3c6f():
+    """The Kaggle sessions of bc, b8 and b4 install commit 39c3c6f. Later commits may change the local decide
+    step only: (1) every file under src/ and pyproject.toml is that commit's, except n13.py; (2) in n13.py every
+    top-level statement of that commit is unchanged in text and order, except decide_batch; (3) nothing that
+    n13.run reaches, by name, is decide_batch or a name added later."""
+    if _git("rev-parse", "--verify", f"{ARM}^{{commit}}") is None:
+        pytest.skip("git history with commit 39c3c6f is not available")
+    tracked = [f for f in _git("ls-tree", "-r", "--name-only", ARM, "--", "src", "pyproject.toml").decode().splitlines()]
+    assert "src/knee/nb/n13.py" in tracked and "src/knee/heads.py" in tracked and "src/knee/nb/n6.py" in tracked
+    for f in tracked:
+        if f != "src/knee/nb/n13.py":
+            assert _git("show", f"{ARM}:{f}") == (REPO / f).read_bytes(), f
+    on_disk = {p.relative_to(REPO).as_posix() for p in (REPO / "src").rglob("*.py")}
+    assert on_disk <= set(tracked)  # no module was added
+    old, new = _top(_git("show", f"{ARM}:src/knee/nb/n13.py").decode()), _top((REPO / "src/knee/nb/n13.py").read_text())
+    kept_old = [text for names, text in old if not names & DECIDE_ONLY]
+    kept_new = [text for names, text in new if not names & (DECIDE_ONLY | DECIDE_NEW)]
+    assert kept_old == kept_new and len(kept_old) == len(old) - 1  # same text, same order; one statement changed
+    added = set().union(*(names for names, _ in new)) - set().union(*(names for names, _ in old))
+    assert added == DECIDE_NEW
+    by_name = {name: text for names, text in new for name in names}
+    reach, todo = set(), ["run"]
+    while todo:  # every module-level name that n13.run can reach, by reference
+        name = todo.pop()
+        if name in reach:
+            continue
+        reach.add(name)
+        todo += [x for x in _refs(by_name[name]) if x in by_name]
+    assert {"run", "run_batch", "_batch_task", "_batch_unit", "batch_summary", "batch_settings", "chosen_configs",
+            "environment", "BATCH_ARMS", "BATCH_PLAN", "CHOSEN_REF", "BATCH_BUDGET_H"} <= reach
+    assert not reach & (DECIDE_ONLY | DECIDE_NEW)
+    assert all(by_name[name] in kept_old for name in reach)  # each is the text of commit 39c3c6f
+    from knee.nb import n13
+
+    assert n13.ARM_COMMIT == ARM and n13.BATCH_PLAN.startswith("it2b_batch_floor_r1.md")  # the arms' own label
+
+
 # ---------------------------------------------------------------- the notebooks
 
 def test_the_three_notebooks_are_registered_as_cpu_notebooks():
@@ -607,3 +842,13 @@ def test_the_three_notebooks_are_registered_as_cpu_notebooks():
         assert timeout >= 1.1 * 6.0 * 3600  # above the step's watchdog
         assert f"| knee-{name} | None (CPU) |" in card and f"`{mk.cell2(name)}`" in card
     assert "knee-n0, knee-n5, knee-n3-r and knee-n6a" in card and "n13.decide_batch(bc, b8, b4, base0, null)" in card
+    # the card of declaration r2: the commit of the three sessions, the notebook to fork, no retry after a crash
+    assert mk.BATCH_COMMIT == ARM and f'`COMMIT = "{ARM}"`' in card and "it2b_batch_floor_r2.md" in card
+    assert "fork of knee-n13-base0" in card and "original environment" in card and "replace cell 2" in card
+    assert "A worker crash is not retried" in card and "Do not restart the session" in card
+    for status in ("no_base", "leakage_check_failed", "chosen_ref_not_checked", "commit_mismatch", "env_mismatch"):
+        assert f'"{status}"' in card
+    for name in ("n13-bc", "n13-b8", "n13-b4"):  # the generator pins cell 1 of the three, whatever --commit says
+        assert mk.commit_for(name, "0123abc") == ARM
+        assert mk.notebook_json(mk.commit_for(name, "0123abc"), mk.cell2(name))["cells"][0]["source"][0] == f'COMMIT = "{ARM}"\n'
+    assert mk.commit_for("n13-base0", "0123abc") == "0123abc"
