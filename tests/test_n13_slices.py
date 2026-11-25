@@ -1,4 +1,4 @@
-"""The slice-count check (it2c_slice_count_r2.md): n13s's arms s32, s16, s16b, s8 and s4 and n13s.decide_slices.
+"""The slice-count check (it2c_slice_count_r3.md; the arms carry the label of r2): n13s's arms s32, s16, s16b, s8 and s4 and n13s.decide_slices.
 
 Synthetic data with 32 slices per plane, CPU. The arms fit the unit's chosen Stage A configuration at its
 chosen batch size on its inner folds, as n13's arm bc does; only the slices the head reads differ.
@@ -381,7 +381,10 @@ S32 = {"dinov2_vits14": [0.7240, 0.7410, 0.7350, 0.7420, 0.7360], "convnext_tiny
 DN, CX = MAIN
 ENDING = ("One seed. Head settings were tuned at 32 slices and not re-tuned. More than 32 slices was not tested: "
           "it needs a new cache. Differences under 0.005 cannot be shown by this check.")
-NOT_MET = "This does not meet the declared rule (more than 0.005 and 4 of 5 folds), so it is not counted as an effect."
+NOT_MET = ("This does not meet the declared rule (more than 0.005 at 4 decimals, and 4 of 5 folds), so it is not "
+           "counted as an effect.")
+NO_CACHE = "More than 32 slices was not tested: it needs a new cache."  # the ending of a no-verdict sentence set
+EDGE = "32 is the largest count tested, so the curve may still rise beyond it."
 FIXED = "The slice count was fixed at 32 and not searched."
 NONE_LINE = ("No count from 4 to 32 differed by the declared margin. This check does not show that 32 is needed and "
              "does not show that fewer is enough.")
@@ -500,7 +503,7 @@ def test_decide_slices_verdicts_by_the_declared_rule(tmp_path):
     assert r["status"] == "decided" and r["added_after_results"] is True and r["same_knee_commit"] is True
     assert round(r["s"], 4) == 0.0030 == r["s_declared"] and r["threshold"] == 0.005 and r["min_gain"] == 0.005
     assert abs(r["threshold_unrounded"] - 0.005) < 1e-12  # 2 s / sqrt(5) = 0.0027 does not bind
-    assert r["plan"] == n13s.SLICE_PLAN and r["declaration"].startswith("it2c_slice_count_r2.md")
+    assert r["plan"] == n13s.SLICE_PLAN and r["declaration"].startswith("it2c_slice_count_r3.md")
     assert r["knee_commits"] == [n13s.SLICE_ARM_COMMIT] and r["knee_commit_is_declared"] is True
     assert r["leakage_assertion_passed"] is True and r["chosen_ref_checked"] is True and r["replaced_runs"] == {}
     e = r["encoders"]
@@ -522,19 +525,20 @@ def test_decide_slices_verdicts_by_the_declared_rule(tmp_path):
     # section 6's sentences
     w = {(enc, arm): (e[enc][arm]["words"], e[enc][arm]["words_extra"], e[enc][arm]["words_limits"]) for enc in MAIN for arm in ("s16", "s8", "s4")}
     assert w[(DN, "s4")] == ("With 4 of the 32 cached slices per plane the head scored 0.0058 lower on inner validation "
-                             "(DINOv2, lower in 4 of 5 folds).", None, ENDING)
+                             "(DINOv2, lower in 4 of 5 folds).", None, None)
     assert w[(CX, "s8")] == ("With 8 of the 32 cached slices per plane the head scored 0.0058 higher on inner validation "
-                             "(ConvNeXt-T, higher in 4 of 5 folds).", "The models were not changed.", ENDING)
+                             "(ConvNeXt-T, higher in 4 of 5 folds).", "The models were not changed.", None)
     assert w[(DN, "s8")] == ("With 8 of the 32 cached slices per plane the head scored 0.0060 lower on inner validation "
-                             "(DINOv2, lower in 3 of 5 folds).", NOT_MET, ENDING)
+                             "(DINOv2, lower in 3 of 5 folds).", NOT_MET, None)
     assert w[(CX, "s16")] == ("With 16 of the 32 cached slices per plane the head scored 0.0050 lower on inner validation "
-                              "(ConvNeXt-T, lower in 5 of 5 folds).", NOT_MET, ENDING)
+                              "(ConvNeXt-T, lower in 5 of 5 folds).", NOT_MET, None)
     lines = n13s.slice_slide_sentences(r)
     assert lines[:6] == [" ".join(p for p in w[(enc, arm)] if p) for enc in MAIN for arm in ("s16", "s8", "s4")]
-    assert all(x.endswith(ENDING) for x in lines[:6])
-    # the summary line: a cost verdict names the largest such count; a "scored higher" is an open point
-    assert r["summary_words"] == lines[6:] == [
-        "Fewer slices cost from 4 down. 32 is the largest count tested, so the curve may still rise beyond it.",
+    assert not any(ENDING in x for x in lines[:6])  # the common ending is given once per slide, as the last line
+    assert lines[-1] == ENDING == r["words_ending"] and lines.count(ENDING) == 1 and len(lines) == 9
+    # the summary lines: the counts that cost, per encoder; a "scored higher" is an open point
+    assert r["summary_words"] == lines[6:8] == [
+        f"Fewer slices cost at 4 (DINOv2). {EDGE}",
         "Open point: with 8 of the 32 cached slices per plane the head scored higher (ConvNeXt-T). The models were not changed."]
     # descriptive: the rerun check, the position effect, the table, the medians
     rc = r["rerun_check"]
@@ -599,8 +603,8 @@ def test_decide_slices_no_difference_sentences_ties_and_the_summary_line(tmp_pat
         "With 4 of the 32 cached slices per plane the head scored 0.0028 lower on inner validation "
         "(DINOv2, lower in 4 of 5 folds).", NOT_MET)
     lines = n13s.slice_slide_sentences(r)
-    assert len(lines) == 7 and lines[6] == NONE_LINE and r["summary_words"] == [NONE_LINE]  # no arm differed
-    assert lines[0] == f"{e[DN]['s16']['words']} {ENDING}" and lines[2] == f"{e[DN]['s4']['words']} {NOT_MET} {ENDING}"
+    assert len(lines) == 8 and lines[6] == NONE_LINE and r["summary_words"] == [NONE_LINE]  # no arm differed
+    assert lines[0] == e[DN]["s16"]["words"] and lines[2] == f"{e[DN]['s4']['words']} {NOT_MET}" and lines[7] == ENDING
     assert r["position_effect"]["s16b_ran"] is False and r["arms"]["s16b"] is None  # s16b missing: the verdicts stand
     assert r["position_effect"]["s16b_minus_s16"][DN] == {"folds": [], "per_fold": {}, "mean": None, "all_folds": False}
     assert r["units"][f"{DN}_f0"]["s16b"] == {"inner_score": None, "E": None, "minus_s32": None}
@@ -609,7 +613,7 @@ def test_decide_slices_no_difference_sentences_ties_and_the_summary_line(tmp_pat
     r2 = _decide(s16={DN: DOWN4, CX: TIE_DOWN}, s8={DN: DOWN4, CX: DOWN4}, s4={DN: FLAT, CX: DOWN4})
     assert [r2["encoders"][DN][a]["verdict"] for a in ("s16", "s8", "s4")] == ["fewer slices cost"] * 2 + ["no difference shown"]
     assert r2["encoders"][CX]["s16"]["verdict"] == "no difference shown"
-    assert r2["summary_words"] == ["Fewer slices cost from 16 down. 32 is the largest count tested, so the curve may still rise beyond it."]
+    assert r2["summary_words"] == [f"Fewer slices cost at 16 and 8 (DINOv2). {EDGE}", f"Fewer slices cost at 8 and 4 (ConvNeXt-T). {EDGE}"]
     # four folds lower and one at 0.0000: lower in 4 of 5 folds
     four = [-0.010, -0.010, -0.010, -0.010, 0.0]
     r3 = _decide(s16={DN: four, CX: [-x for x in four]}, s8={}, s4={})
@@ -634,22 +638,41 @@ def test_decide_slices_gives_no_verdict_with_fewer_than_5_folds(tmp_path):
     assert c16["reason"] == "fewer than 5 folds finished in the arm and in s32" and "diff_unrounded" not in c16
     assert c16["per_fold"] == {0: -0.008, 1: -0.007, 2: -0.006} and c16["lower"] == {"folds": [0, 1, 2]}
     assert (c16["words"], c16["words_extra"]) == (
-        "16 slices, ConvNeXt-T: no verdict (fewer than 5 folds finished in the arm and in s32).", FIXED)
+        "16 slices, ConvNeXt-T: no verdict (fewer than 5 folds finished in the arm and in s32).",
+        f"{FIXED} Finished: s32 5 of 5 folds, s16 3 of 5 folds.")
+    assert c16["words_limits"] == NO_CACHE
     assert r["encoders"][DN]["s16"]["verdict"] == "fewer slices cost"  # the other encoder is whole
     assert r["encoders"][CX]["s8"]["verdict"] == "fewer slices cost"  # and so is the other arm
     s4 = r["encoders"][DN]["s4"]
     assert (s4["verdict"], s4["reason"], s4["words"]) == ("no verdict", "the arm did not run", "4 slices, DINOv2: no verdict (the arm did not run).")
     assert r["arms"]["s4"] is None and r["units"][f"{CX}_f3"]["s16"] == {"inner_score": None, "E": None, "minus_s32": None}
     lines = n13s.slice_slide_sentences(r)
-    assert lines[2] == f"4 slices, DINOv2: no verdict (the arm did not run). {FIXED} {ENDING}"
-    assert lines[6:] == ["Fewer slices cost from 16 down. 32 is the largest count tested, so the curve may still rise beyond it."]
+    assert lines[2] == (f"4 slices, DINOv2: no verdict (the arm did not run). {FIXED} "
+                        f"Finished: s32 5 of 5 folds, s4 0 of 5 folds. {NO_CACHE}")
+    assert lines[6:] == [f"Fewer slices cost at 16 and 8 (DINOv2). {EDGE}", f"Fewer slices cost at 8 (ConvNeXt-T). {EDGE}",
+                         "3 of 6 comparisons have no verdict.", ENDING]  # T2: a cost line beside missing verdicts
     pe = r["position_effect"]["s16b_minus_s16"]  # a partial s16b: its finished folds, and it changes no verdict
     assert pe[DN]["folds"] == [1, 2, 3, 4] and pe[DN]["all_folds"] is False and pe[CX]["folds"] == [0, 1, 2]
     assert r["mean_inner_score"][CX]["s16"] is None and r["mean_inner_score"][CX]["s8"] is not None
     _checked(r, tmp_path / "part")
-    # without a cost and with a missing verdict there is no summary line: "no count differed" is not known
+    # T2: without a cost and with a missing verdict, "no count from 4 to 32 differed" is not known
     rp = _decide(s16={}, s8={}, s4=None)
-    assert rp["status"] == "partial" and rp["summary_words"] == []
+    assert rp["status"] == "partial" and rp["summary_words"] == [
+        "No comparison with a verdict differed by the declared margin; 2 of 6 comparisons have no verdict."]
+    lp = n13s.slice_slide_sentences(rp)
+    assert len(lp) == 8 and lp[6] == rp["summary_words"][0] and lp[7] == ENDING and NONE_LINE not in lp
+    assert lp[5] == f"4 slices, ConvNeXt-T: no verdict (the arm did not run). {FIXED} Finished: s32 5 of 5 folds, s4 0 of 5 folds. {NO_CACHE}"
+    # a "scored higher" beside a missing verdict: the open point and the count of missing verdicts
+    rh = _decide(s16={CX: UP4}, s8={}, s4=None)
+    assert rh["summary_words"] == ["Open point: with 16 of the 32 cached slices per plane the head scored higher "
+                                   "(ConvNeXt-T). The models were not changed.", "2 of 6 comparisons have no verdict."]
+    # no comparison has a verdict (s32 partial in both encoders): no claim about differences, no common ending
+    rz = _decide(s16={}, s8={}, s4={}, s32=_s("s32", stopped={(DN, 0), (CX, 4)}))
+    assert rz["status"] == "partial" and rz["summary_words"] == ["6 of 6 comparisons have no verdict."] and rz["words_ending"] is None
+    lz = n13s.slice_slide_sentences(rz)
+    assert len(lz) == 7 and ENDING not in lz and not any("cannot be shown" in x for x in lz)
+    assert lz[0] == (f"16 slices, DINOv2: no verdict (fewer than 5 folds finished in the arm and in s32). {FIXED} "
+                     f"Finished: s32 4 of 5 folds, s16 5 of 5 folds. {NO_CACHE}")
     # a fold missing in the base takes the verdict from every arm for that encoder
     rb = _decide(s16=down, s8=down, s4=down, s32=_s("s32", stopped={(DN, 0)}))
     assert [rb["encoders"][DN][a]["verdict"] for a in ("s16", "s8", "s4")] == ["no verdict"] * 3
@@ -657,20 +680,24 @@ def test_decide_slices_gives_no_verdict_with_fewer_than_5_folds(tmp_path):
     assert rb["rerun_check"]["units_checked"] == sorted(f"{e}_f{k}" for e in MAIN for k in range(5) if (e, k) != (DN, 0))
     # s32 did not run: no verdict at all
     r0 = _decide(s16=down, s8=down, s4=down, s32=None)
-    assert r0["status"] == "no_base" and "units" not in r0 and r0["summary_words"] == []
+    assert r0["status"] == "no_base" and "units" not in r0 and r0["summary_words"] == ["6 of 6 comparisons have no verdict."]
     recs = [v[a] for v in r0["encoders"].values() for a in ("s16", "s8", "s4")]
     assert all((x["verdict"], x["diff"], x["reason"]) == ("no verdict", None, "the s32 arm (the base) did not run") for x in recs)
-    assert n13s.slice_slide_sentences(r0)[0] == f"16 slices, DINOv2: no verdict (the s32 arm (the base) did not run). {FIXED} {ENDING}"
-    assert len(n13s.slice_slide_sentences(r0)) == 6
+    assert n13s.slice_slide_sentences(r0)[0] == (f"16 slices, DINOv2: no verdict (the s32 arm (the base) did not run). {FIXED} "
+                                                 f"Status: no_base. Arms given: s16, s8, s4. {NO_CACHE}")
+    assert len(n13s.slice_slide_sentences(r0)) == 7 and r0["words_ending"] is None  # nothing was compared: no common ending
+    assert not any("cannot be shown" in x for x in n13s.slice_slide_sentences(r0))
     _checked(r0, tmp_path / "no_base")
 
 
 def _all_none(r, status, reason):
-    assert r["status"] == status and "units" not in r and "rerun_check" not in r and r["summary_words"] == []
+    assert r["status"] == status and "units" not in r and "rerun_check" not in r and r["words_ending"] is None
+    assert r["summary_words"] == ["6 of 6 comparisons have no verdict."]
     recs = [v[a] for v in r["encoders"].values() for a in ("s16", "s8", "s4")]
     assert len(recs) == 6
     assert all((x["verdict"], x["diff"], x["folds_up"], x["reason"]) == ("no verdict", None, None, reason) for x in recs)
-    assert all(x["words"].endswith(f"no verdict ({reason}).") and x["words_extra"] == FIXED for x in recs)
+    assert all(x["words"].endswith(f"no verdict ({reason}).") and x["words_limits"] == NO_CACHE for x in recs)
+    assert all(x["words_extra"].startswith(f"{FIXED} Status: {status}. Arms given: ") for x in recs)  # what ran
     return r
 
 
@@ -688,6 +715,7 @@ def test_decide_slices_statuses_leakage_chosen_ref_commit_environment(tmp_path):
         r = _all_none(_decide(s16=edited("s16", leakage_assertion_passed=bad), s8=down, s4=down),
                       "leakage_check_failed", "an arm's leakage check did not pass")
         assert r["leakage_failed_steps"] == ["n13_s16"] and r["leakage_assertion_passed"] is False
+        assert r["encoders"][DN]["s8"]["words_extra"] == f"{FIXED} Status: leakage_check_failed. Arms given: s32, s16, s8, s4."
     _checked(r, tmp_path / "leak")
     assert _decide(s16=down, s8=down, s4=down, s16b=edited("s16b", leakage_assertion_passed=False))["leakage_failed_steps"] == ["n13_s16b"]
     assert _decide(s16=down, s8=down, s4=down, s32=edited("s32", leakage_assertion_passed=False))["status"] == "leakage_check_failed"
@@ -789,7 +817,7 @@ def test_decide_slices_rerun_check_lists_units_above_the_tolerance(tmp_path):
     rc = tie["rerun_check"]
     assert tie["units"][f"{DN}_f0"]["s32_minus_bc"] == -0.0005 and rc["units_outside"] == [] and rc["words"] is None
     assert rc["identical"] is False and tie["s32_reruns_bc"] is False and rc["max_abs_difference"] == 0.0005
-    assert len(n13s.slice_slide_sentences(tie)) == 7
+    assert len(n13s.slice_slide_sentences(tie)) == 8
     out = _decide(s16=down, s8=down, s4=down, bc=_bc({DN: [0.0006, 0, 0, 0, 0], CX: [0, 0, -0.0020, 0, 0]}))
     rc = out["rerun_check"]
     assert rc["units_outside"] == [f"{DN}_f0", f"{CX}_f2"]  # listed; the verdict is still given
@@ -798,7 +826,8 @@ def test_decide_slices_rerun_check_lists_units_above_the_tolerance(tmp_path):
                            "than 0.0005 in 2 of 10 units (largest difference 0.0020).")
     assert out["status"] == "decided" and out["encoders"] == tie["encoders"]  # bc never enters a verdict
     lines = n13s.slice_slide_sentences(out)
-    assert len(lines) == 8 and lines[7] == rc["words"] and lines[6].startswith("Fewer slices cost from 16 down.")
+    assert len(lines) == 9 and lines[6] == f"Fewer slices cost at 16, 8 and 4 (DINOv2). {EDGE}"
+    assert lines[7] == rc["words"] and lines[8] == ENDING  # the common ending is the last line
     _checked(out, tmp_path)
     # a missing bc unit is not checked; no bc at all: nothing to compare
     part = _decide(s16=down, s8=down, s4=down, bc=_bc(stopped={(CX, 1)}))
@@ -809,11 +838,109 @@ def test_decide_slices_rerun_check_lists_units_above_the_tolerance(tmp_path):
     _checked(none, tmp_path / "none")
 
 
+def test_summary_line_names_the_counts_that_cost_per_encoder(tmp_path):
+    """T1 (code review r1, S1): the summary never says "from <n> down"; it lists the counts with a cost verdict."""
+    from knee.nb import n13s
+
+    assert [n13s._counts_text(c) for c in ([16], [4, 16], [8, 4, 16])] == ["16", "16 and 4", "16, 8 and 4"]
+    # one encoder, one count: s16 cost on DINOv2 only, everything else flat
+    one = _decide(s16={DN: DOWN4}, s8={}, s4={})
+    assert [one["encoders"][e][a]["verdict"] for e in MAIN for a in ("s16", "s8", "s4")] == (
+        ["fewer slices cost"] + ["no difference shown"] * 5)
+    assert one["summary_words"] == [f"Fewer slices cost at 16 (DINOv2). {EDGE}"]
+    lines = n13s.slice_slide_sentences(one)
+    assert lines[6:] == [f"Fewer slices cost at 16 (DINOv2). {EDGE}", ENDING]
+    assert lines[1] == "With 8 of the 32 cached slices per plane the head scored the same on inner validation (DINOv2)."
+    assert not any("down" in x or "ConvNeXt-T). 32 is" in x for x in lines) and NONE_LINE not in lines
+    _checked(one, tmp_path / "one")
+    # not monotone: 16 and 4 cost, 8 does not meet the rule (DINOv2); only 8 cost on ConvNeXt-T
+    mixed = _decide(s16={DN: DOWN4}, s8={DN: DOWN3, CX: DOWN4}, s4={DN: DOWN4})
+    assert mixed["encoders"][DN]["s8"]["verdict"] == "no difference shown"
+    assert mixed["summary_words"] == [f"Fewer slices cost at 16 and 4 (DINOv2). {EDGE}", f"Fewer slices cost at 8 (ConvNeXt-T). {EDGE}"]
+    # every count on one encoder, with an open point on the other
+    every = _decide(s16={DN: DOWN4}, s8={DN: DOWN4}, s4={DN: DOWN4, CX: UP4})
+    assert every["summary_words"] == [
+        f"Fewer slices cost at 16, 8 and 4 (DINOv2). {EDGE}",
+        "Open point: with 4 of the 32 cached slices per plane the head scored higher (ConvNeXt-T). The models were not changed."]
+    assert n13s.slice_slide_sentences(every)[-1] == ENDING
+    _checked(every, tmp_path / "every")
+
+
+def test_a_mean_of_minus_0_00504_is_a_tie_at_4_decimals_and_the_sentence_says_so():
+    """T4 (code review r1, S5): unrounded mean -0.00504, lower in 5 of 5 folds: inside "no difference shown"."""
+    near = [-0.0051, -0.0051, -0.0050, -0.0050, -0.0050]  # the sum is -0.0252
+    r = _decide(s16={DN: near, CX: [-x for x in near]}, s8={DN: [-0.0051] * 5}, s4={})
+    x = r["encoders"][DN]["s16"]
+    assert abs(x["diff_unrounded"] - (-0.00504)) < 1e-9 and x["diff"] == -0.005 and x["lower"] == {"folds": [0, 1, 2, 3, 4]}
+    assert x["verdict"] == "no difference shown"
+    assert (x["words"], x["words_extra"]) == (
+        "With 16 of the 32 cached slices per plane the head scored 0.0050 lower on inner validation "
+        "(DINOv2, lower in 5 of 5 folds).",
+        "This does not meet the declared rule (more than 0.005 at 4 decimals, and 4 of 5 folds), so it is not counted as an effect.")
+    y = r["encoders"][CX]["s16"]  # the same on the other side
+    assert abs(y["diff_unrounded"] - 0.00504) < 1e-9 and (y["verdict"], y["diff"]) == ("no difference shown", 0.005)
+    assert "scored 0.0050 higher" in y["words"] and "at 4 decimals" in y["words_extra"]
+    z = r["encoders"][DN]["s8"]  # -0.0051 is beyond the tie
+    assert (z["verdict"], z["diff"]) == ("fewer slices cost", -0.0051)
+
+
+def test_two_encoders_in_one_worker_each_get_their_own_cut_bank(worker, tmp_path, monkeypatch, one_thread):
+    """T3 (code review r1): a worker runs DINOv2 units and then ConvNeXt-T units; n6._bank replaces its cached
+    bank on the switch and _arm_bank must cut the new one, never reuse the first encoder's copy."""
+    from knee.nb import n6, n13, n13s
+
+    pos = POS["s8"]
+    dn_bank = n6._bank(DN)
+    dn_x = {p: a.clone() for p, a in dn_bank.x.items()}
+    cut_dn = n13s._arm_bank(DN, "s8")
+    assert n13s._S["source"] is dn_bank and n13s._arm_bank(DN, "s8") is cut_dn
+    assert all(torch.equal(cut_dn.x[p], dn_x[p][:, pos, :]) for p in heads.PLANES)
+    cut_cx = n13s._arm_bank(CX, "s8")  # the encoder changes: n6 loads the other bank
+    cx_bank = n6._W["bank"]
+    assert n6._W["bank_enc"] == CX and cx_bank is not dn_bank and cut_cx is not cut_dn
+    assert n13s._S["source"] is cx_bank and n13s._S["arm"] == "s8" and n13s._S["bank"] is cut_cx
+    for p in heads.PLANES:
+        assert torch.equal(cut_cx.x[p], cx_bank.x[p][:, pos, :]) and not torch.equal(cut_cx.x[p], cut_dn.x[p])
+        assert cx_bank.x[p].shape[1] == 32
+    for p in heads.FLIP_PLANES:
+        assert torch.equal(cut_cx.flip[p], cx_bank.flip[p][:, pos, :])
+    assert n13s._arm_bank(CX, "s32") is cx_bank and n13s._S["bank"] is cut_cx  # s32 does not touch the cut copy
+    back = n13s._arm_bank(DN, "s8")  # and back: a new bank object from n6, a new cut
+    assert n13s._S["source"] is n6._W["bank"] and back is not cut_cx
+    assert all(torch.equal(back.x[p], dn_x[p][:, pos, :]) for p in heads.PLANES)
+    # the units of both encoders, one after the other in this worker: each fit reads its own encoder's cut
+    chosen = n13.chosen_configs(worker / "input")
+    seen = []
+    real_fit = heads.fit
+
+    def fit(bank, *a, **kw):
+        seen.append((n6._W["bank_enc"], bank, n6._W["bank"]))
+        return real_fit(bank, *a, **kw)
+
+    monkeypatch.setattr(heads, "fit", fit)
+    out = {}
+    for e in (DN, CX):
+        r = n13s._slice_unit(_task("s8", chosen[(e, 1)]["config"], enc=e, fold=1), tmp_path / "never_made")
+        assert r["ok"] and r["fits"] == r["guard_checks"] == 4
+        out[e] = r["summary"]
+    assert [e for e, _, _ in seen] == [DN] * 4 + [CX] * 4
+    for e, bank, source in seen:
+        assert bank is not source and all(torch.equal(bank.x[p], source.x[p][:, pos, :]) for p in heads.PLANES)
+    assert seen[0][1] is not seen[4][1] and seen[0][2] is not seen[4][2]
+    # the second encoder's score is the one a fresh worker gives
+    monkeypatch.setattr(heads, "fit", real_fit)
+    monkeypatch.setattr(n6, "_W", {"root": str(worker / "input"), "expect": None, "device": "cpu", "shared": None})
+    monkeypatch.setattr(n13s, "_S", {})
+    fresh = n13s._slice_unit(_task("s8", chosen[(CX, 1)]["config"], enc=CX, fold=1), tmp_path / "never_made")["summary"]
+    assert fresh["inner_score"] == out[CX]["inner_score"] and fresh["epochs"] == out[CX]["epochs"]
+    assert out[DN]["inner_score"] != out[CX]["inner_score"]
+
+
 # ---------------------------------------------------------------- the arm run path is SLICE_ARM_COMMIT's
 
 DECIDE_NEW = {"SLICE_DECLARATION", "SLICE_ARM_COMMIT", "VERDICT_ARMS", "COST", "HIGHER", "NO_DIFF", "NO_VERDICT",
-              "RERUN_TOL", "WORDS_ENDING", "WORDS_NOT_CHANGED", "WORDS_FIXED", "WORDS_NONE", "_slice_arm",
-              "decide_slices", "slice_slide_sentences"}  # added after the arm commit
+              "RERUN_TOL", "WORDS_ENDING", "WORDS_NOT_CHANGED", "WORDS_FIXED", "WORDS_NONE", "WORDS_NO_CACHE", "WORDS_EDGE",
+              "N_COMPARISONS", "_counts_text", "_summary_lines", "_slice_arm", "decide_slices", "slice_slide_sentences"}  # added after the arm commit
 
 
 def _top(src: str) -> list:
@@ -911,7 +1038,7 @@ def test_the_five_notebooks_are_registered_as_cpu_notebooks():
         assert mk.commit_for(name, "0123abc") == arm_commit  # cell 1 is pinned, whatever --commit says
         assert mk.notebook_json(mk.commit_for(name, "0123abc"), mk.cell2(name))["cells"][0]["source"][0] == f'COMMIT = "{arm_commit}"\n'
     assert mk.commit_for("n13-bc", "0123abc") == mk.BATCH_COMMIT and mk.commit_for("n13-base0", "0123abc") == "0123abc"
-    assert f'`COMMIT = "{arm_commit}"`' in card and "it2c_slice_count_r2.md" in card
+    assert f'`COMMIT = "{arm_commit}"`' in card and "it2c_slice_count_r3.md" in card
     assert "fork of knee-n13-bc" in card and "original environment" in card and "replace cell 2" in card
     assert "A worker crash is not retried" in card and "n13s.decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=s16b)" in card
     for status in ("no_base", "leakage_check_failed", "chosen_ref_not_checked", "commit_mismatch", "env_mismatch"):

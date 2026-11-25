@@ -307,10 +307,10 @@ def run_slices(arm: str, expect: dict | None = None, root=None, workers: int = 4
     return out
 
 
-# ---- the local decide step of the slice-count check (declaration r2, sections 4 to 7) ----
+# ---- the local decide step of the slice-count check (declaration r3, sections 4 to 7; code review r1) ----
 # Everything from here on runs outside Kaggle only. The five arms run at SLICE_ARM_COMMIT; nothing that
 # run_slices reaches was changed after that commit (tests/test_n13_slices.py proves it on the text).
-SLICE_DECLARATION = "it2c_slice_count_r2.md: r2, after review r1; the arms run at SLICE_ARM_COMMIT, the decide step later"
+SLICE_DECLARATION = "it2c_slice_count_r3.md: r3 (the arm commit, the summary lines); the arms run at SLICE_ARM_COMMIT, the decide step later"
 SLICE_ARM_COMMIT = "ecf264fcc11b780e53940b29de86e5a0fc512ae2"  # the commit the five Kaggle sessions install
 VERDICT_ARMS = ("s16", "s8", "s4")  # s16b is descriptive only: never a verdict
 COST, HIGHER, NO_DIFF, NO_VERDICT = "fewer slices cost", "fewer slices scored higher", "no difference shown", "no verdict"
@@ -321,6 +321,40 @@ WORDS_NOT_CHANGED = "The models were not changed."
 WORDS_FIXED = "The slice count was fixed at 32 and not searched."
 WORDS_NONE = ("No count from 4 to 32 differed by the declared margin. This check does not show that 32 is needed "
               "and does not show that fewer is enough.")
+WORDS_NO_CACHE = "More than 32 slices was not tested: it needs a new cache."  # the ending of a no-verdict sentence set
+WORDS_EDGE = "32 is the largest count tested, so the curve may still rise beyond it."
+N_COMPARISONS = len(MAIN) * len(VERDICT_ARMS)  # six verdict comparisons
+
+
+def _counts_text(counts) -> str:
+    """Counts, largest first: "16", "16 and 4", "16, 8 and 4"."""
+    c = [str(x) for x in sorted(set(counts), reverse=True)]
+    return c[0] if len(c) == 1 else ", ".join(c[:-1]) + " and " + c[-1]
+
+
+def _summary_lines(verdicts: dict) -> list:
+    """The summary lines of the slide (declaration r3, section 7; code review r1, S1 and S2), from
+    {(encoder, arm): verdict}. They never name a count as the one to use."""
+    out = []
+    for e in MAIN:
+        cost = [SLICE_ARMS[arm] for arm in VERDICT_ARMS if verdicts[(e, arm)] == COST]
+        if cost:
+            out.append(f"Fewer slices cost at {_counts_text(cost)} ({n13.ENC_WORDS[e]}). {WORDS_EDGE}")
+    any_cost = bool(out)
+    for e in MAIN:
+        for arm in VERDICT_ARMS:
+            if verdicts[(e, arm)] == HIGHER:
+                out.append(f"Open point: with {SLICE_ARMS[arm]} of the 32 cached slices per plane the head scored "
+                           f"higher ({n13.ENC_WORDS[e]}). {WORDS_NOT_CHANGED}")
+    k = sum(1 for v in verdicts.values() if v == NO_VERDICT)
+    if all(v == NO_DIFF for v in verdicts.values()):
+        out.append(WORDS_NONE)
+    elif k and not out and k < N_COMPARISONS:
+        out.append(f"No comparison with a verdict differed by the declared margin; {k} of {N_COMPARISONS} "
+                   "comparisons have no verdict.")
+    elif k:
+        out.append(f"{k} of {N_COMPARISONS} comparisons have no verdict.")
+    return out
 
 
 def _slice_arm(label: str, summaries) -> dict | None:
@@ -375,6 +409,9 @@ def decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=None, min_gain: float 
                   "fewer slices scored higher" if diff > threshold and higher in at least 4 folds;
                   else "no difference shown" (a tie at 0.0050 is inside).
     An encoder with fewer than 5 folds finished in the arm and in s32 gets "no verdict" for that arm.
+    Sentences per encoder and arm: words (the outcome), words_extra and words_limits (only a no-verdict set
+    has its own ending); summary_words (the summary lines) and words_ending (the common ending, given once
+    per slide when at least one comparison has a verdict); slice_slide_sentences() joins them.
     Descriptive, never in a verdict: s32 minus bc per unit (rerun_check; units above RERUN_TOL are listed),
     s16b minus s16 and s16b minus s32 per encoder (position_effect), the per-unit table, the mean inner
     score and the median best epoch per arm.
@@ -436,12 +473,15 @@ def decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=None, min_gain: float 
                          "s was measured at 32 slices; it may understate noise at 4 slices (a difference is called too easily)"]}
 
     def stop(status: str, reason: str, **extra) -> dict:
+        ran_words = f"Status: {status}. Arms given: {', '.join(ran) if ran else 'none'}."  # what ran
         enc = {e: {arm: {"verdict": NO_VERDICT, "reason": reason, "diff": None, "threshold": threshold,
                          "folds_up": None, "lower": {"folds": []}, "higher": {"folds": []}, "folds": [], "per_fold": {},
                          "words": f"{SLICE_ARMS[arm]} slices, {n13.ENC_WORDS[e]}: no verdict ({reason}).",
-                         "words_extra": WORDS_FIXED, "words_limits": WORDS_ENDING}
+                         "words_extra": f"{WORDS_FIXED} {ran_words}", "words_limits": WORDS_NO_CACHE}
                    for arm in VERDICT_ARMS} for e in MAIN}
-        return {"status": status, **extra, "encoders": enc, "summary_words": [], **record}
+        return {"status": status, **extra, "encoders": enc,
+                "summary_words": _summary_lines({(e, arm): NO_VERDICT for e in MAIN for arm in VERDICT_ARMS}),
+                "words_ending": None, **record}
 
     if arms["s32"] is None:
         return stop("no_base", "the s32 arm (the base) did not run")
@@ -465,23 +505,26 @@ def decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=None, min_gain: float 
         return float(u["inner_score"]) if u and u.get("ok") else None
 
     def words(arm, e, rec) -> tuple:
-        """(outcome, extra, ending): one sentence set per encoder and arm (declaration r2, section 6)."""
+        """(outcome, extra, own ending): one sentence set per encoder and arm (declaration r3, section 6).
+        Only a no-verdict set has its own ending; the common ending is given once per slide (words_ending)."""
         n, name = SLICE_ARMS[arm], n13.ENC_WORDS[e]
         if rec["verdict"] == NO_VERDICT:
-            return f"{n} slices, {name}: no verdict ({rec['reason']}).", WORDS_FIXED, WORDS_ENDING
+            done = {label: sum(1 for k in folds if score(arms[label], e, k) is not None) for label in ("s32", arm)}
+            ran_words = f"Finished: s32 {done['s32']} of 5 folds, {arm} {done[arm]} of 5 folds."  # what ran
+            return f"{n} slices, {name}: no verdict ({rec['reason']}).", f"{WORDS_FIXED} {ran_words}", WORDS_NO_CACHE
         d = rec["diff"]
         if d == 0:  # at 4 decimals
             return (f"With {n} of the 32 cached slices per plane the head scored the same on inner validation "
-                    f"({name})."), None, WORDS_ENDING
+                    f"({name})."), None, None
         side = "lower" if d < 0 else "higher"
         outcome = (f"With {n} of the 32 cached slices per plane the head scored {abs(d):.4f} {side} on inner "
                    f"validation ({name}, {side} in {len(rec[side]['folds'])} of 5 folds).")
         if rec["verdict"] == COST:
-            return outcome, None, WORDS_ENDING
+            return outcome, None, None
         if rec["verdict"] == HIGHER:
-            return outcome, WORDS_NOT_CHANGED, WORDS_ENDING
-        return outcome, (f"This does not meet the declared rule (more than {threshold:g} and {n13.MIN_FOLDS_UP} of 5 "
-                         "folds), so it is not counted as an effect."), WORDS_ENDING
+            return outcome, WORDS_NOT_CHANGED, None
+        return outcome, (f"This does not meet the declared rule (more than {threshold:g} at 4 decimals, and "
+                         f"{n13.MIN_FOLDS_UP} of 5 folds), so it is not counted as an effect."), None
 
     out_e: dict = {}
     for e in MAIN:
@@ -571,20 +614,11 @@ def decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=None, min_gain: float 
                          if all(score(m, e, k) is not None for k in folds) else None)
                  for label, m in arms.items()} for e in MAIN}
     verdicts = {(e, arm): out_e[e][arm]["verdict"] for e in MAIN for arm in VERDICT_ARMS}
-    # the summary line (declaration r2, section 7); it never names a count as the one to use
-    cost = [SLICE_ARMS[arm] for (e, arm), v in verdicts.items() if v == COST]
-    high = [(e, arm) for (e, arm), v in verdicts.items() if v == HIGHER]
-    summary = []
-    if cost:
-        summary.append(f"Fewer slices cost from {max(cost)} down. 32 is the largest count tested, so the curve may "
-                       "still rise beyond it.")
-    elif all(v == NO_DIFF for v in verdicts.values()):
-        summary.append(WORDS_NONE)
-    for e, arm in high:
-        summary.append(f"Open point: with {SLICE_ARMS[arm]} of the 32 cached slices per plane the head scored higher "
-                       f"({n13.ENC_WORDS[e]}). {WORDS_NOT_CHANGED}")
+    summary = _summary_lines(verdicts)
+    with_verdict = any(v != NO_VERDICT for v in verdicts.values())
     return {"status": "decided" if NO_VERDICT not in verdicts.values() else "partial",
             "environment": envs[0], "encoders": out_e, "summary_words": summary,
+            "words_ending": WORDS_ENDING if with_verdict else None,
             "units": table, "mean_inner_score": means,
             "median_best_epoch": {"descriptive": True, "what": "median over the arm's finished units of the unit's E "
                                   "(the median best epoch of its inner fits)", **best_epoch},
@@ -593,13 +627,17 @@ def decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=None, min_gain: float 
 
 
 def slice_slide_sentences(record: dict) -> list:
-    """The slide sentences of a decide_slices record: one per encoder and arm (outcome, extra, the common
-    ending), then the summary line(s), then the rerun-noise sentence when an s32 unit is outside the tolerance."""
+    """The slide sentences of a decide_slices record: one per encoder and arm (outcome, extra, and for a
+    no-verdict set its own ending), then the summary line(s), then the rerun-noise sentence when an s32
+    unit is outside the tolerance, then the common ending once, as the last line (not given when no
+    comparison has a verdict)."""
     out = []
     for e in MAIN:
         for arm in VERDICT_ARMS:
             rec = record["encoders"][e][arm]
             out.append(" ".join(p for p in (rec.get("words"), rec.get("words_extra"), rec.get("words_limits")) if p))
     out += list(record.get("summary_words") or [])
-    extra = (record.get("rerun_check") or {}).get("words")
-    return out + ([extra] if extra else [])
+    for extra in ((record.get("rerun_check") or {}).get("words"), record.get("words_ending")):
+        if extra:
+            out.append(extra)
+    return out

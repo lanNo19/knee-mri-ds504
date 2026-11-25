@@ -443,8 +443,8 @@ The decision (Claude, outside Kaggle, from inner scores only; no test-fold numbe
 
 ## Slice-count check (it2c; added after the results)
 
-Declaration: it2c_slice_count_r2.md in the planning folder (r2, after review r1), written before any of
-these runs. Code: knee.nb.n13s, a new module (tests: tests/test_n13_slices.py). n13.py is unchanged.
+Declaration: it2c_slice_count_r3.md in the planning folder (r3; the arm summaries carry the label of
+r2, frozen in the arm commit), written before any of these runs. Code: knee.nb.n13s, a new module (tests: tests/test_n13_slices.py). n13.py is unchanged.
 The five arms run at commit ecf264f. The later commit changes only the local decide step.
 Finding behind it: the proposal promised a search over the slice count and it was never searched; every
 model reads 32 slices per plane. Question: does the head, at its chosen settings, score lower on inner
@@ -504,8 +504,10 @@ The decision (Claude, outside Kaggle, from inner scores only; no test-fold numbe
 5. Descriptive, never in a verdict: rerun_check (s32 minus bc per unit; a unit above 0.0005 is listed
    and the slide says so), position_effect (s16b minus s16 and s16b minus s32 per encoder), units,
    mean_inner_score and median_best_epoch.
-6. The slide sentences: `n13s.slice_slide_sentences(record)`. One per encoder and arm, then the summary
-   line, then the rerun-noise sentence if any. No sentence names a count as the one to use.
+6. The slide sentences: `n13s.slice_slide_sentences(record)`. One per encoder and arm (a no-verdict
+   sentence says what finished), then the summary lines (the counts that cost, per encoder; open
+   points; the number of comparisons without a verdict), then the rerun-noise sentence if any, then
+   the common ending once, as the last line. No sentence names a count as the one to use.
 7. No outcome changes a model or computes a test-fold number. No submission.
 
 ## If a run fails
