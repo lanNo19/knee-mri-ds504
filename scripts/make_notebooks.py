@@ -99,6 +99,12 @@ NOTEBOOKS = {
     "n10-tails-check-x": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n6a",
                                                "n11x-final", "n11x-select"], 3600),
     "n10-blite-x": (True, True, False, ["n0", "n6a", "n11x-final", "n11x-select"], 32400),
+    # N13, the batch-floor check (it2b_batch_floor_r1.md; RUNBOOK "Batch-floor check"): CPU, three sessions at
+    # the same time, added after the results. Inputs as the iteration-2 arms (knee-n0, knee-n5, knee-n3-r) plus
+    # knee-n6a, whose per-unit summaries hold the chosen configurations. bc is the base (the chosen batch size).
+    "n13-bc": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 25200),
+    "n13-b8": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 25200),
+    "n13-b4": (False, False, False, ["n0", "n5", "n3-r", "n6a"], 25200),
 }
 
 
@@ -198,6 +204,8 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
         return 'from knee.nb import n10; n10.check_tails("dinov2_vits14", fold=None, n=200, tails="n11x")'
     if name == "n10-blite-x":
         return 'from knee.nb import n10; n10.run("dinov2_vits14", tails="n11x")'
+    if name in ("n13-bc", "n13-b8", "n13-b4"):  # budget_h: the soft stop; lower it if the session starts late
+        return f'from knee.nb import n13; n13.run("{name[4:]}", budget_h=6.0, expect={EXPECT})'
     raise KeyError(name)
 
 

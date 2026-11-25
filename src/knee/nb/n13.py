@@ -143,6 +143,12 @@ def run(arm: str, expect: dict | None = None, root=None, workers: int = 4, budge
     A rerun (rerun=1: step n13_<arm>_r; 2: n13_<arm>_r2) runs only the units that failed: pass their
     folds and encoders (folds=(k,), encoders=("<encoder>",)). Its units replace failed units only.
     encoders: a subset of both main encoders for reruns and tests; a7 runs ConvNeXt-T only."""
+    if arm in BATCH_ARMS:  # the batch-floor check (it2b, below): its own runner; budget_h is its soft stop,
+        # at most BATCH_BUDGET_H through this door (run()'s default of 8.0 is past tonight's limit)
+        if schedule_epochs is not None or patience is not None:
+            raise ValueError("the batch-floor arms keep the registered schedule (30 epochs, patience 5)")
+        return run_batch(arm, expect=expect, root=root, workers=workers, budget_h=min(budget_h, BATCH_BUDGET_H),
+                         quiet=quiet, folds=folds, rerun=rerun, encoders=encoders)
     spec = arm_spec(arm, schedule_epochs, patience)
     encs = tuple(spec["encoders"] if encoders is None else encoders)
     if arm == "a7" and encs != A7_ENCODERS:
@@ -537,3 +543,447 @@ def dev(decision, root=None, expect: dict | None = None, quiet: bool = True, bud
         agg.write("n13_dev", s)
     common.summary(s)
     return s
+
+
+# ---------------------------------------------------------------- the batch-floor check (it2b)
+# Declaration: it2b_batch_floor_r1.md, written before any of these runs; "added after the results" (R10).
+# Finding: the head search chose a batch size on its floor (16) in 6 of 10 units and the floor was never
+# extended. Question: does a batch size below the floor score higher on inner validation?
+# Three arms, each its own CPU notebook. Every arm fits, per unit (main encoder x outer fold), the unit's
+# CHOSEN Stage A configuration (knee-n6a's agg_n6a_<encoder>_f<k>.json, field "config") on the unit's inner
+# folds, with the fits of n6's score(): the same inner sets, standardisation, leakage guard, seed + j,
+# 30-epoch schedule and patience 5. Only the batch size differs between the arms:
+#   bc  the chosen batch size, unchanged: the base of both differences. It is needed because base0 is NOT
+#       the chosen configuration: base0, a1 and null fit trial 0 (the L2 defaults, batch 48).
+#   b8  batch size 8.      b4  batch size 4.
+# No arm refits on the outer training set, predicts a test fold or writes a unit folder: there is no
+# head.pt, no predictions.csv and so nothing that N7, N9 or N10 could take for a unit. The test fold and
+# the gold studies reach each fit only as forbidden indices.
+# Nothing above this line changed except the six lines of run() that hand these three arm names over.
+import time
+from dataclasses import replace
+
+BATCH_PLAN = "it2b_batch_floor_r1.md: the batch-floor check, declared before the run, added after the results"
+BATCH_REASON = "it2b batch-floor check: the chosen Stage A configuration on the inner folds; only the batch size differs"
+BATCH_ARMS = {"bc": None, "b8": 8, "b4": 4}  # None: the unit's chosen batch size
+BATCH_SEED = 0  # base0's seed: inner fit j uses seed + j
+BATCH_BUDGET_H = 6.0  # the soft stop of a session (start about 15:30, end by about 22:00)
+SEARCH_RANGE = (16, 128)  # Stage A's registered batch-size range (n6.suggest)
+S_DECLARED = 0.0030  # iteration 2's s (n13_numbers.md): the SD of the 10 null minus base0 differences
+MATTERED, NO_SUPPORT, NO_VERDICT = "the floor mattered", "no support", "no verdict"
+# The chosen batch size and best inner score per unit, as read on 25 Nov (n9_r3_numbers.md, "The optimum
+# found by the head search, per unit"): a check that the attached knee-n6a is that version.
+CHOSEN_REF = {
+    "dinov2_vits14": {0: (33, 0.7249), 1: (16, 0.7419), 2: (16, 0.7362), 3: (16, 0.7435), 4: (16, 0.7368)},
+    "convnext_tiny": {0: (33, 0.7256), 1: (16, 0.7497), 2: (16, 0.7466), 3: (27, 0.7522), 4: (23, 0.7460)},
+}
+BATCH_SCORE = ("inner score: mean over the unit's inner folds of the validation macro AUC at each inner fit's "
+               "best epoch (Stage A's objective), for the unit's chosen configuration at the arm's batch size")
+
+
+def _r5(x) -> int:
+    """To the nearest 5 (as agg.count rounds): steps per epoch at batch 4 would give a study count back."""
+    return int(5 * round(float(x) / 5))
+
+
+def batch_settings(arm: str) -> dict:
+    """The settings block of a batch-floor arm (the batch size sits under "config": a setting, not a count)."""
+    if arm not in BATCH_ARMS:
+        raise ValueError("unknown batch-floor arm: use bc, b8 or b4")
+    b = BATCH_ARMS[arm]
+    return {"l1": "gated|all", "n_trials": 1, "schedule_epochs": heads.MAX_EPOCHS, "patience": heads.PATIENCE,
+            "seed": BATCH_SEED, "space_overrides": None,
+            "config": {"source": "chosen (knee-n6a)", "batch_size": "chosen" if b is None else int(b)}}
+
+
+def chosen_configs(root=None, encoders=MAIN, folds=None, ref: dict | None = CHOSEN_REF) -> dict:
+    """{(encoder, fold): {"config", "best_inner_score", "sha16"}}: each unit's chosen Stage A configuration.
+
+    Read from the attached knee-n6a output: agg_n6a_<encoder>_f<k>.json at its root (the per-unit summary
+    n6 writes; never a file under private/). Exactly one file per unit, from a nested search whose winner
+    is gated attention over all planes, with a batch size inside the registered range. With ref (the
+    default: CHOSEN_REF) the batch size and the best inner score must be the ones read on 25 Nov.
+    Anything else raises ValueError before any fit."""
+    base = Path(root) if root else None
+    out = {}
+    for e in encoders:
+        for k in (range(N_OUTER) if folds is None else folds):
+            hits = paths.glob_outputs(f"agg_n6a_{e}_f{int(k)}.json", base)
+            if len(hits) != 1:
+                raise ValueError(f"chosen_configs: attach exactly one knee-n6a output (unit {e} fold {k}: "
+                                 f"{len(hits)} summaries found)")
+            u = json.loads(hits[0].read_text())
+            c = u.get("config") or {}
+            if (u.get("encoder") != e or int(u.get("fold", -1)) != int(k) or u.get("tuning") != "nested"
+                    or u.get("l1_winner") != {"pooling": "gated", "planes": "all"}
+                    or set(c) != set(heads.Config.__dataclass_fields__)
+                    or (c["pooling"], c["planes"]) != ("gated", "all")):
+                raise ValueError(f"chosen_configs: {e} fold {k} is not a nested gated|all Stage A unit summary")
+            b = c["batch_size"]
+            if int(b) != b or not SEARCH_RANGE[0] <= b <= SEARCH_RANGE[1]:
+                raise ValueError(f"chosen_configs: {e} fold {k} has a batch size outside the registered range")
+            if ref is not None:
+                want = (ref.get(e) or {}).get(int(k))
+                if want is None or (int(b), round(float(u["best_inner_score"]), DECIMALS)) != want:
+                    raise ValueError(f"chosen_configs: {e} fold {k} is not the Stage A unit read on 25 Nov "
+                                     "(batch size or best inner score differs)")
+            out[(e, int(k))] = {"config": heads.config_from(c).to_dict(),
+                                "best_inner_score": float(u["best_inner_score"]), "sha16": common.sha16(hits[0])}
+    return out
+
+
+def _batch_task(task: dict) -> dict:
+    """Worker entry (spawned): one unit; a failure keeps its traceback under private/<step>/errors/."""
+    return n6._guarded(_batch_unit, task, Path(task["dir"]))
+
+
+def _batch_unit(task: dict, od: Path) -> dict:
+    """The inner fits of one unit: n6's score() for the chosen configuration at the arm's batch size.
+
+    Past the deadline no fit starts, and a running fit stops at the end of its epoch (heads.fit's
+    on_epoch): the unit then returns stopped, with no score. Nothing is written to disk."""
+    t0 = time.time()
+    if t0 > task["deadline"]:
+        return {"task": task["id"], "ok": False, "stopped": True}
+    enc, k, seed, elig = task["encoder"], task["fold"], task["seed"], task["eligible"]
+    chosen = heads.config_from(task["config_chosen"])
+    b = task["batch_size"]
+    cfg = chosen if b is None else replace(chosen, batch_size=int(b))
+    d, bank = n6._data(), n6._bank(enc)
+    tr, te, _ = d.split(k)
+    forbid = np.concatenate([te, d.gold_rows()])  # the test fold and every gold study: forbidden in each fit
+    inner = d.inner(k)
+    folds_in = sorted(set(inner[tr][inner[tr] >= 0].tolist()))
+    stats = bank.stats(tr)
+    checks0 = heads.guard_checks
+    sc, best_eps, ran, spe, spe_chosen = [], [], [], [], []
+    for j in folds_in:
+        if time.time() > task["deadline"]:
+            return {"task": task["id"], "ok": False, "stopped": True}
+        itr = tr[inner[tr] != j]
+        iva = tr[(inner[tr] == j) & d.scored[tr]]
+        r = heads.fit(bank, cfg, itr, iva, elig, stats=stats, forbidden=forbid, seed=seed + j,
+                      patience=heads.PATIENCE, schedule_epochs=None,
+                      on_epoch=lambda ep, score: time.time() > task["deadline"])
+        if r.pruned and r.epochs_run < heads.MAX_EPOCHS:  # stopped by the deadline before its own end
+            return {"task": task["id"], "ok": False, "stopped": True}
+        sc.append(r.best_score)
+        best_eps.append(r.best_epoch)
+        ran.append(int(r.epochs_run))
+        spe.append(math.ceil(len(itr) / max(1, int(cfg.batch_size))))
+        spe_chosen.append(math.ceil(len(itr) / max(1, int(chosen.batch_size))))
+    fits = len(folds_in)
+    sc = [x for x in sc if np.isfinite(x)]
+    if not sc:
+        raise ValueError("no finite inner score")
+    used = cfg.to_dict()
+    if {key for key in used if used[key] != task["config_chosen"][key]} - {"batch_size"}:
+        raise AssertionError("a setting other than the batch size differs from the chosen configuration")
+    summary = {"encoder": enc, "fold": k, "inner_score": round(float(np.mean(sc)), DECIMALS),
+               "E": max(1, int(np.median(best_eps))), "epochs": ran, "inner_k": fits, "seed": seed,
+               "schedule_epochs": heads.MAX_EPOCHS, "patience": heads.PATIENCE,
+               "device": n6._W["device"], "device_name": n6._device_name(n6._W["device"]),
+               "config": used, "batch_chosen": int(chosen.batch_size),
+               "steps_per_epoch": _r5(np.mean(spe)), "steps_per_epoch_chosen": _r5(np.mean(spe_chosen)),
+               "step_ratio": round(float(np.sum(spe) / max(1, np.sum(spe_chosen))), 2),
+               "stage_a_best_inner_score": task["stage_a_best"], "chosen_sha16": task["chosen_sha16"],
+               "seconds": round(time.time() - t0, 1)}
+    return {"task": task["id"], "ok": True, "summary": summary, "fits": fits,
+            "guard_checks": heads.guard_checks - checks0}
+
+
+def batch_summary(arm: str, step: str, results: dict, task_ids: list, environment: dict | None,
+                  encoders, budget_h: float | None = None, seconds: float | None = None,
+                  ref_checked: bool = True) -> dict:
+    """The arm's summary block (agg_<step>_inner.json) from the units' results {unit id: worker result}.
+
+    status: "ok" when every unit of the session finished, else "partial" (a unit that was stopped by the
+    soft stop, failed, or has no result yet). The finished units are always written."""
+    units, scores, bad_guard = {}, {}, []
+    for uid in task_ids:
+        r = results.get(uid)
+        if r is None:
+            units[uid] = {"ok": False, "stopped": True, "error": None}
+        elif not r.get("ok"):
+            units[uid] = {"ok": False, "stopped": bool(r.get("stopped")), "error": r.get("error")}
+        else:
+            u = r["summary"]
+            units[uid] = {"ok": True, **{key: v for key, v in u.items() if key not in ("encoder", "fold")}}
+            scores.setdefault(u["encoder"], {})[int(u["fold"])] = u["inner_score"]
+            if r.get("guard_checks") != r.get("fits"):
+                bad_guard.append(uid)
+    done = [uid for uid in task_ids if units[uid]["ok"]]
+    errors = [str(units[uid].get("error")) for uid in task_ids if not units[uid]["ok"]]
+    return {"arm": arm, "step": step, "plan": BATCH_PLAN, "added_after_results": True,
+            "test_overrides": True, "test_overrides_reason": BATCH_REASON,
+            "encoders": list(encoders), "settings": batch_settings(arm),
+            "chosen_ref_checked": bool(ref_checked),
+            "environment": environment, "knee_commit": agg.repo_commit(),
+            "status": "ok" if len(done) == len(task_ids) else "partial",
+            "all_units_ok": len(done) == len(task_ids),
+            "units_finished": done, "units_missing": [uid for uid in task_ids if not units[uid]["ok"]],
+            "leakage_assertion_passed": not bad_guard and not any("LeakageError" in e for e in errors),
+            "test_fold_use": "none: no refit, no prediction, no unit folder; the test fold is only forbidden",
+            "device_names": sorted({units[uid]["device_name"] for uid in done}), "score": BATCH_SCORE,
+            "budget_h": budget_h, "seconds": seconds, "inner_scores": scores, "units": units}
+
+
+def run_batch(arm: str, expect: dict | None = None, root=None, workers: int = 4,
+              budget_h: float = BATCH_BUDGET_H, quiet: bool = True, folds: tuple[int, ...] | None = None,
+              rerun: int = 0, encoders: tuple[str, ...] | None = None, chosen_ref: dict | None = CHOSEN_REF) -> dict:
+    """One arm of the batch-floor check: bc, b8 or b4 (see the section comment above). CPU only.
+
+    Inputs attached: knee-n0, knee-n5, knee-n3-r (as the other arms) and knee-n6a (the chosen
+    configurations; only its agg_n6a_<encoder>_f<k>.json files are read). expect: the card's hashes.
+    budget_h is the soft stop: after budget_h hours no inner fit starts and a running fit ends with its
+    epoch, the session ends cleanly with status "partial", and every finished unit is in the summary
+    (agg_<step>_inner.json, rewritten as each unit ends). The watchdog of the step is at 1.1 x budget_h.
+    Units are queued encoder by encoder (DINOv2 first), so a stopped session tends to hold one encoder
+    whole. A rerun (rerun=1: step n13_<arm>_r) names the folds and encoders of the missing units.
+    chosen_ref=None (tests) skips the check against the values read on 25 Nov; the summary says so."""
+    if arm not in BATCH_ARMS:
+        raise ValueError("unknown batch-floor arm: use bc, b8 or b4")
+    encs = tuple(MAIN if encoders is None else encoders)
+    if not encs or not set(encs) <= set(MAIN):
+        raise ValueError("the arms run the two main encoders (a rerun names the missing ones)")
+    r = int(rerun)
+    if r < 0 or (r and (not folds or encoders is None)):
+        raise ValueError("a rerun names the folds and encoders of the missing units")
+    if budget_h is None or float(budget_h) < 0:
+        raise ValueError("budget_h is the soft stop in hours: a number, 0 or more")
+    name = f"n13_{arm}" + ("" if not r else "_r" if r == 1 else f"_r{r}")
+    env = environment()
+    cfg = {"name": name, "arm": arm, "rerun": r, "encoders": list(encs), "folds": list(folds) if folds else None,
+           "workers": workers, "seed": BATCH_SEED, "budget_h": budget_h,
+           "batch_size": batch_settings(arm)["config"]["batch_size"],
+           "test_overrides": True, "test_overrides_reason": BATCH_REASON, "added_after_results": True,
+           "plan": BATCH_PLAN, "chosen_ref_checked": chosen_ref is not None, "environment": env}
+    out: dict = {}
+    with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
+
+        import torch
+
+        if torch.cuda.device_count():
+            raise ValueError("the batch-floor arms run on CPU (accelerator None): the three arms share one device type")
+        t0 = time.time()
+        d = stage.StageData(root, expect)
+        K = d.n_folds("s2")
+        fold_list = list(folds) if folds else list(range(K))
+        if K != N_OUTER or not set(fold_list) <= set(range(N_OUTER)):
+            raise ValueError("the batch-floor check needs the 5 S2 outer folds")
+        chosen = chosen_configs(root, encs, fold_list, chosen_ref)
+        od = paths.out_dir("private", name, "errors")
+        tasks = [{"id": f"{e}_f{k}", "encoder": e, "fold": k, "seed": BATCH_SEED,
+                  "eligible": list(range(len(FINDINGS))), "batch_size": BATCH_ARMS[arm],
+                  "config_chosen": chosen[(e, k)]["config"], "stage_a_best": chosen[(e, k)]["best_inner_score"],
+                  "chosen_sha16": chosen[(e, k)]["sha16"], "deadline": t0 + float(budget_h) * 3600,
+                  "dir": str(od / f"{e}_f{k}")}
+                 for e in encs for k in fold_list]  # encoder by encoder
+        ids = [t["id"] for t in tasks]
+        results: dict = {}
+
+        def write(final: bool = False) -> dict:
+            s = batch_summary(arm, name, results, ids, env, encs, budget_h=budget_h,
+                              seconds=round(time.time() - t0, 1) if final else None,
+                              ref_checked=chosen_ref is not None)
+            s["upstream"] = d.upstream
+            agg.write(f"{name}_inner", s)
+            return s
+
+        write()
+        ctx = mp.get_context("spawn")
+        counter = ctx.Value("i", 0)
+        with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=ctx, initializer=n6._init,
+                                 initargs=(counter, 0, str(root) if root else None, expect, None)) as ex:
+            futs = {ex.submit(_batch_task, t): t for t in tasks}
+            for f in as_completed(futs):
+                t = futs[f]
+                try:
+                    res = f.result()
+                except BrokenProcessPool:
+                    res = {"task": t["id"], "ok": False, "error": "worker crashed"}
+                except BaseException as e:  # noqa: BLE001
+                    res = {"task": t["id"], "ok": False, "error": safe_log.describe(type(e), e.__traceback__)}
+                results[t["id"]] = res
+                write()  # the finished units are on disk before the next one ends
+        out = write(final=True)
+    common.summary(out)
+    return out
+
+
+def _batch_arm(label: str, summaries) -> dict | None:
+    """merged() for a batch-floor arm, with its label and settings checked; None when the arm did not run."""
+    if summaries is None:
+        return None
+    m = merged(summaries)
+    if m["arm"] != label:
+        raise ValueError(f"decide_batch: the {label} input holds the summary of arm {m['arm']}")
+    if m["settings"] != batch_settings(label):
+        raise ValueError(f"decide_batch: the {label} summaries do not have the declared settings for {label}")
+    want = {(e, k) for e in MAIN for k in range(N_OUTER)}
+    if not set(m["units"]) <= want:
+        raise ValueError(f"decide_batch: {label} holds a unit outside {', '.join(MAIN)} and folds 0-{N_OUTER - 1}")
+    if not all(isinstance(e, dict) for e in m["environments"]):
+        raise ValueError(f"decide_batch: a {label} summary has no environment record")
+    for (e, k), u in m["units"].items():
+        if u.get("ok"):
+            v = u.get("inner_score")
+            if v is None or not math.isfinite(float(v)):
+                raise ValueError(f"decide_batch: {label} unit {e} fold {k} is finished without a finite inner score")
+            b, want_b = (u.get("config") or {}).get("batch_size"), BATCH_ARMS[label]
+            if b is None or (want_b is None and b != u.get("batch_chosen")) or (want_b is not None and b != want_b):
+                raise ValueError(f"decide_batch: {label} unit {e} fold {k} did not use the arm's batch size")
+    return m
+
+
+def _env_differences(envs: list) -> list:
+    fields = sorted(set(ENV_FIELDS).union(*(e.keys() for e in envs)))
+    return [f for f in fields if len({json.dumps(e.get(f), sort_keys=True) for e in envs}) > 1]
+
+
+def decide_batch(bc, b8, b4, base0, null, min_gain: float = MIN_GAIN) -> dict:
+    """The rule of the batch-floor check (it2b_batch_floor_r1.md), on inner scores only (R4, R5).
+
+    Inputs: each arm's summary, agg_n13_<arm>_inner.json as a dict, or the list [original, rerun, ...]
+    (merged()). bc, b8, b4: the three new arms; b8 or b4 may be None (not run), and a new arm may be
+    partial. base0, null: iteration 2's summaries, complete, used only for s (they fit the default
+    configuration at batch 48, so they are not the base of any difference here).
+    Environment: the environments of every bc, b8 and b4 session must be equal field by field (the Kaggle
+    image's commit and build date, python, torch, CUDA, cuDNN, device). If not: status "env_mismatch"
+    and no verdict; rerun the arms on one image. A difference from iteration 2's environment is only
+    reported (same_environment_as_iteration2): s then comes from another image.
+    The rule is iteration 2's keep rule with no new number, every comparison at 4 decimals:
+      s         = sample SD (n - 1) of the 10 differences null - base0; it must be S_DECLARED at 4 decimals;
+      threshold = max(min_gain, 2 s / sqrt(5)), at 4 decimals;
+      gain      = mean over the 5 outer folds of (arm - bc), at 4 decimals, per encoder and arm;
+      folds_up  = folds with round(arm - bc, 4) > 0;
+      verdict   = "the floor mattered" if gain > threshold and folds_up >= 4, else "no support".
+    An encoder with fewer than 5 folds finished in the arm and in bc gets "no verdict" for that arm: its
+    finished folds are listed with their differences, and no gain is given.
+    Also, descriptive: the per-unit table, the units split by chosen batch size (on the floor of 16, or
+    above it), and bc minus Stage A's best inner score. The batch sizes used sit under "config" keys."""
+    arms = {"bc": _batch_arm("bc", bc), "b8": _batch_arm("b8", b8), "b4": _batch_arm("b4", b4)}
+    it2 = {"base0": merged(base0), "null": merged(null)}
+    for label, m in it2.items():
+        if m["arm"] != label or m["settings"] != settings(arm_spec(label)):
+            raise ValueError(f"decide_batch: the {label} input is not iteration 2's {label} arm with its settings")
+    S2 = {label: _complete(label, m) for label, m in it2.items()}
+    folds = list(range(N_OUTER))
+    null_diffs = [S2["null"][e][k] - S2["base0"][e][k] for e in MAIN for k in folds]
+    s = float(np.std(null_diffs, ddof=1))
+    if round(s, DECIMALS) != round(S_DECLARED, DECIMALS):
+        raise ValueError("decide_batch: base0 and null do not give the declared s (0.0030): not iteration 2's summaries")
+    threshold_raw = max(float(min_gain), 2 * s / math.sqrt(N_OUTER))
+    threshold = round(threshold_raw, DECIMALS)
+    ran = {label: m for label, m in arms.items() if m is not None}
+    given = [x for a in (bc, b8, b4) if a is not None for x in ([a] if isinstance(a, dict) else list(a))]
+    envs = [e for m in ran.values() for e in m["environments"]]
+    envs2 = [e for m in it2.values() for e in m["environments"] if isinstance(e, dict)]
+    record = {"rule": "it2b batch-floor rule (n13.decide_batch): iteration 2's keep rule, base = the bc arm",
+              "plan": BATCH_PLAN, "added_after_results": True,
+              "decided_from": "inner validation scores only (R4, R5); no test-fold number exists for these arms",
+              "min_gain": float(min_gain), "s": s, "s_declared": S_DECLARED,
+              "s_source": "iteration 2: sample SD of the 10 null minus base0 differences (defaults, batch 48, seeds 0 and 100)",
+              "threshold": threshold, "threshold_unrounded": threshold_raw,
+              "arms": {label: (None if m is None else {
+                  "steps": m["steps"], "config": {"batch_size": batch_settings(label)["config"]["batch_size"]},
+                  "units_finished": sorted(f"{e}_f{k}" for (e, k), u in m["units"].items() if u.get("ok"))})
+                  for label, m in arms.items()},
+              "same_knee_commit": len({c for m in ran.values() for c in m["knee_commits"]}) == 1,
+              "chosen_ref_checked": all(bool(x.get("chosen_ref_checked")) for x in given),
+              "limits": ["one seed (0); one setting changed at the chosen point, not a new search",
+                         "the learning rate is not rescaled: a smaller batch is also more optimiser steps (step_ratio)",
+                         "four comparisons (2 arms x 2 encoders) against one base, no correction",
+                         "s was measured on the default configuration at batch 48, not at batch 8 or 4"]}
+    empty = {e: {arm: {"verdict": NO_VERDICT, "reason": None, "gain": None, "threshold": threshold,
+                       "folds_up": None, "folds": [], "per_fold": {}} for arm in ("b8", "b4")} for e in MAIN}
+    if arms["bc"] is None:
+        for e in MAIN:
+            for arm in empty[e]:
+                empty[e][arm]["reason"] = "the bc arm (the base) did not run"
+        return {"status": "no_base", "encoders": empty, **record}
+    differ = _env_differences(envs)
+    if differ:
+        for e in MAIN:
+            for arm in empty[e]:
+                empty[e][arm]["reason"] = "the arms' environments differ"
+        return {"status": "env_mismatch", "env_differences": differ,
+                "environments": {label: m["environments"] for label, m in ran.items()},
+                "encoders": empty, **record}
+    differ2 = _env_differences([envs[0], *envs2]) if envs2 else ["no environment record in iteration 2's summaries"]
+
+    def score(label, e, k):
+        u = (arms[label] or {"units": {}})["units"].get((e, k))
+        return float(u["inner_score"]) if u and u.get("ok") else None
+
+    def words(arm, e, rec):
+        b = BATCH_ARMS[arm]
+        if rec["verdict"] == NO_VERDICT:
+            return f"Batch {b}, {e}: no verdict ({rec['reason']})."
+        tail = f"{e}: gain {rec['gain']:+.4f}, higher in {rec['folds_up']} of 5 folds; threshold {threshold:.4f}"
+        if rec["verdict"] == MATTERED:
+            return (f"Open edge: batch {b} scored higher than the chosen batch on inner validation ({tail}). "
+                    "The head search was not rerun.")
+        return f"Batch {b} did not score higher than the chosen batch on inner validation ({tail})."
+
+    out_e: dict = {}
+    for e in MAIN:
+        out_e[e] = {}
+        for arm in ("b8", "b4"):
+            have = [k for k in folds if score("bc", e, k) is not None and score(arm, e, k) is not None]
+            diffs = {k: score(arm, e, k) - score("bc", e, k) for k in have}
+            rec = {"verdict": NO_VERDICT, "reason": None, "gain": None, "threshold": threshold, "folds_up": None,
+                   "folds": have, "per_fold": {k: round(x, DECIMALS) for k, x in diffs.items()}}
+            if arms[arm] is None:
+                rec["reason"] = "the arm did not run"
+            elif len(have) < N_OUTER:
+                rec["reason"] = "fewer than 5 folds finished in the arm and in bc"
+            else:
+                gain_raw = float(np.mean([diffs[k] for k in folds]))
+                gain = round(gain_raw, DECIMALS)
+                up = sum(1 for k in folds if round(diffs[k], DECIMALS) > 0)
+                rec.update(gain=gain, gain_unrounded=gain_raw, folds_up=up,
+                           verdict=MATTERED if (gain > threshold and up >= MIN_FOLDS_UP) else NO_SUPPORT)
+            rec["words"] = words(arm, e, rec)
+            out_e[e][arm] = rec
+
+    table, split = {}, {}
+    for e in MAIN:
+        for k in folds:
+            us = {label: (arms[label] or {"units": {}})["units"].get((e, k)) or {} for label in arms}
+            us = {label: u if u.get("ok") else {} for label, u in us.items()}
+            base = us["bc"].get("inner_score")
+            row = {"batch_chosen": next((u["batch_chosen"] for u in us.values() if u.get("batch_chosen")), None),
+                   "stage_a_best_inner_score": next((u["stage_a_best_inner_score"] for u in us.values()
+                                                     if u.get("stage_a_best_inner_score") is not None), None)}
+            for label, u in us.items():
+                row[label] = {"inner_score": u.get("inner_score"), "E": u.get("E"),
+                              "steps_per_epoch": u.get("steps_per_epoch"), "step_ratio": u.get("step_ratio"),
+                              "minus_bc": (round(u["inner_score"] - base, DECIMALS)
+                                           if label != "bc" and base is not None and u.get("inner_score") is not None
+                                           else None)}
+            row["bc_minus_stage_a"] = (round(base - row["stage_a_best_inner_score"], DECIMALS)
+                                       if base is not None and row["stage_a_best_inner_score"] is not None else None)
+            table[f"{e}_f{k}"] = row
+    for arm in ("b8", "b4"):
+        split[arm] = {}
+        for name, pick in (("chosen_on_floor", lambda b: b == SEARCH_RANGE[0]),
+                           ("chosen_above_floor", lambda b: b > SEARCH_RANGE[0])):
+            uids = [uid for uid, row in table.items() if row["batch_chosen"] is not None
+                    and pick(row["batch_chosen"]) and row[arm]["minus_bc"] is not None]
+            vals = [table[uid][arm]["minus_bc"] for uid in uids]
+            split[arm][name] = {"units": uids, "mean_minus_bc": round(float(np.mean(vals)), DECIMALS) if vals else None,
+                                "units_up": [uid for uid in uids if table[uid][arm]["minus_bc"] > 0]}
+    gaps = [row["bc_minus_stage_a"] for row in table.values() if row["bc_minus_stage_a"] is not None]
+    verdicts = [out_e[e][arm]["verdict"] for e in MAIN for arm in ("b8", "b4")]
+    return {"status": "decided" if NO_VERDICT not in verdicts else "partial",
+            "environment": envs[0], "same_environment_as_iteration2": not differ2,
+            "env_differences_from_iteration2": differ2, "encoders": out_e, "units": table,
+            "by_chosen_batch": {"descriptive": True, "note": "no verdict from this split; for a unit above the floor "
+                                "batch 8 or 4 is a larger change", **split},
+            "bc_minus_stage_a": {"descriptive": True, "mean": round(float(np.mean(gaps)), DECIMALS) if gaps else None,
+                                 "note": "Stage A's score is the best of 30 trials on a T4: favoured by selection"},
+            **record}

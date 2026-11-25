@@ -367,6 +367,57 @@ The heads check (Claude, outside Kaggle, before asking Ablay to submit):
 N10 runs the bundle's wheel. Its n10.py and the head code it calls (heads.make_head, config_from,
 predict) are the same in this branch, so it reads N13's units unchanged.
 
+## Batch-floor check (it2b; added after the results)
+
+Declaration: it2b_batch_floor_r1.md in the planning folder, written before any of these runs. Code:
+knee.nb.n13, the section "the batch-floor check" (tests: tests/test_n13_batch.py). Finding behind it:
+the head search chose a batch size on its floor (16) in 6 of 10 units and the floor was never extended.
+Question: does a batch size below the floor score higher on inner validation?
+
+Each arm fits, per unit, the unit's chosen Stage A configuration on its inner folds, as n6's inner
+fits do (seed 0, 30 epochs, patience 5). Only the batch size differs: bc keeps the chosen one (the
+base), b8 uses 8, b4 uses 4. base0 is not the base: it fits the default configuration at batch 48.
+No arm refits on an outer training set, predicts a test fold or writes a unit folder.
+
+Rules for the three notebooks:
+1. Accelerator None (CPU). A GPU session is refused by the code. Internet On (cell 1 is the usual one).
+2. Inputs: knee-n0, knee-n5, knee-n3-r and knee-n6a. Nothing else. From knee-n6a the code reads only
+   agg_n6a_<encoder>_f<k>.json (the chosen configurations) and checks each unit's batch size and best
+   inner score against the values read on 25 Nov. Never knee-n6a-smoke, never a second knee-n6a.
+3. One image for all three: create them as forks of one CPU notebook and keep "Pin to original
+   environment" (rule 6 of iteration 2). decide_batch gives no verdict when their environments differ.
+4. The three run at the same time. budget_h is the soft stop of a session: after it no inner fit
+   starts, a running fit ends with its epoch, and the session ends with status "partial" and every
+   finished unit in its summary. A session that starts later than 15:30 gets a smaller budget_h, so
+   that it ends by 22:00 (budget_h = hours until 21:30).
+5. Never attach an output of these arms to N7, N9 or N10. They hold no unit folder.
+
+| Notebook | Accelerator | Inputs | Cell 2 | Expected time | Pass |
+|---|---|---|---|---|---|
+| knee-n13-bc | None (CPU) | knee-n0, knee-n5, knee-n3-r, knee-n6a | `from knee.nb import n13; n13.run("bc", budget_h=6.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 40 min (estimate from the code; at most about 3 h if every fit ran all 30 epochs) | STEP n13_bc: OK; status "ok"; all_units_ok and leakage_assertion_passed true; added_after_results, test_overrides and chosen_ref_checked true; units_finished holds 10 units and units_missing none; settings.config.batch_size "chosen"; each unit ok with config.batch_size equal to batch_chosen (33, 16, 16, 16, 16 for DINOv2 folds 0-4; 33, 16, 16, 27, 23 for ConvNeXt-T), step_ratio 1.0, schedule_epochs 30, patience 5, seed 0, device cpu; environment present; no head.pt and no predictions.csv in the output |
+| knee-n13-b8 | None (CPU) | the same | `from knee.nb import n13; n13.run("b8", budget_h=6.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 45-60 min (at most about 3 h) | as knee-n13-bc, but STEP n13_b8, settings.config.batch_size 8, each unit's config.batch_size 8 and step_ratio 2 to 4.1 (chosen batch / 8) |
+| knee-n13-b4 | None (CPU) | the same | `from knee.nb import n13; n13.run("b4", budget_h=6.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 1 h to 1 h 15 min (at most about 3.5 h) | as knee-n13-bc, but STEP n13_b4, settings.config.batch_size 4, each unit's config.batch_size 4 and step_ratio 4 to 8.3 |
+
+A session that ends "partial": report it. Its missing units can run in knee-n13-<arm>-r with the same
+cell 2 plus `rerun=1, folds=(<k>,), encoders=("<encoder>",)`, on the same image, only if it ends by
+22:00. An encoder with fewer than 5 finished folds in an arm (or in bc) gets no verdict for that arm.
+
+The decision (Claude, outside Kaggle, from inner scores only; no test-fold number exists for these arms):
+1. Download agg_n13_bc_inner.json, agg_n13_b8_inner.json and agg_n13_b4_inner.json (and each rerun's)
+   into a new directory, beside iteration 2's agg_n13_base0_inner.json and agg_n13_null_inner.json.
+2. `n13.decide_batch(bc, b8, b4, base0, null)`: each argument a summary dict or the list
+   [original, rerun, ...]; b8 or b4 may be None. It is a pure function.
+3. Write its output with `agg.write("n13_batch_decide", record, folder=<dir>)`: agg_n13_batch_decide.json.
+   The checker runs on it: the batch sizes used sit under "config" keys.
+4. status "env_mismatch": the new arms ran on different images; there is no verdict. status "no_base":
+   bc did not run. status "partial": at least one encoder and arm has "no verdict". status "decided":
+   four verdicts, each "the floor mattered" or "no support", by iteration 2's rule with bc as the base
+   (gain above 0.005 at 4 decimals and higher in at least 4 of 5 folds; s = 0.0030 from base0 and null).
+5. same_environment_as_iteration2 false is reported, not a stop: s then comes from another image.
+6. Report beside it, as descriptive: units (per-unit scores, E, steps per epoch), by_chosen_batch
+   (units on the floor and above it) and bc_minus_stage_a.
+7. No outcome changes a model, reruns the head search or computes a test-fold number.
+
 ## If a run fails
 
 The summary block shows `STEP <name>: FAILED - <ErrorType> at <file>:<line> in <function>()`.
