@@ -304,9 +304,11 @@ def _higher_line(arm: str, e: str, ceiling: str) -> str:
     """The summary line of one "higher dropout scored higher" (declaration r2, sections 5 and 6)."""
     p, name = _p_text(arm), n13.ENC_WORDS[e]
     if ceiling == CEILING:  # arm minus dc and arm minus p5 both meet the rule
-        return f"Open point: the ceiling mattered: dropout {p} scored higher than the chosen dropout and than 0.5 ({name})."
+        return (f"Open point: the ceiling mattered ({name}): dropout {p} scored higher than the chosen dropout and than "
+                "dropout 0.5, the end of the searched range.")
     if ceiling == INSIDE:  # arm minus dc meets the rule, arm minus p5 does not
-        return f"Dropout {p} scored higher than the chosen dropout but not than 0.5, inside the searched range ({name})."
+        return (f"Open point: dropout {p} scored higher than the chosen dropout but not than dropout 0.5, inside the "
+                f"searched range ({name}).")
     return (f"Open point: dropout {p} scored higher than the chosen dropout ({name}). This check does not show "
             "whether the range end or the search's pick inside the range is the cause.")
 
@@ -322,6 +324,8 @@ def _summary_lines(recs: dict) -> list:
     elif not out:
         out.append(f"No comparison with a verdict scored higher by the declared margin; {k} of {N_COMPARISONS} "
                    "comparisons have no verdict.")
+    elif k:  # r3 (code review r1, S1): beside a scored-higher line, as it2c r4
+        out.append(f"{k} of {N_COMPARISONS} comparisons have no verdict.")
     return out
 
 

@@ -524,8 +524,8 @@ def test_decide_dropout_verdicts_by_the_declared_rule(tmp_path):
                              "(ConvNeXt-T, higher in 5 of 5 folds).", NOT_MET, None)
     lines = n13d.dropout_slide_sentences(r)
     assert lines[:4] == [" ".join(p for p in w[(enc, arm)] if p) for enc in MAIN for arm in ("p6", "p7")]
-    assert lines[4:] == ["Open point: the ceiling mattered: dropout 0.6 scored higher than the chosen dropout and than "
-                         "0.5 (DINOv2).", ENDING] == [*r["summary_words"], r["words_ending"]]
+    assert lines[4:] == ["Open point: the ceiling mattered (DINOv2): dropout 0.6 scored higher than the chosen dropout "
+                         "and than dropout 0.5, the end of the searched range.", ENDING] == [*r["summary_words"], r["words_ending"]]
     assert not any(ENDING in x for x in lines[:-1])  # the common ending once, as the last line
     # descriptive: p5 minus dc, the split by chosen dropout, the rerun check, the table, the medians
     pm = r["p5_minus_dc"]
@@ -573,8 +573,8 @@ def test_a_higher_score_is_compared_with_p5_and_a_missing_p5_blocks_nothing(tmp_
     x = inside["encoders"][DN]["p6"]
     assert (x["verdict"], x["ceiling"], x["minus_p5"]["gain"], x["minus_p5"]["meets_higher"]) == (n13d.HIGHER, "inside the searched range", 0.0, False)
     assert inside["summary_words"] == [
-        "Dropout 0.6 scored higher than the chosen dropout but not than 0.5, inside the searched range (DINOv2).",
-        "Dropout 0.6 scored higher than the chosen dropout but not than 0.5, inside the searched range (ConvNeXt-T)."]
+        "Open point: dropout 0.6 scored higher than the chosen dropout but not than dropout 0.5, inside the searched range (DINOv2).",
+        "Open point: dropout 0.6 scored higher than the chosen dropout but not than dropout 0.5, inside the searched range (ConvNeXt-T)."]
     assert inside["encoders"][DN]["p6"]["words_extra"] == "The head search was not rerun."
     _checked(inside, tmp_path / "inside")
     # no p5: the verdicts stand, and the open point says the cause is not shown
@@ -682,7 +682,8 @@ def test_decide_dropout_gives_no_verdict_with_fewer_than_5_folds(tmp_path):
     _checked(r, tmp_path / "part")
     # a "scored higher" beside a missing verdict: the open point only
     rh = _decide(p6={CX: UP4}, p7=None)
-    assert len(rh["summary_words"]) == 1 and rh["summary_words"][0].startswith("Open point: dropout 0.6 scored higher")
+    assert len(rh["summary_words"]) == 2 and rh["summary_words"][0].startswith("Open point: dropout 0.6 scored higher")
+    assert rh["summary_words"][1].endswith("comparisons have no verdict.")
     # all four without a verdict (dc partial in both encoders): only that line, no rerun line, no common ending
     rz = _decide(p6={}, p7={}, dc=_s("dc", stopped={(DN, 0), (CX, 4)}), bc=_bc({DN: [0, 0.002, 0, 0, 0]}))
     assert rz["status"] == "partial" and rz["words_ending"] is None and rz["words_rerun"] is None
