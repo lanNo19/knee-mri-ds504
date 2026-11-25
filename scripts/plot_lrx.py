@@ -136,6 +136,20 @@ def _mean(vals):
     return sum(vals) / len(vals) if vals else None
 
 
+def mean_segments(keys, means: dict) -> list:
+    """The thick mean line as pieces: [(rate, mean), ...] over neighbouring rates that have a mean. A rate
+    without one ends the piece, so the line never passes over it."""
+    out, cur = [], []
+    for key in keys:
+        if means.get(key) is None:
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append((float(key), means[key]))
+    return out + ([cur] if cur else [])
+
+
 def _style(plt):
     plt.rcParams.update({
         "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE, "text.color": INK,
@@ -162,14 +176,17 @@ def draw_g1(d: dict, out: Path, plt) -> None:
                 ax.plot(*zip(*pts), color=colour, linewidth=0.8, alpha=0.45, marker="o", markersize=3, zorder=2)
     # thick lines: the five-fold mean, only over rates that have a mean by Rule D
     with_mean = set(d["means"]) | {key for key in d["steps"][1] | d["steps"][2]}
-    q = [(float(key), _mean(d["quarter"][key].values())) for key in keys
-         if key in with_mean and len(d["quarter"].get(key, {})) == len(FOLDS)]
-    e = [(float(key), d["means"][key]) for key in keys if key in d["means"]]
-    for pts, colour, name in ((q, BLUE, "quarter mark"), (e, ORANGE, "end of schedule")):
-        if pts:
+    q = {key: _mean(d["quarter"][key].values()) for key in keys
+         if key in with_mean and len(d["quarter"].get(key, {})) == len(FOLDS)}
+    for means, colour, name in ((q, BLUE, "quarter mark"), (d["means"], ORANGE, "end of schedule")):
+        ran = [key for key in keys if key in d[("quarter" if colour == BLUE else "end")] or key in means
+               or any(k2 == key for k2, _ in d["invalid"])]  # the rates of this series: one without a mean breaks the line
+        pieces = mean_segments(ran, means)
+        for pts in pieces:
             ax.plot(*zip(*pts), color=colour, linewidth=2.6, marker="o", markersize=6.5, markeredgecolor=SURFACE,
                     markeredgewidth=1.5, zorder=4)
-            ax.annotate(name, pts[-1], xytext=(9, 0), textcoords="offset points", color=INK, fontsize=9.5, va="center",
+        if pieces:
+            ax.annotate(name, pieces[-1][-1], xytext=(9, 0), textcoords="offset points", color=INK, fontsize=9.5, va="center",
                         fontweight="bold")
     b = [(float(key), _num(v.get("val_macro_auc"))) for key, v in sorted(d["best"].items(), key=lambda kv: float(kv[0]))]
     b = [p for p in b if p[1] is not None]
@@ -231,7 +248,7 @@ def draw_g1(d: dict, out: Path, plt) -> None:
                Line2D([], [], color=INK, marker="x", markersize=8, markeredgewidth=1.8, linestyle="none", label="invalid run")]
     fig.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.075, 0.105), ncol=3, columnspacing=1.6, handlelength=2.4)
     picks = ", ".join(f"f{k} {lr_text(lr)}" for k, lr in sorted(d["picks"].items()))
-    lines = [f"pick per fold: {picks}", "The mean line is drawn only over rates with a five-fold mean (Rule D). " + CAPTION_G1]
+    lines = [f"pick per fold: {picks}", "The mean line is drawn only over rates with a five-fold mean (Rule D) and breaks at a rate without one. " + CAPTION_G1]
     if d["words"]:
         lines.append("Rule D: " + d["words"] + (f"; {d['words_swap']}" if d.get("words_swap") else ""))
     for i, text in enumerate(lines):

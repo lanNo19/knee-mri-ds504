@@ -177,6 +177,8 @@ def test_final_fits_are_refused_without_or_with_a_changed_selection_record(chain
     resign = lambda rec: n11._signed({k: v for k, v in rec.items() if k != "sha256"})  # noqa: E731
     refused(resign({**sel, "status": "inconclusive"}))  # a signed record that selected nothing
     refused(resign({**sel, "smoke": True}))
+    refused(resign({**sel, "iteration3": {**sel["iteration3"], "attached": False}}))  # made with reference_only
+    refused(resign({k: v for k, v in sel.items() if k != "iteration3"}))
     refused(resign({**sel, "picks": {**sel["picks"], "fold_0": 1.6e-4}}))  # a refinement point is never a pick
     refused(resign({**sel, "picks": {f"fold_{k}": 8e-5 for k in range(5)}}))  # no fold moved: nothing is refit
     refused({"status": "selected"})
@@ -240,13 +242,13 @@ def test_final_session_fits_each_fold_at_its_pick(chain, final):
         df = pd.read_csv(ud / "pred_b_lite.csv").astype({"StudyInstanceUID": str})
         assert df["StudyInstanceUID"].tolist() == d.uids[d.split(k)[2]].tolist()  # the fold's scored test studies
     # one fit per fold: b-lite, seed 0, the fold's pick, Stage A's head, all outer training rows, no validation rows
-    assert [(f["fold"], f["lr"]) for f in seen["fits"]] == [(k, PICKS[k]) for k in (0, 1, 4, 2, 3)]
+    assert [(f["fold"], f["lr"]) for f in seen["fits"]] == [(k, PICKS[k]) for k in (0, 4, 1, 2, 3)]  # moved folds first
     for f in seen["fits"]:
         assert f["with_encoder"] and f["seed"] == 0 and f["stage_a_head"] and not f["val"]
         assert sorted(f["rows"].tolist()) == sorted(d.split(f["fold"])[0].tolist())
     # the pick stands in run.json before a trained model sees the test fold; frozen0 came first
     trained = [t for t in seen["test"] if t["trained"]]
-    assert [(t["fold"], t["lr"], t["recorded"]) for t in trained] == [(k, PICKS[k], True) for k in (0, 1, 4, 2, 3)]
+    assert [(t["fold"], t["lr"], t["recorded"]) for t in trained] == [(k, PICKS[k], True) for k in (0, 4, 1, 2, 3)]
     assert [t["fold"] for t in seen["test"]][:3] == [0, 1, 4] and not any(t["trained"] for t in seen["test"][:3])
     run = json.loads((work / "run.json").read_text())
     rec = run["n11_chosen_encoder_lr"]
@@ -349,6 +351,14 @@ def test_dev_numbers_of_the_refit_model(chain, final, tmp_path, monkeypatch, cap
         assert (g["abs_macro_auc_gap"], g["max_abs_probability_gap"], g["mean_abs_probability_gap"]) == (0.0, 0.0, 0.0)
     assert s["per_fold"]["fold_0"]["b_lite"] != s["per_fold"]["fold_0"]["b_lite_iteration3"]
     assert s["same_seed_noise"]["folds"] == [1, 3] and s["same_seed_noise"]["max_abs_macro_auc_gap"] == 0.0
+    # the micro-batch of every refit unit equals iteration 3's unit of the same fold
+    assert s["micro_batch"] == {**s["micro_batch"], "equals_iteration3_in_every_refit_fold": True,
+                                "folds_that_differ": {"folds": []}, "label": None}
+    assert s["same_seed_noise"]["micro_batch_label"] is None
+    for k in range(5):
+        f = s["per_fold"][f"fold_{k}"]
+        assert f["config"] == {"micro_batch_studies_refit": 2, "micro_batch_studies_iteration3": 2}
+        assert f["micro_batch_equals_iteration3"] is True and f["micro_batch_label"] is None
     out = json.loads((tmp_path / "out" / "agg_n11x_dev.json").read_text())
     agg._check(out)
     text = (tmp_path / "out" / "agg_n11x_dev.json").read_text()
@@ -377,6 +387,24 @@ def test_dev_numbers_of_the_refit_model(chain, final, tmp_path, monkeypatch, cap
     finally:
         p.write_text(good)
     assert not (tmp_path / "o2" / "agg_n11x_dev.json").exists()
+    # a refit unit with another micro-batch than iteration 3's unit: reported and labelled, also on the noise block
+    p = root / "knee-n11x-final" / "private" / "n11x_final" / f"{DINO}_f3" / "state.json"
+    good = p.read_text()
+    b = json.loads(good)
+    b["config"]["micro_batch_studies"] = 1
+    p.write_text(json.dumps(b))
+    try:
+        m = _dev(chain, monkeypatch, tmp_path / "o3")
+    finally:
+        p.write_text(good)
+    assert m["status"] == "ok" and m["micro_batch"]["label"] == "micro-batch differs from iteration 3"
+    assert m["micro_batch"]["folds_that_differ"] == {"folds": [3]} and m["micro_batch"]["equals_iteration3_in_every_refit_fold"] is False
+    f3 = m["per_fold"]["fold_3"]
+    assert f3["config"] == {"micro_batch_studies_refit": 1, "micro_batch_studies_iteration3": 2}
+    assert f3["micro_batch_label"] == f3["same_seed_noise_of_a_final_fit"]["micro_batch_label"] == "micro-batch differs from iteration 3"
+    assert m["same_seed_noise"]["micro_batch_label"] == "micro-batch differs from iteration 3"
+    assert m["per_fold"]["fold_1"]["micro_batch_label"] is None
+    agg._check(json.loads((tmp_path / "o3" / "agg_n11x_dev.json").read_text()))
     # dev() itself is as it was: it reads iteration 3's units only
     assert set(d3) >= {"frozen0", "head_only_seed_0", "b_lite", "head_only_seed_values"}
 
@@ -544,7 +572,7 @@ def test_soft_stop_ends_partial_and_a_failed_frozen0_check_ends_invalid(chain, t
     real = n11.run_to
 
     def run_to(c, r, twelfth, limit=None):
-        if c.fold == 1 and twelfth == 3:
+        if c.fold == 4 and twelfth == 3:  # GPU 0's order is 0, 4, 1: the moved folds first
             c.task["soft_stop"] = 1.0  # the budget of this process is used up while twelfth 3 trains
         real(c, r, twelfth, limit)
 
@@ -553,13 +581,13 @@ def test_soft_stop_ends_partial_and_a_failed_frozen0_check_ends_invalid(chain, t
     assert "STEP n11x_final: OK" in capfd.readouterr().out
     assert s["status"] == "partial" and s["out_of_time"] is True and s["fits_invalid"] == []
     assert s["units_complete"] == [f"{DINO}_f{k}" for k in (0, 2, 3)] and s["fits_unfinished"] == [f"{DINO}_f1", f"{DINO}_f4"]
-    assert s["errors"][f"{DINO}_f1"].startswith("OutOfTime at")
+    assert s["errors"][f"{DINO}_f4"].startswith("OutOfTime at")
     sts = _states(tmp_path / "ws")
-    fit = sts[1]["final"]["b_lite"]["seed_0"]
+    fit = sts[4]["final"]["b_lite"]["seed_0"]
     assert fit["status"] == "unfinished: out of time" and len(fit["curve"]["train_loss"]) == 3 and fit["valid"] is False
-    assert "final" not in sts[4] and sts[4]["frozen0"]["valid"] is True  # frozen0 ran for every fold first
-    assert s["overview"][f"{DINO}_f4"]["status"] == "not started" and s["overview"][f"{DINO}_f1"]["final_complete"] is False
-    assert not list((tmp_path / "ws" / "private" / "n11x_final" / f"{DINO}_f1").glob("*.pt"))
+    assert "final" not in sts[1] and sts[1]["frozen0"]["valid"] is True  # frozen0 ran for every fold first
+    assert s["overview"][f"{DINO}_f1"]["status"] == "not started" and s["overview"][f"{DINO}_f4"]["final_complete"] is False
+    assert not list((tmp_path / "ws" / "private" / "n11x_final" / f"{DINO}_f4").glob("*.pt"))
     agg._check(json.loads((tmp_path / "ws" / "agg_n11x_final.json").read_text()))
     # check (b) of frozen0 fails: the run is invalid, the step fails, nothing is trained
     monkeypatch.undo()
@@ -571,6 +599,24 @@ def test_soft_stop_ends_partial_and_a_failed_frozen0_check_ends_invalid(chain, t
     assert a["status"].startswith("invalid: frozen0 check (b) failed") and (tmp_path / "wb" / "private" / "n11x_final" / "INVALID").exists()
     assert all(set(b) == {"frozen0"} and b["frozen0"]["valid"] is False for b in a["units"].values())
     assert not list((tmp_path / "wb").rglob("pred_b_lite.csv")) and not list((tmp_path / "wb").rglob("*.pt"))
+
+
+def test_moved_folds_are_fitted_first_inside_each_process(chain, tmp_path, monkeypatch):
+    """A selection where fold 4 moved and fold 0 did not: GPU 0 keeps folds 0, 1, 4 and fits 4 first; the
+    frozen0 checks keep the declared order."""
+    from knee.nb import n11
+
+    sel = n11._signed({**{k: v for k, v in chain["sel"].items() if k != "sha256"},
+                       "picks": {**chain["sel"]["picks"], "fold_0": 8e-5, "fold_3": 6.4e-4}})
+    order = {"frozen0": [], "fit": []}
+    real = n11._frozen0
+    monkeypatch.setattr(n11, "_frozen0", lambda c, st: (order["frozen0"].append(c.fold), real(c, st))[1])
+    monkeypatch.setattr(n11, "_final_ext", lambda c, st, lr: order["fit"].append((c.fold, lr)))
+    s = _final(chain["inputs"], tmp_path / "w", monkeypatch, sel)
+    assert s["processes"] == [f"{DINO} on cpu: folds 0, 1, 4", f"{DINO} on cpu: folds 2, 3"]  # the assignment stays
+    assert order["frozen0"] == [0, 1, 4, 2, 3]
+    assert order["fit"] == [(4, 3.2e-4), (0, 8e-5), (1, 8e-5), (2, 1.28e-3), (3, 6.4e-4)]
+    assert s["status"] == "partial" and s["selection"]["folds_moved"] == {"folds": [2, 3, 4]}  # the fits were replaced here
 
 
 def test_two_processes_share_the_step_folder_and_run_json(chain, tmp_path, monkeypatch):
@@ -677,5 +723,20 @@ def test_graph_script_draws_g1_and_g2_from_the_aggregates(chain, tmp_path, monke
                         "--out", str(tmp_path / "g2")], capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     assert (tmp_path / "g2" / "g1_steps_to_the_optimum.png").exists()
+    # the thick mean line breaks at a rate without a mean: it never passes over one (the fixture's refinement rate
+    # 1.6e-4 lies between 8e-5 and 3.2e-4 and has no mean by Rule D)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("plot_lrx", script)
+    pl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pl)
+    d = pl.load([base / "wa" / "agg_n11_a.json", base / "wb" / "agg_n11_b.json"], [tmp_path / "agg_n11x_inner.json"],
+                chain["sel_path"], tmp_path / "agg_n11x_refine.json")
+    keys = sorted({*d["quarter"], *d["end"]}, key=float)
+    assert keys == ["5e-06", "2e-05", "8e-05", "0.00016", "0.00032", "0.00128"] and "0.00016" not in d["means"]
+    segs = pl.mean_segments([k for k in keys if k in d["end"]], d["means"])
+    assert [[x for x, _ in s] for s in segs] == [[2e-5, 8e-5], [3.2e-4, 1.28e-3]]
+    assert pl.mean_segments(["1", "2", "3", "4"], {"1": 0.5, "3": 0.6, "4": 0.7}) == [[(1.0, 0.5)], [(3.0, 0.6), (4.0, 0.7)]]
+    assert pl.mean_segments(["1", "2"], {}) == [] and pl.mean_segments(["1", "2"], {"1": 0.5, "2": 0.6}) == [[(1.0, 0.5), (2.0, 0.6)]]
     text = script.read_text()  # matplotlib and the standard library only; it opens what it is given, nothing else
     assert "import pandas" not in text and "import numpy" not in text and "glob" not in text and ".csv" not in text

@@ -167,7 +167,8 @@ def tail_units(encoder: str, root: Path | None = None, source: str = "n11") -> d
     source "n11x": the final fits of the learning-rate extension (private/n11x_final/) instead. The
     conditions "every final fit at its unit's chosen rate" and "inner work complete" are replaced by: the
     signed selection record is attached (status "selected", intact sha256), every unit's state holds that
-    record's sha256, every final fit ran at the record's pick for its fold and is finished and valid. One
+    record's sha256, every final fit ran at the record's pick for its fold, is finished and valid and wrote finite test-fold
+    predictions. One
     known commit, folds 0-4, the weights file's hash and the knee-n6a config check stay. The result also
     holds "source" and "selection" (sha256, time).
 
@@ -205,7 +206,7 @@ def tail_units(encoder: str, root: Path | None = None, source: str = "n11") -> d
             if (b.get("ext_final") or {}).get("selection_sha256") != sel["sha256"]:
                 raise TailError(f"b-lite: the final fit of fold {k} was not run under the attached selection record")
             if not (fin.get("complete") and fin.get("valid") and fit.get("finished") and fit.get("valid")
-                    and (b.get("frozen0") or {}).get("valid")):
+                    and fit.get("test_predictions_finite") and (b.get("frozen0") or {}).get("valid")):
                 raise TailError(f"b-lite: the final fit of fold {k} is not finished and valid")
         elif not (fin.get("complete") and inner.get("complete") and (b.get("frozen0") or {}).get("valid")):
             raise TailError(f"b-lite: the unit of fold {k} is not complete")

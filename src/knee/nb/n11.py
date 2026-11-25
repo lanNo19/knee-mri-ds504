@@ -3415,12 +3415,14 @@ EXT_DEV_LABEL = f"{DEV_LABEL}; {EXT_DEV_NOTE}"
 EXT_KEEP_SHA256 = "0a8cce4c28d408b93faac3c7fd8d67d3c7453b81979dffebef98215b4dcab00f"
 EXT_FINAL_NOTE = "predictions only: no test-fold metric of a trained model is computed in this notebook"
 EXT_INCOMPLETE = "the refit model is incomplete: per-fold development numbers only, no N10 preparation"
+EXT_MICRO_LABEL = "micro-batch differs from iteration 3"
 
 
 def _selection(selection_record=None, root=None) -> dict:
     """The signed selection record: selection_ext()'s output as a dict, its JSON text, the path of its file,
     or (None) the attached agg_n11x_select.json. Accepted only with status "selected", an intact sha256, not
-    from a smoke run, and one pick per fold out of 8e-5 and the selectable rates (R5)."""
+    from a smoke run, made with iteration 3's states attached (not reference_only), and one pick per fold out
+    of 8e-5 and the selectable rates (R5)."""
     d = selection_record
     if d is None:
         p = paths.find_file(f"agg_{EXT_NAME}_select.json", Path(root) if root else None)
@@ -3438,6 +3440,8 @@ def _selection(selection_record=None, root=None) -> dict:
         raise ValueError("the selection record of a smoke run is not a result")
     if d.get("status") != "selected":
         raise ValueError('the selection record must have status "selected": after any other status no fold moves')
+    if (d.get("iteration3") or {}).get("attached") is not True:
+        raise ValueError("the selection record was made without iteration 3's states (reference_only): not for final fits")
     picks = d.get("picks") or {}
     allowed = (EXT_REUSED_LR, *EXT_SELECTABLE)
     if sorted(picks) != [f"fold_{k}" for k in range(N_OUTER)] or not all(
@@ -3541,7 +3545,8 @@ def _final_ext(c, st: dict, lr: float) -> dict:
 def _task_final(task: dict) -> dict:
     """One process of the final fits: DINOv2 on one device, through its folds in order. As iteration 3's
     session: first frozen0 with check (b) for every fold of the process (a failed check stops everything
-    before any training), then the final fit of every fold. Only safe fields return."""
+    before any training), then the final fit of every fold, the moved folds of the process first (a soft stop
+    then cuts a fold that keeps 8e-5, if any). Only safe fields return."""
     enc, working, step = task["encoder"], Path(task["working"]), task["step"]
     folds = [int(k) for k in task["folds"]]
     picks = {int(k): float(v) for k, v in task["picks"].items()}
@@ -3572,7 +3577,7 @@ def _task_final(task: dict) -> dict:
             f = _frozen0(c, st)
             states[cur] = st
             del f
-        for cur in folds:  # 2. the final fit of every fold, at its pick
+        for cur in sorted(folds, key=lambda k: (math.isclose(picks[k], EXT_REUSED_LR), k)):  # 2. the fits: moved folds first
             try:
                 c = _context(sh, cur)
                 _final_ext(c, states[cur], picks[cur])
@@ -3664,7 +3669,8 @@ def run_final_lrx(selection=None, folds=None, *, budget_h: float, root=None, exp
       3.7 h for five folds, 2.6 h for three or four, 1.3 h for one or two. A value above the bound plus 0.1
       is refused. It is the soft stop: a late fit stops within one twelfth, the session ends OK with status
       "partial" and everything written; the watchdog stops the step at 1.1 x.
-    Devices: five folds: GPU 0 takes folds 0, 1, 4 and GPU 1 folds 2, 3; fewer folds alternate. Two
+    Devices: five folds: GPU 0 takes folds 0, 1, 4 and GPU 1 folds 2, 3; fewer folds alternate. Inside a
+      process the folds that moved are fitted first, then the others, each group in rising order. Two
       processes need two CUDA devices (refused before the cache copy otherwise; devices is the tests'
       argument and marks test_overrides).
     Inside a process: frozen0 with check (b) for each of its folds (a failed check: the run is invalid and
@@ -3886,7 +3892,8 @@ def dev_lrx(decision_record=None, selection=None, root=None, n_boot: int = N_BOO
             raise ValueError("dev_lrx: no final fit of the extension is attached (knee-n11x-final)")
         it3_units = {k: ud for (e, k), ud in find_units(root).items() if e == DINO}
         it3_lr = {k: float(dec["units"][_unit(DINO, k)]["chosen_lr"]) for k in range(N_OUTER)}
-        envs = [u["state"].get("environment") for u in units.values()] + [_load_state(ud).get("environment") for ud in it3_units.values()]
+        it3_states = {k: _load_state(ud) for k, ud in it3_units.items()}
+        envs = [u["state"].get("environment") for u in units.values()] + [b.get("environment") for b in it3_states.values()]
         env_differ = sorted(f for f in set().union(*((x or {}).keys() for x in envs))
                             if len({json.dumps((x or {}).get(f), sort_keys=True) for x in envs}) > 1)
         commits = sorted({u["commit"] for u in units.values()})
@@ -3895,13 +3902,22 @@ def dev_lrx(decision_record=None, selection=None, root=None, n_boot: int = N_BOO
                            "environment_label": "across environments" if env_differ else None}
         fold, Y, find = A["frozen0"]["fold"], A["frozen0"]["Y"], list(range(len(FINDINGS)))
         refit = np.full(A["frozen0"]["P"].shape, np.nan)
-        have, per_fold, noise = [], {}, {}
+        have, per_fold, noise, micro_differs = [], {}, {}, []
         for k in range(N_OUTER):
             m = fold == k
             u = units.get(k)
             info: dict = {**tag, "pick": picks[k], "pick_key": _lr_key(picks[k]), "moved": k in moved,
                           "iteration3_lr": it3_lr[k], "final_fit": u["status"] if u else "not refit"}
             per_fold[f"fold_{k}"] = info
+            if u:  # the micro-batch of the refit against iteration 3's unit of the same fold (under "config": a setting)
+                mb = {"micro_batch_studies_refit": (u["state"].get("config") or {}).get("micro_batch_studies"),
+                      "micro_batch_studies_iteration3": ((it3_states.get(k) or {}).get("config") or {}).get("micro_batch_studies")}
+                same_mb = bool(mb["micro_batch_studies_refit"] is not None
+                               and mb["micro_batch_studies_refit"] == mb["micro_batch_studies_iteration3"])
+                info.update({"config": mb, "micro_batch_equals_iteration3": same_mb,
+                             "micro_batch_label": None if same_mb else EXT_MICRO_LABEL})
+                if not same_mb:
+                    micro_differs.append(k)
             if not (u and u["usable"]):
                 continue
             rows = _read_rows(u["dir"] / "pred_b_lite.csv")
@@ -3930,15 +3946,21 @@ def dev_lrx(decision_record=None, selection=None, root=None, n_boot: int = N_BOO
                     "what": "same-seed noise of a final fit: this fold's refit against iteration 3's final fit at the same rate",
                     "encoder_lr": picks[k], "macro_auc_refit_minus_iteration3": _r(d),
                     "abs_macro_auc_gap": _r(abs(d)), "max_abs_probability_gap": _r(float(gap.max()), 5),
-                    "mean_abs_probability_gap": _r(float(gap.mean()), 6)}
+                    "mean_abs_probability_gap": _r(float(gap.mean()), 6),
+                    "micro_batch_label": info.get("micro_batch_label")}
         s["per_fold"] = per_fold
         s["folds_refit"] = {"folds": have}
+        s["micro_batch"] = {"equals_iteration3_in_every_refit_fold": not micro_differs, "folds_that_differ": {"folds": micro_differs},
+                            "label": EXT_MICRO_LABEL if micro_differs else None,
+                            "note": "studies per micro-batch of each final fit against iteration 3's unit of the same fold; "
+                                    "the gradient of a batch is the same up to rounding, the fit is not a bit-equal replicate"}
         gaps = [x["abs_macro_auc_gap"] for x in noise.values() if x["abs_macro_auc_gap"] is not None]
         s["same_seed_noise"] = {**tag, "what": "same-seed noise of a final fit (development): two final fits at one rate, seed 0",
                                 "folds": [int(f.split("_")[1]) for f in noise],
                                 "max_abs_macro_auc_gap": _r(max(gaps)) if gaps else None,
                                 "mean_abs_macro_auc_gap": _r(float(np.mean(gaps))) if gaps else None,
                                 "environment_label": s["final_fits"]["environment_label"],
+                                "micro_batch_label": EXT_MICRO_LABEL if any(x.get("micro_batch_label") for x in noise.values()) else None,
                                 "note": "one pair of fits per fold; the folds refit at the rate iteration 3 used"}
         missing = [k for k in range(N_OUTER) if k not in have]
         if missing:

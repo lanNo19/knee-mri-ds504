@@ -766,6 +766,7 @@ Gates, read first (declaration, sections 6 and 9):
 1. The selection record has status "selected" and any_fold_moves true. No fold moved = nothing is refit; skip sections 5 to 8.
 2. Read the quota. At least 4.2 h left: all five folds. Under 4.2 h: only the moved folds (the fallback call below), and only if the quota left is at least that call's bound plus 0.5 h (1.8 h for one or two folds, 3.1 h for three or four); then no S4 model is built.
 3. Create the notebook as a fork of knee-n11-a ("Pin to original environment").
+4. Speed, read before the start: train_seconds of the finished inner runs in agg_n11x_inner.json (overview.<lr key>.fold_k). Plan: about 2,020 s for fold 0 and about 3,100 s for the other folds. More than 10% above the plan = the last fit on GPU 0 (folds 0, 1, 4) is at risk of the soft stop (slack about 16%). The code already fits the moved folds first (the moved-folds-first order), so the fit at risk is a fold that keeps 8e-5, if GPU 0 has one. Say the risk in the log before the start.
 
 ```python
 from knee.nb import n11; n11.run_final_lrx(budget_h=BUDGET_H, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
@@ -779,13 +780,14 @@ BUDGET_H is not defined on purpose: replace it by a number. No default exists an
 Expected time: 3.3 h planned, 3.7 h bound (five folds). GPU 0: folds 0, 1, 4. GPU 1: folds 2, 3. Fewer folds alternate over the two GPUs. The watchdog stops the step at 1.1 x budget_h.
 
 Inside a process, in this order:
-1. frozen0 with check (b) for each of its folds. A failed check: the run is invalid, STEP n11x_final: FAILED, nothing is trained (as in iteration 3).
-2. Per fold: the pick is written to run.json (n11_chosen_encoder_lr); then the b-lite fit from Stage A's head on all training studies, seed 0, one twelfth at a time; then pred_b_lite.csv and b_lite_seed_0.pt. No head-only seed. No test-fold metric.
+1. frozen0 with check (b) for each of its folds. A failed check: the run is invalid, STEP n11x_final: FAILED, no fit is kept (as in iteration 3; the other GPU may have trained up to two twelfths by then).
+2. Per fold, the moved folds of the process first, then the folds that keep 8e-5: the pick is written to run.json (n11_chosen_encoder_lr); then the b-lite fit from Stage A's head on all training studies, seed 0, one twelfth at a time; then pred_b_lite.csv and b_lite_seed_0.pt. No head-only seed. No test-fold metric.
 
 What to read (summary block and agg_n11x_final.json):
 1. STEP n11x_final: OK. status "ok" = every fit finished and is valid. "partial" = read units_missing, fits_invalid, fits_unfinished, out_of_time, errors.
 2. selection.sha256 equals the recorded selection's. overview.<unit>.pick equals the record's pick for the fold.
 3. overview.<unit>: frozen0_valid true, check_b_abs_difference at most 0.0005, status "finished", valid true, skipped_step_share, train_seconds, weights_file_sha16.
+3b. units.<unit>.config.micro_batch_studies is 2 in all five final-fit units (as in iteration 3 and in D1's smoke run). If it is 1: the fit is valid, but report it beside the same-seed noise; knee-n11x-dev then writes micro_batch.label "micro-batch differs from iteration 3".
 4. A fit is valid with a finite training loss at every twelfth and a skipped-step share of at most 0.05 (units.<unit>.final.b_lite.seed_0.per_twelfth). An invalid fit stops at that twelfth and writes no prediction and no weights. An invalid or unfinished fit is reported and not repeated, also not at another rate.
 5. refit_model.complete true = all five fits finished and valid. False = per-fold development numbers only, no section 7 or 8.
 6. Do not compute anything from the private files (pred_frozen0.csv, pred_b_lite.csv).
@@ -804,7 +806,7 @@ What to read (summary block and agg_n11x_dev.json):
 3. status "ok": model holds frozen0, head_only_seed_0, b_lite (the refit model) and b_lite_iteration3 (8e-5 in every fold), each with mean_of_fold_macros, fold_stratified_macro_auc and fold_stratified_interval; b_lite_minus_frozen0, b_lite_minus_head_only and b_lite_minus_iteration3_b_lite with the paired study-bootstrap interval. Check: frozen0, head_only_seed_0 and b_lite_iteration3 equal agg_n11_dev.json (the same files, folds, draws and seed). A gap = stop and report.
 4. status "ok (per-fold numbers only: the refit model is incomplete)": fewer than five refit folds, or an invalid or unfinished one. model.status "per-fold numbers only", model.why. No five-fold number exists.
 5. per_fold.fold_<k>: pick, moved, iteration3_lr, final_fit, each arm's macro AUC in that fold and the three differences with an interval. null = a finding lacks a class in that fold.
-6. same_seed_noise and per_fold.fold_<k>.same_seed_noise_of_a_final_fit: for each fold refit at the rate iteration 3 used (8e-5), the gap between the two final fits: macro AUC difference and the largest and mean probability gap. Say it as "same-seed noise of a final fit" (development, labelled). environment_label "across environments" = the two fits ran in different environments.
+6. same_seed_noise and per_fold.fold_<k>.same_seed_noise_of_a_final_fit: for each fold refit at the rate iteration 3 used (8e-5), the gap between the two final fits: macro AUC difference and the largest and mean probability gap. Say it as "same-seed noise of a final fit" (development, labelled). environment_label "across environments" = the two fits ran in different environments. micro_batch (and per_fold.fold_<k>.config): each refit unit's micro-batch against iteration 3's unit of the same fold; label "micro-batch differs from iteration 3" on a mismatch.
 7. report_final_model.model: "refit" only if all five final fits are finished and valid; else "iteration3_8e-5" with the sentence for the report. This is fixed before any second S4 score exists.
 
 ### 7. knee-n10-tails-check-x (only if refit_model.complete; at least 1.2 h of quota; before Wed 22:30)
@@ -825,7 +827,7 @@ from knee.nb import n10; n10.run("dinov2_vits14", tails="n11x")
 
 Offline cell 1, the same bundle version as section 7, the same version of knee-n6a that knee-n11x-final had attached. Expected time: 3-6 h on the hidden test.
 
-The step refuses to run (STEP n10: FAILED, before any decoding, no submission.csv) unless all of these hold: the signed selection record is attached (status "selected", intact sha256); exactly folds 0-4 of private/n11x_final; every unit's state holds that record's sha256; every final fit is finished and valid, with frozen0 valid; every fit ran at the record's pick for its fold; each b_lite_seed_0.pt is the file its state records; one known commit; one schedule; no test overrides; knee-n6a's config of the fold equals the logged one.
+The step refuses to run (STEP n10: FAILED, before any decoding, no submission.csv) unless all of these hold: the signed selection record is attached (status "selected", intact sha256); exactly folds 0-4 of private/n11x_final; every unit's state holds that record's sha256; every final fit is finished and valid, with finite test-fold predictions and frozen0 valid; every fit ran at the record's pick for its fold; each b_lite_seed_0.pt is the file its state records; one known commit; one schedule; no test overrides; knee-n6a's config of the fold equals the logged one.
 
 Check in agg_n10.json before asking Ablay: the list of the card "N10 with N11's B-lite models" (items 1 to 9), with these changes. Item 2: b_lite.n11_commit = the commit of knee-n11x-final. Item 3: weights_file_sha16 against overview.<unit>.weights_file_sha16 of agg_n11x_final.json. Item 5: b_lite.units.fold_k.encoder_lr = the selection record's pick for fold k. Item 9: against the check of section 7, for the fold it replayed. New: b_lite.source "n11x" and b_lite.selection_sha256 = the recorded selection's.
 

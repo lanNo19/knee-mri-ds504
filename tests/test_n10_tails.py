@@ -792,7 +792,7 @@ def _selection_x(picks=PICKS_X, **over) -> dict:
     from knee.nb import n11
 
     return n11._signed({"status": "selected", "smoke": False, "plan": "it3_lr_extension_r3", "rule_d": {"words": "test"},
-                        "written_at_utc": "2026-11-25T11:15:00Z", "picks": {f"fold_{k}": v for k, v in picks.items()},
+                        "written_at_utc": "2026-11-25T11:15:00Z", "iteration3": {"attached": True}, "picks": {f"fold_{k}": v for k, v in picks.items()},
                         **over})
 
 
@@ -824,7 +824,8 @@ def _write_n11x(inp: Path, sel: dict | None = None, enc: str = ENC, folds=range(
             "ext_final": {"selection_sha256": sel["sha256"], "pick": lr, "moved": lr != 8e-5},
             "frozen0": {"valid": True},
             "final": {"complete": True, "valid": True,
-                      "b_lite": {"seed_0": {"encoder_lr": lr, "status": "finished", "finished": True, "valid": True}}},
+                      "b_lite": {"seed_0": {"encoder_lr": lr, "status": "finished", "finished": True, "valid": True,
+                                             "test_predictions_finite": True}}},
             "files_sha16": {"b_lite_seed_0.pt": sha}}))
     return sel
 
@@ -889,7 +890,7 @@ def test_refused_extension_units_selection_rate_validity_commit(n11x_files):
     bad["picks"]["fold_1"] = 3.2e-4  # a pick changed after the record was written
     selp.write_text(json.dumps(bad))
     refused("changed after it was written")
-    for over in ({"status": "inconclusive"}, {"smoke": True}):
+    for over in ({"status": "inconclusive"}, {"smoke": True}, {"iteration3": {"attached": False}}):
         fresh(sel=_selection_x(**over))
         refused("selection record")
     fresh()
@@ -906,6 +907,8 @@ def test_refused_extension_units_selection_rate_validity_commit(n11x_files):
     for edit in (lambda st: st["final"].update({"valid": False}), lambda st: st["final"].update({"complete": False}),
                  lambda st: st["final"]["b_lite"]["seed_0"].update({"valid": False, "status": "invalid"}),
                  lambda st: st["final"]["b_lite"]["seed_0"].update({"finished": False, "status": "unfinished: out of time"}),
+                 lambda st: st["final"]["b_lite"]["seed_0"].update({"test_predictions_finite": False}),
+                 lambda st: st["final"]["b_lite"]["seed_0"].pop("test_predictions_finite"),
                  lambda st: st["frozen0"].update({"valid": False})):
         fresh()
         _edit_x(inp, 3, edit)
