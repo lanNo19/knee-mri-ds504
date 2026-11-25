@@ -779,3 +779,240 @@ def test_blite_notebook_entries_match_the_runbook_card():
     for name in ("n10", "n10-convnext", "n10-canary"):  # the registered entries are unchanged
         assert "tails" not in mk.cell2(name)
     assert mk.NOTEBOOKS["n10"] == (True, True, False, ["n0", "n6a"], 32400)
+
+
+# ---------------------------------------------------------------- tails="n11x": the refit model of the extension
+
+PICKS_X = {0: 3.2e-4, 1: 8e-5, 2: 1.28e-3, 3: 8e-5, 4: 3.2e-4}
+COMMIT_X = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+def _selection_x(picks=PICKS_X, **over) -> dict:
+    """A signed selection record with the fields the readers use (n11._signed, as select_lrx writes it)."""
+    from knee.nb import n11
+
+    return n11._signed({"status": "selected", "smoke": False, "plan": "it3_lr_extension_r3", "rule_d": {"words": "test"},
+                        "written_at_utc": "2026-11-25T11:15:00Z", "picks": {f"fold_{k}": v for k, v in picks.items()},
+                        **over})
+
+
+def _write_n11x(inp: Path, sel: dict | None = None, enc: str = ENC, folds=range(5), commit=COMMIT_X) -> dict:
+    """What knee-n11x-final and knee-n11x-select leave for N10: the fold models of _write_n11 (the same
+    tensors) under private/n11x_final/, each state with the selection's sha256 and the fold's pick."""
+    sel = sel or _selection_x()
+    (inp / "knee-n11x-select").mkdir(parents=True, exist_ok=True)
+    (inp / "knee-n11x-select" / "agg_n11x_select.json").write_text(json.dumps(sel))
+    out = inp / "knee-n11x-final"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run.json").write_text(json.dumps({"step": "n11x_final", "commit": commit, "config": {
+        "session": "final", "folds": list(folds), "schedule": "full", "passes": 16200, "selection_sha256": sel["sha256"],
+        "test_overrides": False}}))
+    for k in folds:
+        cfg = heads.config_from(_cfg_of(k))
+        ud = out / "private" / "n11x_final" / f"{enc}_f{k}"
+        ud.mkdir(parents=True)
+        torch.manual_seed(50 + k)
+        head = heads.make_head(cfg, D, len(heads.PLANE_SETS[cfg.planes]))
+        torch.save({"tail": _tail_of(k), "head": head.state_dict(), "encoder": enc, "fold": k,
+                    "tail_prefixes": ["block.", "ls.", "norm."]}, ud / "b_lite_seed_0.pt")
+        sha = hashlib.sha256((ud / "b_lite_seed_0.pt").read_bytes()).hexdigest()[:16]
+        lr = PICKS_X[k]
+        (ud / "state.json").write_text(json.dumps({
+            "encoder": enc, "fold": k, "session": "final", "schedule": "full", "stage_a_unit": "knee-n6a",
+            "config": {"pooling": cfg.pooling, "planes": cfg.planes, "dropout": cfg.dropout, "head_lr": cfg.lr,
+                       "head_weight_decay": cfg.weight_decay, "amp_fp16": False},
+            "ext_final": {"selection_sha256": sel["sha256"], "pick": lr, "moved": lr != 8e-5},
+            "frozen0": {"valid": True},
+            "final": {"complete": True, "valid": True,
+                      "b_lite": {"seed_0": {"encoder_lr": lr, "status": "finished", "finished": True, "valid": True}}},
+            "files_sha16": {"b_lite_seed_0.pt": sha}}))
+    return sel
+
+
+def _edit_x(inp: Path, k: int, fn) -> None:
+    p = inp / "knee-n11x-final" / "private" / "n11x_final" / f"{ENC}_f{k}" / "state.json"
+    st = json.loads(p.read_text())
+    fn(st)
+    p.write_text(json.dumps(st))
+
+
+@pytest.fixture()
+def n11x_files(tmp_path):
+    inp = tmp_path / "input"
+    _write_n6a(inp)
+    return inp, _write_n11x(inp)
+
+
+def test_tail_units_reads_the_five_final_fits_of_the_extension(n11x_files):
+    from knee.nb import n10
+
+    inp, sel = n11x_files
+    assert n10.TAILS == ("n11", "n11x")
+    t = n10.tail_units(ENC, inp, "n11x")
+    assert sorted(t["units"]) == [0, 1, 2, 3, 4] and t["commit"] == COMMIT_X and t["schedule"] == "full" and t["source"] == "n11x"
+    assert [t["units"][k]["encoder_lr"] for k in range(5)] == [PICKS_X[k] for k in range(5)]
+    assert t["selection"] == {"sha256": sel["sha256"], "written_at_utc": sel["written_at_utc"], "folds_moved": [0, 2, 4]}
+    assert t["lr_rule"] == {"selection_sha256": sel["sha256"], "passes": 16200} and t["units"][3]["config"].planes == "sag+cor"
+    with pytest.raises(n10.TailError, match="exactly folds 0-4"):  # the N11 source sees none of these units
+        n10.tail_units(ENC, inp)
+    with pytest.raises(ValueError):
+        n10.tail_units(ENC, inp, "n12")
+    with pytest.raises(n10.TailError, match="DINOv2 only"):
+        n10.tail_units("convnext_tiny", inp, "n11x")
+    # the two sources stay apart: iteration 3's units beside the extension's change neither reading
+    _write_n11(inp)
+    old = n10.tail_units(ENC, inp)
+    assert set(old) == {"units", "commit", "schedule", "lr_rule"} and old["commit"] == COMMIT
+    assert [old["units"][k]["encoder_lr"] for k in range(5)] == [LRS[k] for k in range(5)]
+    assert n10.tail_units(ENC, inp, "n11x")["commit"] == COMMIT_X
+
+
+def test_refused_extension_units_selection_rate_validity_commit(n11x_files):
+    from knee.nb import n10
+
+    inp, sel = n11x_files
+    selp = inp / "knee-n11x-select" / "agg_n11x_select.json"
+
+    def fresh(**kw):
+        shutil.rmtree(inp)
+        _write_n6a(inp)
+        return _write_n11x(inp, **kw)
+
+    def refused(match):
+        with pytest.raises(n10.TailError, match=match):
+            n10.tail_units(ENC, inp, "n11x")
+
+    selp.unlink()  # no selection record attached
+    refused("selection record")
+    fresh()
+    bad = json.loads(selp.read_text())
+    bad["picks"]["fold_1"] = 3.2e-4  # a pick changed after the record was written
+    selp.write_text(json.dumps(bad))
+    refused("changed after it was written")
+    for over in ({"status": "inconclusive"}, {"smoke": True}):
+        fresh(sel=_selection_x(**over))
+        refused("selection record")
+    fresh()
+    selp.write_text(json.dumps(_selection_x(written_at_utc="2026-11-25T15:00:00Z")))  # another (later) record
+    refused("fold 0 was not run under the attached selection record")
+    fresh()
+    _edit_x(inp, 2, lambda st: st["ext_final"].update({"selection_sha256": "0" * 64}))
+    refused("fold 2 was not run under the attached selection record")
+    fresh()
+    _edit_x(inp, 4, lambda st: st["final"]["b_lite"]["seed_0"].update({"encoder_lr": 8e-5}))  # iteration 3's rate, not the pick
+    refused("fold 4 was not run at the fold's pick")
+    fresh(sel=_selection_x({**PICKS_X, 1: 3.2e-4}))  # the record picks another rate than the fit of fold 1 used
+    refused("fold 1 was not run at the fold's pick")
+    for edit in (lambda st: st["final"].update({"valid": False}), lambda st: st["final"].update({"complete": False}),
+                 lambda st: st["final"]["b_lite"]["seed_0"].update({"valid": False, "status": "invalid"}),
+                 lambda st: st["final"]["b_lite"]["seed_0"].update({"finished": False, "status": "unfinished: out of time"}),
+                 lambda st: st["frozen0"].update({"valid": False})):
+        fresh()
+        _edit_x(inp, 3, edit)
+        refused("final fit of fold 3 is not finished and valid")
+    fresh(folds=(0, 2, 4))  # the moved folds only: no N10 preparation
+    refused("exactly folds 0-4")
+    fresh()
+    (inp / "knee-n11x-final" / "private" / "n11x_final" / f"{ENC}_f1" / "b_lite_seed_0.pt").write_bytes(b"other")
+    refused("weights of fold 1")
+    fresh()
+    shutil.copytree(inp / "knee-n11x-final", inp / "knee-n11x-final-2")  # the same units attached twice
+    refused("two final-fit units")
+    fresh(commit=None)
+    refused("one known commit")
+    fresh()
+    rj = inp / "knee-n11x-final" / "run.json"
+    r = json.loads(rj.read_text())
+    rj.write_text(json.dumps({**r, "config": {**r["config"], "test_overrides": True}}))
+    refused("test overrides")
+    rj.write_text(json.dumps({**r, "config": {**r["config"], "selection_sha256": "0" * 64}}))
+    refused("session did not run under the attached selection record")
+    fresh()
+    _edit_x(inp, 4, lambda st: st["config"].update({"dropout": 0.1}))
+    refused("not the one N11 trained with")
+    fresh()
+    _edit_x(inp, 0, lambda st: st.update({"fold": 1}))
+    refused("names another encoder or fold")
+    fresh()
+    shutil.rmtree(inp / "knee-n6a" / "private" / "n6a" / "units" / f"{ENC}_f2")
+    refused("knee-n6a's unit of fold 2")
+
+
+def test_refit_model_submission_equals_the_same_fold_models_read_from_n11(blite_env):
+    """The same five fold models once under knee-n11-a/-b and once under knee-n11x-final: tails="n11x" writes
+    the same submission bytes as tails="n11", and says in its summary where the models came from."""
+    from knee.nb import n10
+
+    sel = _write_n11x(blite_env["inp"])
+    s_old = n10.run(ENC, tails="n11", encoder_factory=fake_factory, workers=2, quiet=True, eval_studies=3)
+    b_old = (paths.WORKING / "submission.csv").read_bytes()
+    (paths.WORKING / "submission.csv").unlink()
+    assert "source" not in s_old["b_lite"] and "selection_sha256" not in s_old["b_lite"]  # the n11 summary is as it was
+    s = n10.run(ENC, tails="n11x", encoder_factory=fake_factory, workers=2, quiet=True, eval_studies=3)
+    assert (paths.WORKING / "submission.csv").read_bytes() == b_old
+    b = s["b_lite"]
+    assert s["mode"] == "b-lite" and s["folds"] == [0, 1, 2, 3, 4] and b["source"] == "n11x"
+    assert b["selection_sha256"] == sel["sha256"] and b["n11_commit"] == COMMIT_X[:12] and b["schedule"] == "full"
+    assert b["lr_rule"] == {"selection_sha256": sel["sha256"], "passes": 16200}
+    for k in range(5):
+        u, o = b["units"][f"fold_{k}"], s_old["b_lite"]["units"][f"fold_{k}"]
+        assert u["encoder_lr"] == PICKS_X[k] and u["session"] == "final"
+        assert (u["tail_sha16"], u["head_sha16"], u["stage_a_stats_sha16"]) == (o["tail_sha16"], o["head_sha16"], o["stage_a_stats_sha16"])
+    assert set(b) - set(s_old["b_lite"]) == {"source", "selection_sha256", "selection_written_at_utc"}
+    out = json.loads((paths.WORKING / "agg_n10.json").read_text())
+    agg._check(out)
+    text = (paths.WORKING / "agg_n10.json").read_text()
+    assert not [u for u in blite_env["uids"] if u in text]
+    run = json.loads((paths.WORKING / "run.json").read_text())
+    assert run["config"]["tails"] == "n11x"
+    # refused before any decoding when a final fit is not valid; no submission is written
+    (paths.WORKING / "submission.csv").unlink()
+    _edit_x(blite_env["inp"], 2, lambda st: st["final"].update({"valid": False}))
+    calls = []
+    real = study_table.build
+    study_table.build = lambda *a, **kw: calls.append(1) or real(*a, **kw)
+    try:
+        with pytest.raises(safe_log.StepFailed):
+            n10.run(ENC, tails="n11x", encoder_factory=fake_factory, workers=2, quiet=True)
+    finally:
+        study_table.build = real
+    assert not calls and not (paths.WORKING / "submission.csv").exists()
+    with pytest.raises(ValueError):
+        n10.run(canary=True, tails="n11x")
+
+
+def test_check_tails_replays_one_refit_fold(check_env):
+    from knee.nb import n10
+
+    inp = check_env["inp"]
+    s_old = n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory)
+    run_old = json.loads((paths.WORKING / "run.json").read_text())
+    assert "tails" not in run_old["config"] and "source" not in s_old  # the n11 check is as it was
+    sel = _write_n11x(inp)
+    ud = inp / "knee-n11x-final" / "private" / "n11x_final" / f"{ENC}_f0"
+    shutil.copy(check_env["unit"] / "pred_b_lite.csv", ud / "pred_b_lite.csv")  # the same model: the same predictions
+    _edit_x(inp, 0, lambda st: st["files_sha16"].update(
+        {"pred_b_lite.csv": hashlib.sha256((ud / "pred_b_lite.csv").read_bytes()).hexdigest()[:16]}))
+    s = n10.check_tails(ENC, fold=None, n=200, encoder_factory=fake_factory, tails="n11x")  # None: the lowest moved fold
+    assert s["passed"] is True and s["fold"] == 0 and s["source"] == "n11x" and s["encoder_lr"] == 3.2e-4
+    assert s["selection_sha256"] == sel["sha256"] and s["n11_commit"] == COMMIT_X[:12]
+    for key in ("max_abs_probability_gap", "mean_abs_probability_gap", "tail_sha16", "head_sha16", "trunk_sha16",
+                "weights_file_sha16", "stage_a_stats_sha16", "prediction_file_sha16", "studies"):
+        assert s[key] == s_old[key], key
+    out = json.loads((paths.WORKING / "agg_n10_tails_check.json").read_text())
+    agg._check(out)
+    assert set(out) - set(s_old) == {"source", "selection_sha256", "encoder_lr"}
+    assert json.loads((paths.WORKING / "run.json").read_text())["config"]["tails"] == "n11x"
+    assert not list(paths.WORKING.rglob("*.csv"))
+    with pytest.raises(safe_log.StepFailed):  # fold 1 holds no prediction file here
+        n10.check_tails(ENC, fold=1, n=200, encoder_factory=fake_factory, tails="n11x")
+    with pytest.raises(ValueError):
+        n10.check_tails(ENC, fold=None, n=200, encoder_factory=fake_factory)  # fold=None belongs to the extension
+    with pytest.raises(ValueError):
+        n10.check_tails(ENC, fold=0, tails="n12")
+    # a later selection record: the check is refused, and the summary is not written as passed
+    (inp / "knee-n11x-select" / "agg_n11x_select.json").write_text(json.dumps(_selection_x(written_at_utc="later")))
+    (paths.WORKING / "agg_n10_tails_check.json").unlink()
+    with pytest.raises(safe_log.StepFailed):
+        n10.check_tails(ENC, fold=0, n=200, encoder_factory=fake_factory, tails="n11x")
+    assert not (paths.WORKING / "agg_n10_tails_check.json").exists()

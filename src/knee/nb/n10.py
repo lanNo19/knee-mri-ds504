@@ -36,6 +36,14 @@ check_tails (its own notebook, before a b-lite submission): replays one fold's b
 first studies of N11's saved test-fold predictions, from the N4 caches and the bundle checkpoint,
 and reports the gap as aggregates. It ties the bundle's trunk, knee-n6a's statistics and the
 loaded tail and head to what N11 ran.
+
+Refit model of the learning-rate extension (tails="n11x"; it3_lr_extension_r3.md, section 6): the same path
+with another source. The five fold models are the final fits of knee-n11x-final
+(private/n11x_final/<encoder>_f<k>/), each at its fold's pick. Extra inputs instead of knee-n11-a and
+knee-n11-b: the outputs of knee-n11x-final and knee-n11x-select (the signed selection record). A final fit
+is accepted only if its state holds the sha256 of the attached selection record and its rate is that
+record's pick for the fold; all five must be finished and valid. check_tails(..., tails="n11x") replays one
+refit fold. The tails=None and tails="n11" paths are unchanged.
 """
 from __future__ import annotations
 
@@ -110,7 +118,8 @@ def series_tiers(st: pd.DataFrame) -> dict:
 
 # ---------------------------------------------------------------- B-lite: N11's fold models
 
-TAILS = ("n11",)
+TAILS = ("n11", "n11x")
+FINAL_X = "n11x_final"  # the step folder of the extension's final fits (n11.EXT_FINAL_STEP)
 BLITE_FILE = "b_lite_seed_0.pt"
 N_FOLDS = 5
 
@@ -133,8 +142,34 @@ def _close(a, b) -> bool:
     return a is not None and b is not None and math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=0.0)
 
 
-def tail_units(encoder: str, root: Path | None = None) -> dict:
+def _final_units_x(encoder: str, root: Path | None) -> tuple[dict, dict]:
+    """(the signed selection record, {fold: folder}) of the extension's final fits, or a TailError."""
+    from . import n11
+
+    if encoder != n11.DINO:
+        raise TailError("b-lite: the learning-rate extension holds DINOv2 only")
+    try:
+        sel = n11._selection(None, root)
+    except (ValueError, OSError) as e:  # no record, a changed one, or one that is not "selected"
+        raise TailError(f"b-lite: {e}") from None
+    found: dict = {}
+    for p in paths.glob_outputs(f"private/{FINAL_X}/{encoder}_f*/state.json", root):
+        k = int(p.parent.name.rsplit("_f", 1)[1])
+        if k in found:
+            raise TailError(f"b-lite: two final-fit units for fold {k}: attach knee-n11x-final once")
+        found[k] = p.parent
+    return sel, found
+
+
+def tail_units(encoder: str, root: Path | None = None, source: str = "n11") -> dict:
     """The five final fits of `encoder` in the attached N11 outputs, or a TailError.
+
+    source "n11x": the final fits of the learning-rate extension (private/n11x_final/) instead. The
+    conditions "every final fit at its unit's chosen rate" and "inner work complete" are replaced by: the
+    signed selection record is attached (status "selected", intact sha256), every unit's state holds that
+    record's sha256, every final fit ran at the record's pick for its fold and is finished and valid. One
+    known commit, folds 0-4, the weights file's hash and the knee-n6a config check stay. The result also
+    holds "source" and "selection" (sha256, time).
 
     Refused unless: exactly folds 0-4; every unit complete (frozen0 valid, inner work and final fits
     complete, the weights file present with the hash its state records); one known commit, one schedule
@@ -144,11 +179,18 @@ def tail_units(encoder: str, root: Path | None = None) -> dict:
     one N11 logged. Returns {"units": {fold: {...}}, "commit", "schedule", "lr_rule"}."""
     from . import n11
 
-    try:
-        every = n11.find_units(root)
-    except ValueError as e:  # two folders of one unit that got equally far
-        raise TailError(f"b-lite: {e}") from None
-    found = {k: ud for (e, k), ud in every.items() if e == encoder}
+    if source not in TAILS:
+        raise ValueError('source: "n11" or "n11x"')
+    x = source == "n11x"
+    if x:
+        sel, found = _final_units_x(encoder, root)
+        picks = n11.selection_picks(sel)
+    else:
+        try:
+            every = n11.find_units(root)
+        except ValueError as e:  # two folders of one unit that got equally far
+            raise TailError(f"b-lite: {e}") from None
+        found = {k: ud for (e, k), ud in every.items() if e == encoder}
     if sorted(found) != list(range(N_FOLDS)):
         raise TailError(f"b-lite needs exactly folds 0-4 of {encoder}; attached: {sorted(found)}")
     units, commits, schedules, rules = {}, set(), set(), set()
@@ -158,7 +200,14 @@ def tail_units(encoder: str, root: Path | None = None) -> dict:
         wp = ud / BLITE_FILE
         if b.get("encoder") != encoder or b.get("fold") is None or int(b["fold"]) != k:
             raise TailError(f"b-lite: the state of fold {k} names another encoder or fold than its folder")
-        if not (fin.get("complete") and inner.get("complete") and (b.get("frozen0") or {}).get("valid")):
+        if x:
+            fit = (fin.get("b_lite") or {}).get("seed_0") or {}
+            if (b.get("ext_final") or {}).get("selection_sha256") != sel["sha256"]:
+                raise TailError(f"b-lite: the final fit of fold {k} was not run under the attached selection record")
+            if not (fin.get("complete") and fin.get("valid") and fit.get("finished") and fit.get("valid")
+                    and (b.get("frozen0") or {}).get("valid")):
+                raise TailError(f"b-lite: the final fit of fold {k} is not finished and valid")
+        elif not (fin.get("complete") and inner.get("complete") and (b.get("frozen0") or {}).get("valid")):
             raise TailError(f"b-lite: the unit of fold {k} is not complete")
         if not wp.exists() or common.sha16(wp) != (b.get("files_sha16") or {}).get(BLITE_FILE):
             raise TailError(f"b-lite: the weights of fold {k} are missing or not the file its state records")
@@ -167,11 +216,17 @@ def tail_units(encoder: str, root: Path | None = None) -> dict:
         if rc.get("test_overrides"):
             raise TailError(f"b-lite: the session of fold {k} ran with test overrides")
         lr = ((fin.get("b_lite") or {}).get("seed_0") or {}).get("encoder_lr")
-        if not _close(lr, inner.get("chosen_lr")):
+        if x:
+            if not _close(lr, picks[k]):
+                raise TailError(f"b-lite: the final fit of fold {k} was not run at the fold's pick in the selection record")
+        elif not _close(lr, inner.get("chosen_lr")):
             raise TailError(f"b-lite: the final fit of fold {k} was not run at the unit's chosen learning rate")
         commits.add(str(run.get("commit")))
         schedules.add(str(b.get("schedule")))
-        rules.add(json.dumps({"rung1_tie": rc.get("rung1_tie"), "passes": rc.get("passes")}, sort_keys=True))
+        if x:
+            rules.add(json.dumps({"selection_sha256": rc.get("selection_sha256"), "passes": rc.get("passes")}, sort_keys=True))
+        else:
+            rules.add(json.dumps({"rung1_tie": rc.get("rung1_tie"), "passes": rc.get("passes")}, sort_keys=True))
         sa = paths.glob_outputs(f"private/n6a/units/{encoder}_f{k}/config.json", root)
         if len(sa) != 1:  # knee-n6a only, as n11._context: never an iteration-2 unit or a rerun
             raise TailError(f"b-lite: knee-n6a's unit of fold {k} must be attached exactly once")
@@ -191,7 +246,13 @@ def tail_units(encoder: str, root: Path | None = None) -> dict:
         raise TailError("b-lite: the N11 units ran under different schedules")
     if len(rules) != 1:
         raise TailError("b-lite: the N11 sessions used different learning-rate rules")
-    return {"units": units, "commit": commits.pop(), "schedule": schedules.pop(), "lr_rule": json.loads(rules.pop())}
+    out = {"units": units, "commit": commits.pop(), "schedule": schedules.pop(), "lr_rule": json.loads(rules.pop())}
+    if x:
+        if out["lr_rule"].get("selection_sha256") != sel["sha256"]:
+            raise TailError("b-lite: the final-fit session did not run under the attached selection record")
+        out.update({"source": source, "selection": {"sha256": sel["sha256"], "written_at_utc": sel.get("written_at_utc"),
+                                                    "folds_moved": n11._selection_moved(sel)}})
+    return out
 
 
 class _Trunk:
@@ -318,8 +379,8 @@ CHECK_NOTE = ("same code, batches and fp16 as N11: the expected gap is far below
               "measured). A wrong trunk, tail, head or statistics file moves probabilities by far more than 0.01")
 
 
-def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, root=None, quiet: bool = True,
-                budget_h: float = 1.0, encoder_factory=None, eval_studies: int = 4) -> dict:
+def check_tails(encoder: str = "dinov2_vits14", fold: int | None = 0, n: int = 200, root=None, quiet: bool = True,
+                budget_h: float = 1.0, encoder_factory=None, eval_studies: int = 4, tails: str = "n11") -> dict:
     """Replay one fold's b-lite model against N11's saved predictions (GPU or CPU; internet off).
 
     Inputs attached: the bundle, the three N4 caches, knee-n6a and the N11 sessions' outputs. The first `n`
@@ -331,11 +392,21 @@ def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, roo
     <= 0.01 and mean gap <= 0.001; a gap that is not finite is written as null and fails). A failed check
     writes the summary and then raises TailError, so the step ends FAILED. Only the UID, "resolved" and the 12
     probability columns of the file are read; no label column, no metric, no per-study output. The UIDs
-    are used in memory to find the cache rows and are never printed or written."""
+    are used in memory to find the cache rows and are never printed or written.
+
+    tails "n11x": one refit fold of the learning-rate extension (knee-n11x-final and knee-n11x-select attached
+    instead of the N11 sessions). fold=None then means the lowest fold that moved in the selection record.
+    The summary also holds source, selection_sha256 and the fold's encoder_lr. tails "n11" is unchanged."""
+    if tails not in TAILS:
+        raise ValueError('tails: "n11" or "n11x"')
+    if fold is None and tails != "n11x":
+        raise ValueError("fold: a fold number")
     step = "n10_tails_check"
-    s: dict = {"encoder": encoder, "fold": int(fold)}
-    cfg = {"encoder": encoder, "fold": int(fold), "n": int(n), "eval_studies": int(eval_studies),
+    s: dict = {"encoder": encoder, "fold": None if fold is None else int(fold)}
+    cfg = {"encoder": encoder, "fold": None if fold is None else int(fold), "n": int(n), "eval_studies": int(eval_studies),
            "test_overrides": encoder_factory is not None}
+    if tails != "n11":  # the n11 check's run.json stays as it was
+        cfg["tails"] = tails
     with common.notebook(step, cfg, quiet=quiet, budget_h=budget_h):
         import torch
 
@@ -345,7 +416,10 @@ def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, roo
         rootp = Path(root) if root else None
         bdir, man = _bundle(rootp)
         s["bundle_commit"] = (man.get("commit") or "")[:12] or None
-        tl = tail_units(encoder, rootp)
+        tl = tail_units(encoder, rootp, tails)
+        if fold is None:  # n11x: a fold fitted at a new rate
+            fold = min(tl["selection"]["folds_moved"], default=0)
+            s["fold"] = int(fold)
         if int(fold) not in tl["units"]:
             raise TailError("check: no such fold")
         u = tl["units"][int(fold)]
@@ -396,6 +470,8 @@ def check_tails(encoder: str = "dinov2_vits14", fold: int = 0, n: int = 200, roo
                   "device": "cuda" if dev.startswith("cuda") else "cpu",
                   "reads": "UID, resolved and the 12 probabilities of pred_b_lite.csv; no label, no metric",
                   "seconds": round(time.time() - t0, 1)})
+        if tails != "n11":
+            s.update({"source": tails, "selection_sha256": tl["selection"]["sha256"], "encoder_lr": u["encoder_lr"]})
         agg.write(step, s)
         if not s["passed"]:  # the summary file is written; the step must not end OK
             raise TailError("check: the replay does not reproduce N11's predictions (see agg_n10_tails_check.json)")
@@ -433,11 +509,12 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
     """budget_h 8.0: the watchdog ends the step at 8.8 h, inside the 9-hour submission limit.
 
     tails: None = the fold heads on the frozen encoder's embeddings (the registered path, unchanged);
-      "n11" = the five B-lite fold models of the attached N11 outputs (see the module docstring).
+      "n11" = the five B-lite fold models of the attached N11 outputs (see the module docstring);
+      "n11x" = the five final fits of the learning-rate extension (knee-n11x-final, with knee-n11x-select).
     encoder_factory (tests; b-lite only): (name, device) -> an n11.Split, instead of the timm encoder with
       the bundle checkpoint. eval_studies: studies per forward batch of the b-lite path (4, as N11)."""
     if tails is not None and tails not in TAILS:
-        raise ValueError('tails: None or "n11"')
+        raise ValueError('tails: None, "n11" or "n11x"')
     if tails is not None and canary:
         raise ValueError("the canary reads no model: tails must be None")
     if encoder_factory is not None and tails is None:
@@ -456,7 +533,7 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
         bdir, man = _bundle(rootp)
         s["bundle_commit"] = (man.get("commit") or "")[:12] or None  # the installed wheel's commit
         prev = _prevalence(rootp)
-        tl = tail_units(encoder, rootp) if tails else None  # refused here, before any decoding
+        tl = tail_units(encoder, rootp, tails) if tails else None  # refused here, before any decoding
         units = {} if canary or tails else _units(encoder, rootp)
         if not canary:  # a wrong bundle fails in seconds, before hours of decoding
             ckpt = _checkpoint(encoder, bdir, man)
@@ -471,6 +548,9 @@ def run(encoder: str = "dinov2_vits14", canary: bool = False, root=None, workers
                                                    "stage_a_stats_sha16": u["stats_sha16"],
                                                    "amp_fp16_in_training": u["amp_fp16_in_training"]}
                                      for k, u in sorted(tl["units"].items())}}
+            if tails != "n11":  # the extension's refit model: where the fold models and their rates come from
+                s["b_lite"].update({"source": tails, "selection_sha256": tl["selection"]["sha256"],
+                                    "selection_written_at_utc": tl["selection"]["written_at_utc"]})
         else:
             s["folds"] = sorted(units)
             s["heads_sha16"] = {f"fold_{k}": u["head_sha16"] for k, u in sorted(units.items())}

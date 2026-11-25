@@ -3389,3 +3389,604 @@ def select_lrx(root=None, sessions=("inner",), describe=(), reference_only: bool
 
 
 select_extension = select_lrx  # the name the declaration's code list uses
+
+
+# ================================================================ the extension, delivery D2
+# it3_lr_extension_r3.md section 6 and code list items 11 and 12. Additions only: nothing above this line is
+# changed, and the fits call iteration 3's loop (new_run, run_to) as it is.
+#
+#   run_final_lrx()  GPU. Refused without the signed selection record (status "selected", intact sha256,
+#                    at least one fold moved). Final fits on each fold's full outer training set at that
+#                    fold's pick. Per process: frozen0 with check (b) for each of its folds, then per fold
+#                    the pick into run.json, the b-lite fit (seed 0, from Stage A's head, one twelfth at a
+#                    time), the test-fold predictions and the weights. No head-only seeds. No test-fold
+#                    metric of a trained model. Private: private/n11x_final/<encoder>_f<fold>/ with
+#                    state.json, pred_frozen0.csv, pred_b_lite.csv and b_lite_seed_0.pt. Aggregates:
+#                    agg_n11x_final.json, run.json. Iteration 3's outputs are not attached (R9).
+#   dev_lrx()        CPU. Refused without the keep record and the signed selection record. frozen0 and
+#                    head-only from iteration 3's units, b-lite from n11x_final. Writes agg_n11x_dev.json.
+
+EXT_FINAL_STEP = f"{EXT_NAME}_final"
+EXT_FINAL_GPUS = ((0, 1, 4), (2, 3))  # section 6: GPU 0 takes folds 0, 1, 4; GPU 1 takes folds 2, 3
+EXT_FINAL_BOUND_H = {5: 3.7, 4: 2.6, 3: 2.6, 2: 1.3, 1: 1.3}  # section 9: the bound of the final fits, by number of folds
+EXT_DEV_NOTE = "rate chosen after iteration 3's results were read"  # section 6: added to the development label
+EXT_DEV_LABEL = f"{DEV_LABEL}; {EXT_DEV_NOTE}"
+# the keep record of iteration 3 (knee-n11-decide v1, Wed 04:27; n11_numbers.md): dev_lrx is gated on it
+EXT_KEEP_SHA256 = "0a8cce4c28d408b93faac3c7fd8d67d3c7453b81979dffebef98215b4dcab00f"
+EXT_FINAL_NOTE = "predictions only: no test-fold metric of a trained model is computed in this notebook"
+EXT_INCOMPLETE = "the refit model is incomplete: per-fold development numbers only, no N10 preparation"
+
+
+def _selection(selection_record=None, root=None) -> dict:
+    """The signed selection record: selection_ext()'s output as a dict, its JSON text, the path of its file,
+    or (None) the attached agg_n11x_select.json. Accepted only with status "selected", an intact sha256, not
+    from a smoke run, and one pick per fold out of 8e-5 and the selectable rates (R5)."""
+    d = selection_record
+    if d is None:
+        p = paths.find_file(f"agg_{EXT_NAME}_select.json", Path(root) if root else None)
+        if p is None:
+            raise ValueError("the signed selection record (select_lrx's output, agg_n11x_select.json) is needed: R5")
+        d = p
+    if isinstance(d, (str, Path)):
+        text = str(d)
+        d = json.loads(text) if text.lstrip().startswith("{") else json.loads(Path(text).read_text())
+    if not isinstance(d, dict) or "picks" not in d or "rule_d" not in d:
+        raise ValueError("this is not a selection record written by n11.select_lrx")
+    if d.get("sha256") != hashlib.sha256(_canon(d)).hexdigest():
+        raise ValueError("the selection record was changed after it was written (sha256)")
+    if d.get("smoke"):
+        raise ValueError("the selection record of a smoke run is not a result")
+    if d.get("status") != "selected":
+        raise ValueError('the selection record must have status "selected": after any other status no fold moves')
+    picks = d.get("picks") or {}
+    allowed = (EXT_REUSED_LR, *EXT_SELECTABLE)
+    if sorted(picks) != [f"fold_{k}" for k in range(N_OUTER)] or not all(
+            isinstance(v, float) and any(math.isclose(v, a) for a in allowed) for v in picks.values()):
+        raise ValueError("the selection record must hold one pick per fold, each 8e-5 or a selectable rate")
+    return d
+
+
+def selection_picks(sel: dict) -> dict:
+    """{fold: the fold's pick} of a selection record."""
+    return {k: float(sel["picks"][f"fold_{k}"]) for k in range(N_OUTER)}
+
+
+def _selection_moved(sel: dict) -> list:
+    picks = selection_picks(sel)
+    return [k for k in range(N_OUTER) if not math.isclose(picks[k], EXT_REUSED_LR)]
+
+
+def _selection_head(sel: dict) -> dict:
+    """What a D2 summary says about the selection it ran under."""
+    return {"status": sel["status"], "sha256": sel["sha256"], "written_at_utc": sel.get("written_at_utc"),
+            "picks": dict(sel["picks"]), "folds_moved": {"folds": _selection_moved(sel)}}
+
+
+def _final_block(r, lr: float, log: dict, status: str, why: tuple | None) -> dict:
+    """One final fit as the state holds it: iteration 3's fit summary and the validity record."""
+    finished = r.k == TWELFTHS
+    return {"encoder_lr": float(lr), "status": status, "finished": bool(finished), "valid": bool(finished and why is None),
+            "invalid": None if why is None else {"k": int(why[0]), "reason": why[1]},
+            "non_finite": bool(any(log["non_finite"])), "max_skipped_step_share": EXT_MAX_SKIPPED,
+            "validity_rule": "finite training loss at every twelfth and a share of skipped optimiser steps of at most 0.05",
+            "per_twelfth": {k: list(v) for k, v in log.items()},
+            "per_twelfth_note": "at each twelfth's end: cumulative skipped-step share, non-finite training loss, cumulative train seconds",
+            **_fit_summary(r)}
+
+
+def _final_ext(c, st: dict, lr: float) -> dict:
+    """One final fit of the extension: b-lite at the fold's pick on all its training studies, from Stage A's
+    head, seed 0, through iteration 3's loop (the calls of _final), one twelfth at a time. The pick stands
+    in run.json before anything is trained. After every twelfth: the validity record and the state on disk.
+    An invalid fit stops at that twelfth; it and an unfinished fit write no test-fold prediction and no
+    weights, and are not repeated. A finished, valid fit writes pred_b_lite.csv and b_lite_seed_0.pt as
+    _final does. No test-fold metric is computed."""
+    import torch
+
+    _abort_if_invalid(c)
+    if not (st.get("frozen0") or {}).get("valid"):
+        raise AssertionError("frozen0 check (b) has not passed for this unit")
+    _guard(c.tr, None, c.forbid_outer)
+    sel = c.task["selection"]
+    record_chosen(c.working, c.unit, {"lr": float(lr), "reason": "the fold's pick in the signed selection record (Rule S)",
+                                      "selection_sha256": sel["sha256"],
+                                      "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                      "before_any_test_pass_of_a_trained_model": True})
+    fin: dict = {"b_lite": {}, "complete": False, "valid": False, "chosen_lr_in_run_json": True,
+                 "curve_note": "training loss per twelfth only (dropout on)", "note": EXT_FINAL_NOTE}
+    st["final"] = fin
+    r = new_run(c, c.src, c.head_state, c.tr, lr, 0)
+    log: dict = {"skipped_step_share": [], "non_finite": [], "train_seconds": []}
+    why = None
+    for t in range(1, TWELFTHS + 1):
+        late = None
+        try:
+            run_to(c, r, t)
+        except (OutOfTime, InvalidRun) as e:  # raised at a twelfth's end, after its record: the record is kept
+            late = e
+        if len(log["non_finite"]) < len(r.history):
+            loss = r.history[-1].get("train_loss")
+            share = r.skipped / max(r.step, 1)
+            log["non_finite"].append(bool(loss is None or not np.isfinite(loss)))
+            log["skipped_step_share"].append(round(share, 4))
+            log["train_seconds"].append(round(r.train_s, 1))
+            if log["non_finite"][-1]:
+                why = (r.k, "non-finite train loss")
+            elif share > EXT_MAX_SKIPPED:
+                why = (r.k, "skipped optimiser steps above the limit")
+        status = ("invalid" if why else "unfinished: out of time" if isinstance(late, OutOfTime)
+                  else "unfinished: the session is invalid" if late else "finished" if r.k == TWELFTHS else "running")
+        fin["b_lite"]["seed_0"] = _final_block(r, lr, log, status, why)
+        _save_state(c.dir, st)
+        if late is not None and why is None:
+            raise late
+        if why:
+            break
+    blk = fin["b_lite"]["seed_0"]
+    if blk["valid"]:
+        P = predict_test(c, c.src, r.head, trained=True, lr=lr)  # once, at the end
+        _save_pred(c, "b_lite", P, st)
+        torch.save({"tail": c.enc.tail_state(), "head": r.head.state_dict(), "encoder": c.name, "fold": c.fold,
+                    "tail_prefixes": list(c.enc.tail_prefixes)}, c.dir / "b_lite_seed_0.pt")  # kept for N10
+        st["files_sha16"]["b_lite_seed_0.pt"] = sha16(c.dir / "b_lite_seed_0.pt")
+        blk["test_predictions_finite"] = bool(np.isfinite(P).all())
+        fin["drift"] = {"mean_abs_z_frozen0": st["frozen0"]["mean_abs_z_training"],
+                        "mean_abs_z_b_lite_last": blk["mean_abs_z_last"],
+                        "what": "mean absolute z of the training features under the fixed Stage A statistics"}
+        fin["valid"] = fin["complete"] = True
+    _save_state(c.dir, st)
+    return blk
+
+
+def _task_final(task: dict) -> dict:
+    """One process of the final fits: DINOv2 on one device, through its folds in order. As iteration 3's
+    session: first frozen0 with check (b) for every fold of the process (a failed check stops everything
+    before any training), then the final fit of every fold. Only safe fields return."""
+    enc, working, step = task["encoder"], Path(task["working"]), task["step"]
+    folds = [int(k) for k in task["folds"]]
+    picks = {int(k): float(v) for k, v in task["picks"].items()}
+    sel = task["selection"]
+    if task.get("spawned"):
+        safe_log.worker_init()
+        paths.WORKING = working
+        try:
+            import torch
+
+            torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))  # two processes share the CPU cores
+        except Exception:  # noqa: BLE001
+            pass
+    cur = folds[0]
+    states: dict = {}
+    errors: dict = {}
+    try:
+        sh = _shared(task)
+        for cur in folds:  # 1. frozen0 for every fold: an invalid run stops before any training
+            c = _context(sh, cur)
+            if not task.get("micro") and cur == folds[0]:
+                sh.micro = c.micro = pick_micro(c)
+            st = _base_block(c)
+            st["ext_final"] = {"plan": EXT_PLAN, "selection_sha256": sel["sha256"], "selection_status": sel["status"],
+                               "selection_written_at_utc": sel.get("written_at_utc"), "pick": picks[cur],
+                               "pick_key": _lr_key(picks[cur]), "moved": not math.isclose(picks[cur], EXT_REUSED_LR),
+                               "head_lr": float(c.cfg.lr)}
+            f = _frozen0(c, st)
+            states[cur] = st
+            del f
+        for cur in folds:  # 2. the final fit of every fold, at its pick
+            try:
+                c = _context(sh, cur)
+                _final_ext(c, states[cur], picks[cur])
+                states[cur]["leakage_assertion_passed"] = True
+                _save_state(c.dir, states[cur])
+            except (InvalidRun, OutOfTime, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:  # noqa: BLE001 - a unit's own failure costs only that unit
+                errors[_unit(enc, cur)] = safe_log.describe(type(e), e.__traceback__)
+                try:
+                    (_unit_dir(working, step, enc, cur) / "error.log").write_text(
+                        "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                except Exception:  # noqa: BLE001
+                    pass
+        return {"ok": not errors, "encoder": enc, "errors": errors}
+    except BaseException as e:  # noqa: BLE001 - only the type and the location leave the process
+        try:
+            (_unit_dir(working, step, enc, cur) / "error.log").write_text(
+                "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):  # the watchdog or a manual stop ends the whole step
+            raise
+        return {"ok": False, "encoder": enc, "invalid": isinstance(e, InvalidRun), "out_of_time": isinstance(e, OutOfTime),
+                "errors": {**errors, _unit(enc, cur): safe_log.describe(type(e), e.__traceback__)}}
+    finally:
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _map_final(tasks: list, parallel: bool) -> list:
+    if not parallel:
+        return [_task_final(t) for t in tasks]
+    out = []
+    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=mp.get_context("spawn")) as ex:
+        futs = [ex.submit(_task_final, {**t, "spawned": True}) for t in tasks]
+        for t, f in zip(tasks, futs):
+            try:
+                out.append(f.result())
+            except (KeyboardInterrupt, SystemExit):  # the watchdog or a manual stop: never swallowed
+                raise
+            except BaseException as e:  # noqa: BLE001 - a crashed worker
+                out.append({"ok": False, "encoder": t["encoder"],
+                            "errors": {_unit(t["encoder"], t["folds"][0]): safe_log.describe(type(e), e.__traceback__)}})
+    return out
+
+
+def _final_status(b: dict) -> str:
+    """One unit's final fit in a word: finished, invalid, unfinished: ..., or not started."""
+    return (((b.get("final") or {}).get("b_lite") or {}).get("seed_0") or {}).get("status") or "not started"
+
+
+def _final_overview(b: dict) -> dict:
+    """The lines of one final-fit unit that the summary prints."""
+    fz, fin = b.get("frozen0") or {}, b.get("final") or {}
+    blk = (fin.get("b_lite") or {}).get("seed_0") or {}
+    x = b.get("ext_final") or {}
+    return {"pick": x.get("pick"), "moved": x.get("moved"), "frozen0_valid": fz.get("valid"),
+            "check_b_abs_difference": (fz.get("check_b") or {}).get("abs_difference"),
+            "status": _final_status(b), "valid": blk.get("valid"), "invalid": blk.get("invalid"),
+            "skipped_step_share": blk.get("skipped_step_share"), "train_seconds": blk.get("train_seconds"),
+            "final_complete": bool(fin.get("complete")), "weights_file_sha16": (b.get("files_sha16") or {}).get("b_lite_seed_0.pt")}
+
+
+def run_final_lrx(selection=None, folds=None, *, budget_h: float, root=None, expect: dict | None = None,
+                  encoders: tuple[str, ...] = (DINO,), quiet: bool = True, devices=None, processes: bool | None = None,
+                  val_table: dict | None = None, val_range=VAL_RANGE, passes: int = PASSES, encoder_factory=None,
+                  eval_studies: int = 4, micro: int | None = None, local_cache=None, local_margin: int = 2 << 30) -> dict:
+    """The final fits of the extension (it3_lr_extension_r3.md, section 6): DINOv2 b-lite on each fold's full
+    outer training set at that fold's pick, with iteration 3's seed, schedule, starting head and loop.
+
+    selection: the signed selection record (a dict, its JSON text, a path; None = the attached
+      agg_n11x_select.json). Refused, before anything is written, unless it has status "selected" and an
+      intact sha256, and unless at least one fold moved (no fold moves: nothing is refit). Its sha256 goes
+      into every unit's state and into run.json.
+    folds: None = all five (a fold that keeps 8e-5 is refit at 8e-5: N10 then reads one source at one
+      commit, and the 8e-5 refits are a same-seed replicate of a final fit). Under the quota fallback
+      (under 4.2 h left) the caller passes the moved folds, and only they are accepted; the refit model is
+      then incomplete: per-fold development numbers only, no N10 preparation.
+    budget_h: required, no default: the smaller of (the bound plus 0.1) and (quota minus 0.4); the bound is
+      3.7 h for five folds, 2.6 h for three or four, 1.3 h for one or two. A value above the bound plus 0.1
+      is refused. It is the soft stop: a late fit stops within one twelfth, the session ends OK with status
+      "partial" and everything written; the watchdog stops the step at 1.1 x.
+    Devices: five folds: GPU 0 takes folds 0, 1, 4 and GPU 1 folds 2, 3; fewer folds alternate. Two
+      processes need two CUDA devices (refused before the cache copy otherwise; devices is the tests'
+      argument and marks test_overrides).
+    Inside a process: frozen0 with check (b) for each of its folds (a failed check: the run is invalid and
+      the step fails, as in iteration 3); then per fold the pick into run.json, the fit, the test-fold
+      predictions and the weights. Validity of a fit: finite training loss at every twelfth and at most 0.05
+      skipped optimiser steps. An invalid or unfinished fit is reported and not repeated.
+    No test-fold metric of a trained model is computed (frozen0's check equals an iteration-1 number).
+    Writes agg_n11x_final.json and run.json."""
+    from . import n13
+
+    sel = _selection(selection, root)
+    picks, moved = selection_picks(sel), _selection_moved(sel)
+    if tuple(encoders) != (DINO,):
+        raise ValueError("the extension is declared for DINOv2 only")
+    if not moved:
+        raise ValueError("no fold moved: nothing is refit (the submitted model already uses 8e-5 in every fold)")
+    every = list(range(N_OUTER))
+    folds = every if folds is None else sorted(int(k) for k in folds)
+    if folds != every and folds != moved:
+        raise ValueError(f"folds: all five, or (quota fallback) exactly the moved folds {moved}")
+    if isinstance(budget_h, bool) or not isinstance(budget_h, (int, float)) or not budget_h > 0:
+        raise ValueError("budget_h: a number of hours, typed by the caller (declaration, section 9)")
+    if budget_h > EXT_FINAL_BOUND_H[len(folds)] + 0.1 + 1e-9:
+        raise ValueError(f"budget_h is above the bound of {len(folds)} final fits plus 0.1 h "
+                         f"({EXT_FINAL_BOUND_H[len(folds)] + 0.1:.1f}): the smaller of that and quota minus 0.4")
+    step = EXT_FINAL_STEP
+    overrides = bool(encoder_factory is not None or val_table is not None or tuple(val_range or ()) != VAL_RANGE
+                     or passes != PASSES or micro is not None or devices is not None)
+    env = n13.environment()
+    cfg = {"session": "final", "folds": list(folds), "encoders": [DINO], "budget_h": budget_h, "passes": passes,
+           "selection_sha256": sel["sha256"], "picks": {f"fold_{k}": picks[k] for k in folds}, "eval_studies": eval_studies,
+           "environment": env, "schedule": "full", "test_overrides": overrides}
+    s: dict = {"written_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": EXT_SCOPE, "plan": EXT_PLAN,
+               "added_after_results": True, "session": "final", "folds": list(folds), "schedule": "full",
+               "test_overrides": overrides, "environment": env, "knee_commit": agg.repo_commit(),
+               "selection": _selection_head(sel), "all_five_folds": folds == every,
+               "rules": {"max_skipped_step_share": EXT_MAX_SKIPPED, "check_b_tolerance": CHECK_B_TOL,
+                         "validity": "finite training loss at every twelfth; skipped optimiser steps at most 0.05",
+                         "not_repeated": "an invalid or unfinished final fit is reported and not repeated"},
+               "note": EXT_FINAL_NOTE + "; frozen0's check equals an iteration-1 number; nothing of iteration 3 is attached (R9)"}
+    with common.notebook(step, cfg, quiet=quiet, budget_h=budget_h):
+        import shutil
+
+        t0 = time.time()
+        working = Path(paths.WORKING)
+        d = stage.StageData(root, expect)
+        s["upstream"] = d.upstream
+        s["validation_table"] = {}
+        for k in folds:  # the plan's table against the attached folds, before anything runs
+            sp = inner_split(d, k, val_table, val_range)
+            s["validation_table"][f"fold_{k}"] = {"test_groups": sp["test_groups"], "inner_validation_groups": sp["val_groups"],
+                                                  "inner_validation_studies": agg.count(len(sp["iva_all"]))}
+        devs = n5._devices(devices)
+        split = [list(g) for g in EXT_FINAL_GPUS] if folds == every else [folds[0::2], folds[1::2]]
+        jobs = [(devs[i % len(devs)], fs) for i, fs in enumerate(split) if fs]
+        if devices is None and len(jobs) >= 2 and sum(str(x).startswith("cuda") for x in devs) < 2:
+            # two processes on one device would run one after the other and the soft stop would cut the second
+            raise AssertionError("two GPUs are needed (accelerator GPU T4 x2): this session has two processes")
+        shutil.rmtree(working / "private" / step, ignore_errors=True)  # nothing of an earlier call survives
+        parallel = bool(len(devs) >= 2) if processes is None else bool(processes)
+        s["processes"] = [f"{DINO} on {dv}: folds {', '.join(str(k) for k in fs)}" for dv, fs in jobs]
+        base = {"root": str(root) if root else None, "expect": expect, "working": str(working), "step": step,
+                "session": "final", "schedule": "full", "factory": encoder_factory, "val_table": val_table,
+                "val_range": list(val_range) if val_range else None, "passes": int(passes), "eval_studies": eval_studies,
+                "micro": micro, "environment": env, "phase": "final_extension", "encoder": DINO,
+                "soft_stop": t0 + budget_h * 3600, "picks": {str(k): picks[k] for k in folds},
+                "selection": {"sha256": sel["sha256"], "status": sel["status"], "written_at_utc": sel.get("written_at_utc")}}
+        base["cache_paths"], s["cache_copy"] = localise_caches(root, local_cache, local_margin)
+        local_dir = s["cache_copy"].pop("local_dir", None)
+
+        def collect() -> dict:
+            return {u: b for u, b in ((_unit(DINO, k), _load_state(working / "private" / step / _unit(DINO, k)))
+                                      for k in folds) if b}
+
+        def write(status: str, units: dict) -> None:
+            s["status"], s["seconds"] = status, round(time.time() - t0, 1)
+            s["overview"] = {u: _final_overview(b) for u, b in units.items()}
+            try:
+                agg.write(step, {**s, "units": units})
+            except agg.UnsafeSummary:
+                agg.write(step, {**s, "write_error": "the unit blocks were refused by the checks"})
+
+        try:
+            results = _map_final([{**base, "device": dv, "folds": list(fs)} for dv, fs in jobs], parallel and len(jobs) >= 2)
+        except BaseException:  # the watchdog or a manual stop: what is on disk is still written, then the stop goes on
+            try:
+                write("interrupted", collect())
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        finally:
+            if local_dir:
+                shutil.rmtree(local_dir, ignore_errors=True)
+        on_disk = collect()
+        bad = {u: err for r in results if not r.get("ok") for u, err in (r.get("errors") or {}).items()}
+        s["errors"] = bad
+        if any(r.get("invalid") for r in results) or _invalid_flag(working, step).exists():
+            write("invalid: frozen0 check (b) failed for a unit; nothing else is read",
+                  {u: {"frozen0": b.get("frozen0")} for u, b in on_disk.items() if b.get("frozen0")})
+            raise InvalidRun("frozen0 check (b) failed: the run is invalid")
+        want = [_unit(DINO, k) for k in folds]
+        done = [u for u in want if ((on_disk.get(u) or {}).get("final") or {}).get("complete")]
+        s["units_complete"] = done
+        s["units_missing"] = [u for u in want if u not in done]
+        s["fits_invalid"] = [u for u in want if _final_status(on_disk.get(u) or {}) == "invalid"]
+        s["fits_unfinished"] = [u for u in s["units_missing"] if u not in s["fits_invalid"]]
+        s["out_of_time"] = any(r.get("out_of_time") for r in results)
+        complete = bool(folds == every and not s["units_missing"])
+        s["refit_model"] = {"complete": complete,
+                            "note": ("all five final fits are finished and valid: development numbers of the model, then the N10 check"
+                                     if complete else EXT_INCOMPLETE)}
+        write("ok" if not bad and not s["units_missing"] else "partial", on_disk)
+    keep = ("status", "errors", "session", "folds", "all_five_folds", "selection", "processes", "units_complete", "units_missing",
+            "fits_invalid", "fits_unfinished", "out_of_time", "refit_model", "overview", "cache_copy", "environment",
+            "validation_table", "test_overrides", "seconds", "note")
+    try:
+        common.summary({k: s.get(k) for k in keep})
+    except agg.UnsafeSummary:
+        common.summary({"status": s.get("status"), "errors": s.get("errors"),
+                        "summary_error": f"the summary block was refused by the checks; read agg_{step}.json"})
+    return s
+
+
+run_final_extension = run_final_lrx  # the name the declaration's code list uses
+
+
+# ---------------------------------------------------------------- development numbers of the refit model (CPU)
+
+def find_final_units(root=None, encoder: str = DINO) -> dict:
+    """{fold: folder} of the attached final fits of the extension (private/n11x_final/). The same fold in two
+    attached outputs is refused."""
+    out: dict = {}
+    for p in paths.glob_outputs(f"private/{EXT_FINAL_STEP}/{encoder}_f*/state.json", Path(root) if root else None):
+        k = int(p.parent.name.rsplit("_f", 1)[1])
+        if k in out:
+            raise ValueError(f"two final-fit units for fold {k}: attach knee-n11x-final once")
+        out[k] = p.parent
+    return dict(sorted(out.items()))
+
+
+def final_units(sel: dict, root=None, encoder: str = DINO) -> dict:
+    """The attached final fits against the selection record: {fold: {"dir", "state", "status", "usable",
+    "commit"}}. Refused: a state that names another unit, a unit fitted under another selection record or at
+    another rate than the fold's pick, a session with test overrides, a prediction file that is not the one
+    its state records. usable: frozen0 valid, the fit finished and valid, pred_b_lite.csv there."""
+    picks, out = selection_picks(sel), {}
+    for k, ud in find_final_units(root, encoder).items():
+        b = _load_state(ud)
+        x, fin = b.get("ext_final") or {}, b.get("final") or {}
+        blk = (fin.get("b_lite") or {}).get("seed_0") or {}
+        run = _session_run(ud)
+        if b.get("encoder") != encoder or b.get("fold") is None or int(b["fold"]) != k or k not in picks:
+            raise ValueError(f"the state of the final fit of fold {k} names another unit than its folder")
+        if x.get("selection_sha256") != sel["sha256"]:
+            raise ValueError(f"the final fit of fold {k} was not run under this selection record (sha256)")
+        if x.get("pick") is None or not math.isclose(float(x["pick"]), picks[k]) or (
+                blk.get("encoder_lr") is not None and not math.isclose(float(blk["encoder_lr"]), picks[k])):
+            raise ValueError(f"the final fit of fold {k} was not run at the fold's pick")
+        if (run.get("config") or {}).get("test_overrides"):
+            raise ValueError("the final-fit session ran with test overrides")
+        usable = bool(fin.get("complete") and fin.get("valid") and blk.get("finished") and blk.get("valid")
+                      and (b.get("frozen0") or {}).get("valid"))
+        pp = ud / "pred_b_lite.csv"
+        if usable and (not pp.exists() or sha16(pp) != (b.get("files_sha16") or {}).get(pp.name)):
+            raise ValueError(f"the prediction file of the final fit of fold {k} is missing or not the one its state records")
+        out[k] = {"dir": ud, "state": b, "status": _final_status(b), "usable": usable, "commit": str(run.get("commit"))}
+    return out
+
+
+def _fold_macro_draws(arms: dict, Y: np.ndarray, n_boot: int, seed: int, fold: int) -> np.ndarray:
+    """[draw, arm]: each arm's macro AUC of one test fold under a study bootstrap inside that fold, the same
+    draws for every arm (paired). NaN where a draw lacks a class of a finding."""
+    n, find, zeros = len(Y), list(range(len(FINDINGS))), np.zeros(len(Y), int)
+    rng = np.random.default_rng([int(seed), int(fold)])
+    out = np.empty((int(n_boot), len(arms)))
+    for b in range(int(n_boot)):
+        w = np.bincount(rng.integers(0, n, n), minlength=n).astype(float)
+        out[b] = [metrics.macro(P, Y, zeros, find, w) for P in arms.values()]
+    return out
+
+
+def dev_lrx(decision_record=None, selection=None, root=None, n_boot: int = N_BOOT, seed: int = 0, quiet: bool = True,
+            budget_h: float = 1.0, expect_decision: str | None = EXT_KEEP_SHA256) -> dict:
+    """The S2 development numbers of the refit model (it3_lr_extension_r3.md, section 6), DINOv2 only.
+
+    Attached: knee-n11x-final, knee-n11x-select, knee-n11-a, knee-n11-b and knee-n11-decide. Refused without
+    the keep record (dev()'s gate: status "decided", intact sha256; expect_decision: its sha256, the record
+    of Wed 04:27 unless a test passes another or None) and without the signed selection record; refused when
+    a file's hash differs from its record, and when a final fit was run under another selection or rate.
+    frozen0 and head-only (seed 0) come from iteration 3's units (hashes from the keep record), b-lite from
+    n11x_final, b_lite_iteration3 is iteration 3's final fit (8e-5 in every fold).
+    Always: per refit fold, each arm's fold macro AUC and the refit's differences with a paired study
+      bootstrap inside the fold; and, for a fold refit at the rate iteration 3 used, the gap between the two
+      final fits ("same-seed noise of a final fit").
+    Only with five finished, valid refit folds: the metrics of dev() for the refit model, and refit minus
+      iteration 3's b-lite with dev()'s paired bootstrap. Else: per-fold numbers only.
+    Every number carries the development label plus "rate chosen after iteration 3's results were read"
+    (R6). Writes agg_n11x_dev.json (aggregates only). dev() and dev_findings() are not touched."""
+    dec = _decision(decision_record, root)
+    if expect_decision is not None and dec.get("sha256") != expect_decision:
+        raise ValueError("dev_lrx: the attached decision is not the keep record of iteration 3 (sha256)")
+    if DINO not in (dec.get("encoders_run") or []):
+        raise ValueError("dev_lrx: the keep record does not hold DINOv2")
+    sel = _selection(selection, root)
+    picks, moved = selection_picks(sel), _selection_moved(sel)
+    tag = {"label": EXT_DEV_LABEL, "descriptive": True, "added_after_results": True}
+    s: dict = {**_dev_head(dec), "label": EXT_DEV_LABEL, "label_parts": [DEV_LABEL, EXT_DEV_NOTE], "extension_plan": EXT_PLAN,
+               "encoder": DINO, "selection": _selection_head(sel)}
+    cfg = {"decision_sha256": dec["sha256"], "selection_sha256": sel["sha256"], "n_boot": int(n_boot), "seed": seed,
+           "test_overrides": expect_decision != EXT_KEEP_SHA256}
+    with common.notebook(f"{EXT_NAME}_dev", cfg, quiet=quiet, budget_h=budget_h):
+        _, arms_of = _dev_arms(dec, root)
+        A = arms_of[DINO]
+        bad = _dev_arms_status(A)
+        if bad:
+            raise ValueError(f"dev_lrx: iteration 3's arms cannot be scored: {bad}")
+        units = final_units(sel, root)
+        if not units:
+            raise ValueError("dev_lrx: no final fit of the extension is attached (knee-n11x-final)")
+        it3_units = {k: ud for (e, k), ud in find_units(root).items() if e == DINO}
+        it3_lr = {k: float(dec["units"][_unit(DINO, k)]["chosen_lr"]) for k in range(N_OUTER)}
+        envs = [u["state"].get("environment") for u in units.values()] + [_load_state(ud).get("environment") for ud in it3_units.values()]
+        env_differ = sorted(f for f in set().union(*((x or {}).keys() for x in envs))
+                            if len({json.dumps((x or {}).get(f), sort_keys=True) for x in envs}) > 1)
+        commits = sorted({u["commit"] for u in units.values()})
+        s["final_fits"] = {"knee_commits": commits, "one_known_commit": bool(len(commits) == 1 and "None" not in commits),
+                           "environment_differences_from_iteration3": env_differ,
+                           "environment_label": "across environments" if env_differ else None}
+        fold, Y, find = A["frozen0"]["fold"], A["frozen0"]["Y"], list(range(len(FINDINGS)))
+        refit = np.full(A["frozen0"]["P"].shape, np.nan)
+        have, per_fold, noise = [], {}, {}
+        for k in range(N_OUTER):
+            m = fold == k
+            u = units.get(k)
+            info: dict = {**tag, "pick": picks[k], "pick_key": _lr_key(picks[k]), "moved": k in moved,
+                          "iteration3_lr": it3_lr[k], "final_fit": u["status"] if u else "not refit"}
+            per_fold[f"fold_{k}"] = info
+            if not (u and u["usable"]):
+                continue
+            rows = _read_rows(u["dir"] / "pred_b_lite.csv")
+            if rows["uid"].tolist() != A["frozen0"]["uid"][m].tolist() or not np.array_equal(rows["Y"], Y[m]):
+                raise ValueError("dev_lrx: a refit fold holds other studies than iteration 3's arms")
+            if not np.isfinite(rows["P"]).all():
+                info["final_fit"] = "b-lite predictions not finite"
+                continue
+            refit[m] = rows["P"]
+            have.append(k)
+            arms = {"frozen0": A["frozen0"]["P"][m], "head_only_seed_0": A["head_only_seed_0"]["P"][m],
+                    "b_lite": rows["P"], "b_lite_iteration3": A["b_lite"]["P"][m]}
+            zeros = np.zeros(int(m.sum()), int)
+            v = {a: metrics.macro(P, Y[m], zeros, find) for a, P in arms.items()}
+            dr = _fold_macro_draws(arms, Y[m], n_boot, seed, k)
+            col = {a: dr[:, i] for i, a in enumerate(arms)}
+            info.update({"studies": agg.count(int(m.sum())), **{a: _r(x) for a, x in v.items()}})
+            for key, base in (("b_lite_minus_frozen0", "frozen0"), ("b_lite_minus_head_only", "head_only_seed_0"),
+                              ("b_lite_minus_iteration3_b_lite", "b_lite_iteration3")):
+                info[key] = {"macro_auc": _r(v["b_lite"] - v[base]), "interval": _pct(col["b_lite"] - col[base])}
+            info["null_means"] = "a finding lacks a class in this fold"
+            if math.isclose(picks[k], it3_lr[k]):  # the same rate, seed and data: two final fits of one model
+                gap = np.abs(rows["P"] - A["b_lite"]["P"][m])
+                d = v["b_lite"] - v["b_lite_iteration3"]
+                noise[f"fold_{k}"] = info["same_seed_noise_of_a_final_fit"] = {
+                    "what": "same-seed noise of a final fit: this fold's refit against iteration 3's final fit at the same rate",
+                    "encoder_lr": picks[k], "macro_auc_refit_minus_iteration3": _r(d),
+                    "abs_macro_auc_gap": _r(abs(d)), "max_abs_probability_gap": _r(float(gap.max()), 5),
+                    "mean_abs_probability_gap": _r(float(gap.mean()), 6)}
+        s["per_fold"] = per_fold
+        s["folds_refit"] = {"folds": have}
+        gaps = [x["abs_macro_auc_gap"] for x in noise.values() if x["abs_macro_auc_gap"] is not None]
+        s["same_seed_noise"] = {**tag, "what": "same-seed noise of a final fit (development): two final fits at one rate, seed 0",
+                                "folds": [int(f.split("_")[1]) for f in noise],
+                                "max_abs_macro_auc_gap": _r(max(gaps)) if gaps else None,
+                                "mean_abs_macro_auc_gap": _r(float(np.mean(gaps))) if gaps else None,
+                                "environment_label": s["final_fits"]["environment_label"],
+                                "note": "one pair of fits per fold; the folds refit at the rate iteration 3 used"}
+        missing = [k for k in range(N_OUTER) if k not in have]
+        if missing:
+            why = "; ".join(f"fold {k}: {per_fold[f'fold_{k}']['final_fit']}" for k in missing)
+            s["model"] = {**tag, "status": "per-fold numbers only", "why": why if len(why) <= 150 else "see per_fold.<fold>.final_fit",
+                          "note": EXT_INCOMPLETE}
+        else:
+            B = {"frozen0": A["frozen0"], "head_only_seed_0": A["head_only_seed_0"], "b_lite": {**A["frozen0"], "P": refit},
+                 "b_lite_iteration3": A["b_lite"]}
+
+            def m2(a):
+                x = B[a]
+                return {"mean_of_fold_macros": metrics.per_fold_macro_mean(x["P"], x["Y"], x["fold"], find),
+                        "fold_stratified_macro_auc": metrics.macro(x["P"], x["Y"], x["fold"], find)}
+
+            vals = {a: m2(a) for a in B}
+            draws = np.array([[metrics.macro(B[a]["P"], B[a]["Y"], B[a]["fold"], find, w) for a in B]
+                              for w in _fold_draws(fold, int(n_boot), seed)])  # dev()'s draws: the same folds and seed
+            col = {a: draws[:, i] for i, a in enumerate(B)}
+
+            def diff(base):
+                ci = _pct(col["b_lite"] - col[base])
+                return {**{k: _r(vals["b_lite"][k] - vals[base][k]) for k in vals["b_lite"]}, "fold_stratified_interval": ci,
+                        "interval_excludes_0": bool(ci["lo"] is not None and (ci["lo"] > 0 or ci["hi"] < 0))}
+
+            s["model"] = {**tag, "status": "ok", "studies": agg.count(len(A["frozen0"]["uid"])),
+                          "b_lite_is": "the refit model: each fold's final fit at its pick",
+                          "b_lite_iteration3_is": "iteration 3's final fits (8e-5 in every fold)",
+                          **{a: {**{k: _r(x) for k, x in vals[a].items()}, "fold_stratified_interval": _pct(col[a])} for a in B},
+                          "b_lite_minus_frozen0": diff("frozen0"), "b_lite_minus_head_only": diff("head_only_seed_0"),
+                          "b_lite_minus_iteration3_b_lite": diff("b_lite_iteration3")}
+        full = not missing
+        s["report_final_model"] = {
+            "model": "refit" if full else "iteration3_8e-5",
+            "rule": "the refit model if Rule S moved a fold and all five final fits are finished and valid, also if its S4 score is lower",
+            "sentence": None if full else "the picks were not applied to a full model: "
+                        + ("fewer than five refit folds" if len(units) < N_OUTER else "a final fit is invalid or unfinished"),
+            "picks_text": ", ".join(f"f{k} {_lr_text(picks[k])}" for k in range(N_OUTER))}
+        s["interval"] = ("model: study bootstrap inside each test fold, paired across arms (dev()'s draws); per_fold: a study "
+                         "bootstrap inside that fold, paired; percentile 2.5-97.5; descriptive")
+        s["n_boot"] = int(n_boot)
+        s["metrics"] = {"mean_of_fold_macros": "mean over the S2 folds of each fold's macro AUC",
+                        "fold_stratified_macro_auc": "pairs inside one S2 test fold, mean over the 12 findings",
+                        "per_fold": "one fold's mean AUC over the 12 findings"}
+        s["status"] = "ok" if full else "ok (per-fold numbers only: the refit model is incomplete)"
+        agg.write(f"{EXT_NAME}_dev", s)
+    common.summary(s)
+    return s
+
+
+dev_extension = dev_lrx  # the name the declaration's code list uses

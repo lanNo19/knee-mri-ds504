@@ -88,6 +88,17 @@ NOTEBOOKS = {
     "n11x-smoke-select": (False, False, False, ["n11x-smoke", "n11-a", "n11-b"], 1800),
     "n11x-select": (False, False, False, ["n11x-inner", "n11-a", "n11-b"], 3600),
     "n11x-refine": (True, False, False, N11_GPU_INPUTS, 14400),
+    # N11x, delivery D2 (declaration, section 6). The final fits attach the GPU inputs and the selection's
+    # output (the signed record), and nothing of iteration 3 (R9): frozen0 is recomputed there for check (b),
+    # and no head-only seed is fitted. The CPU development step attaches iteration 3's sessions and its keep
+    # record: frozen0 and head-only come from there, as in n11-dev. Timeout: above 1.1 x 3.8 h.
+    "n11x-final": (True, False, False, N11_GPU_INPUTS + ["n11x-select"], 16200),
+    "n11x-dev": (False, False, False, ["n11x-final", "n11x-select", "n11-a", "n11-b", "n11-decide"], 3600),
+    # N10 with the refit model (internet off; the bundle must be rebuilt at the commit that holds this code):
+    # as n10-tails-check and n10-blite, with knee-n11x-final and knee-n11x-select instead of knee-n11-a/-b
+    "n10-tails-check-x": (True, False, False, ["n0", "n3-r", "n4-sagittal", "n4-coronal", "n4-axial", "n6a",
+                                               "n11x-final", "n11x-select"], 3600),
+    "n10-blite-x": (True, True, False, ["n0", "n6a", "n11x-final", "n11x-select"], 32400),
 }
 
 
@@ -175,6 +186,18 @@ def cell2(name: str, dread_file: str | None = None, dread_ok: bool = False, with
     if name == "n11x-refine":  # edit rates: refinement.rate of agg_n11x_select.json; budget_h: min(3.4, quota - 0.4)
         return (f'from knee.nb import n11; n11.run_lrx("refine", rates=(1.6e-4,), split_folds=True, replay=False, '
                 f'budget_h=3.4, expect={EXPECT})')
+    if name == "n11x-final":
+        # BUDGET_H is not defined on purpose: the caller types the number in its place (no default anywhere).
+        # Five folds: the smaller of 3.8 and (quota minus 0.4). Quota fallback (under 4.2 h left): add
+        # folds=<the moved folds> and type the smaller of 2.7 (three or four folds) or 1.4 (one or two) and
+        # (quota minus 0.4)
+        return f"from knee.nb import n11; n11.run_final_lrx(budget_h=BUDGET_H, expect={EXPECT})"
+    if name == "n11x-dev":
+        return "from knee.nb import n11; n11.dev_lrx()"
+    if name == "n10-tails-check-x":  # fold=None: the lowest fold that moved in the selection record
+        return 'from knee.nb import n10; n10.check_tails("dinov2_vits14", fold=None, n=200, tails="n11x")'
+    if name == "n10-blite-x":
+        return 'from knee.nb import n10; n10.run("dinov2_vits14", tails="n11x")'
     raise KeyError(name)
 
 
@@ -187,7 +210,8 @@ CELL1_OFFLINE = (
     ' "python-gdcm", "pylibjpeg", "pylibjpeg-libjpeg", "pylibjpeg-openjpeg", "dicomsdl"], check=True)\n'
     "import knee.safe_log as sl; sl.install()"
 )
-OFFLINE = ("n10", "n10-convnext", "n10-canary", "n10-blite", "n10-convnext-blite", "n10-tails-check")
+OFFLINE = ("n10", "n10-convnext", "n10-canary", "n10-blite", "n10-convnext-blite", "n10-tails-check",
+           "n10-tails-check-x", "n10-blite-x")
 
 
 def cell1(commit: str, offline: bool = False) -> str:
