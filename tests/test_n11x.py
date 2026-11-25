@@ -259,6 +259,13 @@ def test_no_test_row_is_read_and_the_starting_head_is_the_inner_refit(inputs, re
         _lrx(inputs, tmp_path / "w", monkeypatch, encoders=(MAIN[1],))
     with pytest.raises(TypeError):  # budget_h has no default
         n11.run_lrx("inner", root=inputs)
+    # two processes need two GPUs: refused before the cache copy (devices is the tests' argument)
+    monkeypatch.setattr(n11, "localise_caches", lambda *a, **k: pytest.fail("refused before the cache copy"))
+    for kw in ({}, {"rates": (1.6e-4,), "split_folds": True, "replay": False}):
+        with pytest.raises(Exception) as ei:
+            _lrx(inputs, tmp_path / "w9", monkeypatch, session="inner", reference=refs, devices=None, **kw)
+        assert "AssertionError" in str(ei.value) or isinstance(ei.value, AssertionError)
+    assert not list((tmp_path / "w9").glob("agg_*.json"))
 
 
 def test_two_processes_do_not_collide(inputs, refs, tmp_path, monkeypatch):
@@ -417,8 +424,23 @@ def test_early_stop_rule_swaps_the_upper_rate(inputs, refs, tmp_path, monkeypatc
     assert sw[2]["ext"]["swapped_from"] == 1.28e-3 and sw[2]["ext"]["start"]["copied_from_step"] == "n11x_inner_0.00128"
     assert (tmp_path / "w" / "agg_n11x_inner_0.00064.json").exists()
     sel = n11.selection_ext(n11.find_ext_units(tmp_path / "w"), None, None, reference=refs, smoke=True, n_boot=0)
-    assert sel["rule_d"]["upper"] == 6.4e-4 and sel["rule_d"]["words"].endswith(
+    assert sel["rule_d"]["upper"] == 6.4e-4 and sel["rule_d"]["words_swap"] == (
         "1.28e-3 was unstable in folds 0 and 1 and was not run in the other three")
+    assert "unstable" not in sel["rule_d"]["words"]
+    # the swap followed by a soft stop and an invalid fold of 6.4e-4: every string of the record stays writable
+    from knee import agg
+
+    for k, status in ((2, "invalid"), (3, "unfinished: out of time")):
+        p = tmp_path / "w" / "private" / "n11x_inner_0.00064" / f"{DINO}_f{k}" / "state.json"
+        b = json.loads(p.read_text())
+        b["ext"]["run"].update({"status": status, "finished": False, "valid": False, "val_macro_auc": None})
+        p.write_text(json.dumps(b))
+    sel = n11.selection_ext(n11.find_ext_units(tmp_path / "w"), None, None, reference=refs, smoke=True, n_boot=0)
+    agg._check(sel)
+    rd = sel["rule_d"]
+    assert rd["c2"] == "UNSTABLE" and rd["reasons"]["0.00064"] == ["invalid in fold 2", "not finished in fold 3", "no unit for fold 4"]
+    assert rd["line"] == {"k": 1} and rd["reasons"]["0.00032"] == ["no unit for fold 4"]  # the session had four folds
+    assert _longest(sel) <= 200
     # late failures do not swap: fold 1 invalid after the quarter mark
 
     def late(c, r):
@@ -483,6 +505,14 @@ def test_rule_s_per_fold():
     assert S({lo: 0.7000, mid: None, up: 0.7100}, yes)["pick"] == up and S({lo: None, mid: 0.9}, yes)["pick"] == lo
     assert S({lo: 0.7, mid: 0.8, 6.4e-4: 0.81, up: 0.9}, {mid: True, 6.4e-4: True, up: True})["pick"] == up
     assert S({2e-5: 0.99, lo: 0.7, mid: 0.7}, yes)["pick"] == lo  # a lower rate is never a candidate
+
+
+def _longest(o) -> int:
+    if isinstance(o, dict):
+        return max([_longest(v) for v in o.values()] + [len(str(k)) for k in o] + [0])
+    if isinstance(o, list):
+        return max([_longest(v) for v in o] + [0])
+    return len(o) if isinstance(o, str) else 0
 
 
 def _five(base, deltas):
@@ -556,8 +586,27 @@ def test_rule_d_every_line_and_the_classes():
     four = {k: v for k, v in _five(b, up5).items() if k != 4}
     assert n11.ext_rule_d({lo: b, mid: four, up: _five(b, up5)}, mid, up)["c1"] == "NONE"
     r = D(up5, flat, upper=6.4e-4, swapped_from=up)
-    assert r["upper"] == 6.4e-4 and r["words"] == ("optimum of the grid: 3.2e-4, bracketed (8e-5 and 6.4e-4 are both lower); "
-                                                   "1.28e-3 was unstable in folds 0 and 1 and was not run in the other three")
+    assert r["upper"] == 6.4e-4 and r["words"] == "optimum of the grid: 3.2e-4, bracketed (8e-5 and 6.4e-4 are both lower)"
+    assert r["words_swap"] == "1.28e-3 was unstable in folds 0 and 1 and was not run in the other three"
+    assert D(up5, flat)["words_swap"] is None
+    # d by the one convention: the mean of the per-fold differences at 4 decimals (the keep rule's way)
+    A = dict(enumerate((0.7951, 0.7950, 0.7950, 0.7950, 0.7951)))  # mean 0.79504: shown as 0.7950
+    B = dict(enumerate((0.7900, 0.7900, 0.7900, 0.7899, 0.7899)))  # mean 0.78996: shown as 0.7900
+    c = C(A, B)
+    assert (c["mean_a"], c["mean_b"], c["d"], c["class"]) == (0.795, 0.79, 0.0051, "HIGHER")
+    assert C(B, A)["d"] == -0.0051 and C(B, A)["class"] == "LOWER"
+    A[0] = 0.7947  # the mean difference is now 0.00500: not more than 0.005
+    assert (C(A, B)["d"], C(A, B)["class"]) == (0.005, "BAND")
+    assert "mean over the folds of the differences" in r["compare"]["convention"] == n11.EXT_D_CONVENTION
+    # no outcome writes a string above the summaries' 200 characters: line 1, the split line, line 4 with a reason
+    long = "invalid in folds 0, 1; not run in folds 2, 3; not finished in fold 4; start check failed in fold 3"
+    outs = [D(None, up5, reasons={mid: long}, swapped_from=up, upper=6.4e-4), D([0.05, 0.05, 0.05, -0.01, -0.01], dn5, swapped_from=up, upper=6.4e-4),
+            D(dn5, None, upper_invalid=True, reasons={6.4e-4: long}, swapped_from=up, upper=6.4e-4),
+            D(flat, None, reasons={up: long}), D(dn5, None, reasons={up: "invalid in fold 2; not run in fold 4"}, upper_invalid=True)]
+    for o in outs:
+        assert _longest(o) <= 200
+    assert outs[0]["words"] == "no five-fold mean for 3.2e-4 (several causes: see rule_d.reasons); per-fold lines only; the question is not answered"
+    assert outs[4]["words"].endswith("1.28e-3 has no five-fold mean (invalid in fold 2; not run in fold 4)")
     from knee import agg
 
     agg._check(json.loads(json.dumps(r)))
@@ -578,7 +627,7 @@ def test_rule_d_every_line_and_the_classes():
 ENV = {"python": "3.x", "torch": "2.x", "device_name": "T4"}
 
 
-def _attached(tmp_path, work, refs, env3=None, scores=None, commit="095c91f", mutate=None):
+def _attached(tmp_path, work, refs, env3=None, scores=None, commit="095c91f", mutate=None, b_lite=False):
     """A copy of the session's output as a notebook input (test_overrides off, a known environment), and
     hand-made iteration-3 units whose states carry the reference numbers. scores: {lr key: {fold: end}} to
     write into the extension's states."""
@@ -617,6 +666,17 @@ def _attached(tmp_path, work, refs, env3=None, scores=None, commit="095c91f", mu
                         "to_the_end": {"8e-05": {"val_macro_auc": refs["end_val_macro_auc"]["8e-05"][f], "curve": curve},
                                        "2e-05": {"val_macro_auc": refs["end_val_macro_auc"]["2e-05"][f],
                                                  "curve": {**curve, "val_macro_auc": [0.5] * 11 + [refs["end_val_macro_auc"]["2e-05"][f]]}}}}}
+        if b_lite:  # iteration 3's 2e-5 validation predictions: every scored validation study of the fold
+            from knee.labels import FINDINGS
+            from knee.nb import n11
+            from tests.test_n11 import _write_rows
+
+            rng = np.random.default_rng(k)
+            vs = "+".join(sorted(TABLE[k]["val"]))
+            n = 60
+            _write_rows(ud / "inner_b_lite.csv", [f"{vs}_{i}" for i in range(n)], k, rng.random((n, len(FINDINGS))),
+                        (rng.random((n, len(FINDINGS))) < 0.3).astype(float), {"val_set": vs})
+            st["files_sha16"]["inner_b_lite.csv"] = n11.sha16(ud / "inner_b_lite.csv")
         (ud / "state.json").write_text(json.dumps(st))
     return root
 
@@ -761,9 +821,19 @@ def test_smoke_runs_both_processes_a_forced_invalid_run_and_the_selection(inputs
     with pytest.raises(Exception):
         n11.select_lrx(root=tmp_path / "w", sessions=("smoke",), reference_only=True, reference=off, n_boot=0)
     # a failed check is said: the forced run is not invalid
-    real = n11._inner_ext
+    real, real_run = n11._inner_ext, n11.run_to
+
+    def run_to(c, r, twelfth, limit=None):
+        real_run(c, r, twelfth, limit)
+        if c.fold == 1 and r.with_encoder and r.lr_enc == 1.28e-3:
+            r.skipped = r.step // 2  # skipped steps do not invalidate a smoke run: reported only
+
+    monkeypatch.setattr(n11, "run_to", run_to)
     monkeypatch.setattr(n11, "_inner_ext", lambda c, st, lr, head0, force_k=None: real(c, st, lr, head0, None))
     s = _lrx(inputs, tmp_path / "w2", monkeypatch, smoke=True, budget_h=0.5, reference=off, folds=(0, 1, 2))
+    assert s["smoke_skipped_step_share"]["0.00128"] == {"fold_0": 0.0, "fold_1": 0.5, "fold_2": 0.0}
+    assert s["overview"]["0.00128"]["fold_1"]["status"] == "finished" and s["swapped"] == []
+    assert s["smoke_checks"]["c5_every_other_run_has_12_records_and_a_finite_end_score"] is True
     assert s["smoke_passed"] is False and s["smoke_checks"]["c4_forced_run_invalid_with_twelfth_and_reason"] is False
     assert s["smoke_checks"]["c1_every_process_lists_its_folds"] is False  # three folds, not five
 
@@ -817,3 +887,83 @@ def test_n11x_cli_entries_match_the_runbook_card():
         assert mk.cell2(name) in card and meta["enable_gpu"] is False
         assert meta["kernel_sources"] == [f"u/knee-{first}", "u/knee-n11-a", "u/knee-n11-b"]
     assert "TODO D2" in card and mk.NOTEBOOKS["n11x-inner"][4] >= 1.1 * 5.8 * 3600
+
+
+# ---------------------------------------------------------------- review r1 of bdc49c3
+
+def test_smoke_select_notebook_call_with_iteration3_prediction_files(inputs, refs, tmp_path, monkeypatch, capfd):
+    """knee-n11x-smoke-select's exact call on a smoke output beside iteration-3 units that hold inner_b_lite.csv
+    (all validation studies; the smoke's files hold 32): no interval is computed and iteration 3's file is
+    not opened, so the record is written and the environment check (criterion 7) can be read."""
+    from knee import agg, paths
+    from knee.nb import n11
+
+    s = _lrx(inputs, tmp_path / "w", monkeypatch, smoke=True, budget_h=0.5, reference=refs)
+    assert s["smoke_checks"]["c7_selection_ran_in_smoke_mode"] is True
+    root = _attached(tmp_path, tmp_path / "w", refs, b_lite=True)
+    monkeypatch.setattr(paths, "INPUT", root)
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "out")
+    monkeypatch.setattr(n11, "_read_rows", lambda p: pytest.fail("no per-study file is opened by the smoke selection"))
+    rec = n11.select_lrx(smoke=True)  # cell 2 of knee-n11x-smoke-select
+    assert "STEP n11x_smoke_select: OK" in capfd.readouterr().out
+    assert rec["environment"]["compared_with_iteration3"] is True and rec["environment"]["differences"] == []
+    assert rec["intervals"]["pairs"] == {} and rec["intervals"]["n_boot"] == 0 and rec["smoke"] is True
+    assert rec["iteration3"]["attached"] and rec["inconclusive_because"] == ["reference_mismatch"]  # the fixture is not EXT_REF
+    agg._check(json.loads((tmp_path / "out" / "agg_n11x_smoke_select.json").read_text()))
+    rec = n11.select_lrx(smoke=True, reference=refs)
+    assert rec["status"] == "selected" and rec["iteration3"]["constants_equal_the_states"] is True
+
+
+def test_a_described_refinement_point_at_the_swap_rate_is_not_a_swap(session, refs, tmp_path):
+    from knee.nb import n11
+
+    s, work = session
+    root = _attached(tmp_path, work, refs)
+    src = root / "knee-n11x-inner" / "private" / "n11x_inner_0.00032"
+    dst = root / "knee-n11x-refine" / "private" / "n11x_refine_0.00064"
+    shutil.copytree(src, dst)
+    (root / "knee-n11x-refine" / "run.json").write_text(json.dumps({"commit": "abc1234", "config": {"test_overrides": False}}))
+    for p in dst.rglob("state.json"):
+        b = json.loads(p.read_text())
+        b["session"] = "refine"
+        b["ext"].update({"lr": 6.4e-4, "lr_key": "0.00064"})
+        b["ext"]["run"]["val_macro_auc"] = 0.99
+        p.write_text(json.dumps(b))
+    units = n11.find_ext_units(root, ("inner", "refine"))
+    r = n11.selection_ext(units, n11.find_units(root), None, reference=refs, n_boot=0, describe=("refine",))
+    plain = n11.selection_ext(n11.find_ext_units(root), n11.find_units(root), None, reference=refs, n_boot=0)
+    assert r["rule_d"]["upper"] == 1.28e-3 and r["rule_d"]["words_swap"] is None and r["new_rates"] == [3.2e-4, 6.4e-4, 1.28e-3]
+    assert (r["rule_d"]["words"], r["rule_d"]["c1"], r["rule_d"]["c2"], r["picks"]) == (
+        plain["rule_d"]["words"], plain["rule_d"]["c1"], plain["rule_d"]["c2"], plain["picks"])
+    assert all(v["runs"]["0.00064"]["why_not_eligible"] == "a refinement point is never eligible" for v in r["folds"].values())
+    assert r["rule_d"]["means"]["0.00064"] == 0.99 and r["refinement"]["already_ran"] in (True, False)
+
+
+def test_replay_process_ending_without_its_record_stops_the_session(inputs, refs, tmp_path, monkeypatch):
+    from knee.nb import n11
+
+    trained = []
+    real = n11._inner_ext
+    monkeypatch.setattr(n11, "_inner_ext", lambda c, *a, **k: (trained.append(c.step), real(c, *a, **k))[1])
+    monkeypatch.setattr(n11, "_ext_replay", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("synthetic failure in the replay")))
+    s = _lrx(inputs, tmp_path / "w", monkeypatch, session="inner", folds=(0, 1), reference=refs)
+    flag = json.loads((tmp_path / "w" / "private" / "n11x_STOP").read_text())
+    assert flag["reason"] == "replay: no record" and flag["lr_key"] == "0.00128" and trained == []
+    assert s["status"].startswith("inconclusive") and s["replay"] is None
+    assert s["errors"][f"{DINO}_f0@8e-05"].startswith("RuntimeError at")
+    env = _states(tmp_path / "w", "n11x_inner_0.00128")[0]["environment"]
+    for p in (tmp_path / "w").glob("run.json"):  # as a real session's output: no test overrides
+        j = json.loads(p.read_text())
+        j["config"]["test_overrides"] = False
+        p.write_text(json.dumps(j))
+    sel = n11.selection_ext(n11.find_ext_units(tmp_path / "w"), None, s["stop_flag"], reference=refs, n_boot=0, expect_env=env)
+    assert (sel["status"], sel["inconclusive_because"]) == ("inconclusive", ["no_replay_record"]) and not sel["refinement"]["may_run"]
+    # a process without the replay that fails writes no flag: the other process goes on
+    monkeypatch.undo()
+    from knee import paths
+
+    monkeypatch.setattr(paths, "WORKING", tmp_path / "w2")
+    monkeypatch.setattr(n11, "_inner_ext", lambda c, *a, **k: (_ for _ in ()).throw(RuntimeError("x")) if c.step.endswith("0.00032") else real(c, *a, **k))
+    s = _lrx(inputs, tmp_path / "w2", monkeypatch, session="inner", folds=(0, 1), reference=refs)
+    assert s["status"] == "partial" and s["stop_flag"] is None and s["replay"]["passed"] is True
+    assert all(v["status"] == "finished" for v in s["overview"]["0.00128"].values())

@@ -676,7 +676,8 @@ Expected time: about 0.4 h. It runs both processes on all five folds with fits o
 What to read (summary block and agg_n11x_smoke.json):
 1. STEP n11x_smoke: OK. status "ok (smoke: no score is meaningful)". smoke_passed true.
 2. smoke_checks, the declaration's pass criteria as booleans: c1 both processes list five folds (the page's "Successful" is read by eye); c2 the start check passed in every fold of both processes; c3 the replay stored three gaps; c4 the forced run is invalid with its twelfth and reason; c5 every other run has 12 records and a finite end score; c6 micro-batches of 2 studies; c7 the selection ran in smoke mode.
-3. c7_environment_equals_iteration3 is null here (nothing of iteration 3 is attached). Run knee-n11x-smoke-select and read environment.differences: it must be an empty list.
+3. Skipped optimiser steps do not invalidate a smoke run and do not fail c5 (a smoke fit has 12 steps, so one skipped step is already 0.083): they are reported in smoke_skipped_step_share. The inner session keeps the 0.05 rule. A smoke run that is invalid by a non-finite loss at 1.28e-3 only is information about that rate, not a code fault: read overview.0.00128.
+3b. c7_environment_equals_iteration3 is null here (nothing of iteration 3 is attached). Run knee-n11x-smoke-select and read environment.differences: it must be an empty list.
 
 ```python
 from knee.nb import n11; n11.select_lrx(smoke=True)
@@ -692,7 +693,7 @@ If it does not pass: fix, test locally, one new smoke run. After the second smok
 from knee.nb import n11; n11.run_lrx("inner", budget_h=5.8, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
 ```
 
-Expected time: 5.1 h planned, 5.6 h bound (up to 0.4 h more if the early-stop rule fires). GPU 0 runs 3.2e-4, GPU 1 runs 1.28e-3, each on folds 0-4. The watchdog stops the step at 1.1 x budget_h.
+Expected time: 5.1 h planned, 5.6 h bound (up to 0.4 h more if the early-stop rule fires). The step refuses to start, before the cache copy, without two GPUs. GPU 0 runs 3.2e-4, GPU 1 runs 1.28e-3, each on folds 0-4. The watchdog stops the step at 1.1 x budget_h.
 
 Option C (quota from 3.8 to 6.2 h): `n11.run_lrx("inner", rates=(3.2e-4,), split_folds=True, budget_h=<the smaller of 3.4 and quota minus 0.4>, expect=...)`.
 
@@ -712,7 +713,7 @@ What to read (summary block, agg_n11x_inner.json, agg_n11x_inner_0.00032.json, a
 Stop rules (the code applies them; the status names them):
 1. Three or more failed start checks in a process: the session stop flag (private/n11x_STOP) is written and nothing trains. status "stopped: the start check failed in three or more folds". The cause is looked for once; one new session may start under the declaration's section 9.
 2. One or two failed start checks: the runs go on; that fold cannot pick that rate, and the rate has no five-fold mean.
-3. Replay gap above 0.005: the stop flag is written and every process stops at its next twelfth. status "inconclusive: reused and new scores cannot be compared at 0.005". No fold moves, no refinement point, no further GPU run.
+3. Replay gap above 0.005, or the replay process ending before its replay record exists (flag reason "replay: no record"): the stop flag is written and every process stops at its next twelfth. status "inconclusive: reused and new scores cannot be compared at 0.005". No fold moves, no refinement point, no further GPU run.
 4. An invalid run (a non-finite training or validation loss, a skipped-step share above 0.05, a non-finite end score) stops at that twelfth and is reported. Only that fold and rate are affected.
 5. Early-stop rule: 1.28e-3 invalid in folds 0 and 1, both at or before twelfth 3: that process runs 6.4e-4 on all five folds (agg_n11x_inner_0.00064.json; swapped in the summary).
 6. Soft stop at budget_h: status "partial", out_of_time true, everything written. runs_missing lists what did not finish. The selection accepts a partial session.
@@ -728,7 +729,7 @@ What to read (summary block = agg_n11x_select.json, the signed selection record)
 2. status "inconclusive" (inconclusive_because names why: replay_gap_above_tolerance, no_replay_record, across_environments, environment_not_compared, reference_mismatch) or "stopped_at_start_check": all five picks are 8e-5 and refinement.may_run is false.
 3. iteration3.constants_equal_the_states true. False = a constant in EXT_REF differs from iteration 3's state: stop and report.
 4. picks: one rate per fold (Rule S). folds.fold_k: scores of all rates, runs (valid, eligible, why_not_eligible), steps, best_twelfth.
-5. rule_d: means, c1, c2, cur, r_star, line, words (words_as_shown carries the label after a stop), schedule_sentence, mean_curve. Rule D describes; it never overrides a pick.
+5. rule_d: means, c1, c2, cur, r_star, line, words (words_as_shown carries the label after a stop), words_swap (the sentence every line adds if 6.4e-4 replaced 1.28e-3), reasons, compare.convention (how d is computed), schedule_sentence, mean_curve. Rule D describes; it never overrides a pick.
 6. missing: the runs that did not finish. refinement: r_star, neighbour, rate, may_run.
 7. graphs.g1 and graphs.g2: the data of the two graphs. intervals: descriptive only.
 

@@ -2250,6 +2250,7 @@ EXT_REPLAY_TOL = 0.005  # a larger replay gap writes the stop flag
 EXT_REPLAY_HALF = 0.0025  # above it the slide says the band is not well above the noise
 EXT_START_TOL = CHECK_B_TOL  # 0.0005
 EXT_START_STOP = 3  # this many failed start checks stop the session
+EXT_REASON_MAX = 60  # a longer reason inside Rule D's words is replaced by a pointer to rule_d.reasons
 EXT_SMOKE_STEPS = 12  # optimiser steps of a smoke fit
 EXT_SMOKE_VAL = 32  # validation studies of a smoke fit
 EXT_SCOPE = "extension of the encoder learning-rate search, DINOv2 B-lite, iteration 3: added after the results (R10)"
@@ -2417,7 +2418,7 @@ def _inner_ext(c, st: dict, lr: float, head0: dict, force_k: int | None = None) 
             log["train_seconds"].append(round(r.train_s, 1))
             if bad:
                 why = (r.k, "non-finite " + " and ".join(x.replace("_", " ") for x in bad))
-            elif share > EXT_MAX_SKIPPED:
+            elif share > EXT_MAX_SKIPPED and not c.task.get("smoke"):  # 12 steps: one skipped step is 0.083
                 why = (r.k, "skipped optimiser steps above the limit")
             elif r.k == TWELFTHS and (h.get("val_macro_auc") is None or not np.isfinite(h["val_macro_auc"])):
                 why = (r.k, "the end score is not finite")
@@ -2496,9 +2497,12 @@ def _task_ext(task: dict) -> dict:
     errors: dict = {}
     out = {"ok": True, "encoder": enc, "lr": lr0, "errors": errors, "out_of_time": False, "stopped": None, "swapped_to": None}
     cur = (lr0, folds[0])
+    k0 = int(EXT_REPLAY[0])
+    owes_replay = bool(task.get("replay") and k0 in folds and ref.get("replay"))
+    states: dict = {}
     try:
         sh = _shared({**task, "step": _ext_step(session, lr0)})
-        ctx, states, head0 = {}, {}, {}
+        ctx, head0 = {}, {}
         for k in folds:  # 1. every fold: its unit, the head refit, the start check; nothing is trained yet
             cur = (lr0, k)
             c = _context(sh, k)
@@ -2517,8 +2521,7 @@ def _task_ext(task: dict) -> dict:
         if flag:
             out["stopped"] = flag.get("reason")
             return out
-        k0 = int(EXT_REPLAY[0])
-        if task.get("replay") and k0 in folds and ref.get("replay"):  # 2. the replay check
+        if owes_replay:  # 2. the replay check
             cur = (float(ref["replay"].get("lr", EXT_REPLAY[1])), k0)
             if not _ext_replay(ctx[k0], states[k0], head0[k0], ref["replay"], smoke) and not smoke:
                 _ext_stop(working, session, "replay", {"lr_key": _lr_key(lr0), "fold": k0,
@@ -2578,7 +2581,14 @@ def _task_ext(task: dict) -> dict:
             pass
         if isinstance(e, (KeyboardInterrupt, SystemExit)):  # the watchdog or a manual stop ends the whole step
             raise
-        flag = _ext_stopped(working, session) if isinstance(e, ExtStop) else None
+        if owes_replay and not smoke and not (states.get(k0) or {}).get("replay"):
+            # this process ended before its replay record exists: without it the result is "inconclusive"
+            # (declaration, section 9), so the other process must not train on for hours
+            try:
+                _ext_stop(working, session, "replay: no record", {"lr_key": _lr_key(lr0), "fold": k0})
+            except Exception:  # noqa: BLE001
+                pass
+        flag = _ext_stopped(working, session) if isinstance(e, ExtStop) or owes_replay else None
         return {**out, "ok": False, "out_of_time": isinstance(e, OutOfTime), "stopped": (flag or {}).get("reason"),
                 "errors": {**errors, f"{_unit(enc, cur[1])}@{_lr_key(cur[0])}": safe_log.describe(type(e), e.__traceback__)}}
     finally:
@@ -2704,6 +2714,8 @@ def run_lrx(session: str = "inner", folds=(0, 1, 2, 3, 4), rates=EXT_LRS, encode
       written as booleans (smoke_checks). The start checks are the real ones, on all validation rows. No
       score of it is meaningful; it is marked test_overrides. expect_env: iteration 3's environment record,
       if it is to be compared here (else select_lrx(smoke=True) with knee-n11-a and -b attached does it).
+    devices: tests only (it marks test_overrides). Without it a session with two processes needs two
+      CUDA devices and is refused before the cache copy otherwise.
     reference: EXT_REF unless given (tests). No output of iteration 3 is attached or read (R9), and no
       test-fold file is read or written.
     Writes agg_n11x_<session>.json, one agg_n11x_<session>_<lr key>.json per rate and run.json."""
@@ -2730,7 +2742,8 @@ def run_lrx(session: str = "inner", folds=(0, 1, 2, 3, 4), rates=EXT_LRS, encode
     step = f"{EXT_NAME}_{session}"
     ref = json.loads(json.dumps(reference if reference is not None else EXT_REF))
     overrides = bool(smoke or encoder_factory is not None or val_table is not None or tuple(val_range or ()) != VAL_RANGE
-                     or passes != PASSES or reference is not None or micro is not None or force_invalid is not None)
+                     or passes != PASSES or reference is not None or micro is not None or force_invalid is not None
+                     or devices is not None)
     env = n13.environment()
     cfg = {"session": session, "folds": list(folds), "rates": list(lrs), "encoders": list(encs), "smoke": bool(smoke),
            "budget_h": budget_h, "passes": passes, "split_folds": bool(split_folds), "replay": bool(replay),
@@ -2757,6 +2770,9 @@ def run_lrx(session: str = "inner", folds=(0, 1, 2, 3, 4), rates=EXT_LRS, encode
             s["validation_table"][f"fold_{k}"] = {"test_groups": sp["test_groups"], "inner_validation_groups": sp["val_groups"],
                                                   "inner_validation_studies": agg.count(len(sp["iva_all"]))}
         devs = n5._devices(devices)
+        if devices is None and (split_folds or len(lrs) >= 2) and sum(str(x).startswith("cuda") for x in devs) < 2:
+            # two processes on one device would run one after the other and the soft stop would cut the second
+            raise AssertionError("two GPUs are needed (accelerator GPU T4 x2): this session has two processes")
         for old in (working / "private").glob(f"{step}_*"):  # nothing of an earlier call of this session survives
             shutil.rmtree(old, ignore_errors=True)
         for old in [*working.glob(f"agg_{step}_*.json"), _ext_flag(working)]:
@@ -2770,7 +2786,7 @@ def run_lrx(session: str = "inner", folds=(0, 1, 2, 3, 4), rates=EXT_LRS, encode
             has = [i for i, (_, _, fs) in enumerate(jobs) if int(EXT_REPLAY[0]) in fs]
             with_replay = (has[0] if split_folds else has[-1]) if has else None
         parallel = bool(len(devs) >= 2) if processes is None else bool(processes)
-        s["processes"] = [f"{_lr_text(lr)} on {dv.split(':')[0]}: folds {', '.join(str(k) for k in fs)}"
+        s["processes"] = [f"{_lr_text(lr)} on {dv}: folds {', '.join(str(k) for k in fs)}"
                           + ("; the replay first" if i == with_replay else "") for i, (lr, dv, fs) in enumerate(jobs)]
         base = {"root": str(root) if root else None, "expect": expect, "working": str(working), "session": session,
                 "schedule": "full", "factory": encoder_factory, "val_table": val_table,
@@ -2863,11 +2879,13 @@ def run_lrx(session: str = "inner", folds=(0, 1, 2, 3, 4), rates=EXT_LRS, encode
                 ran = False
                 s["selection"] = {"error": safe_log.describe(type(e), e.__traceback__)}
             s["smoke_checks"] = _ext_smoke_checks(by_rate, jobs, force_invalid, s["replay"], ran, (s["selection"].get("environment") or {}))
+            s["smoke_skipped_step_share"] = {key: {f"fold_{b['fold']}": ((b.get("ext") or {}).get("run") or {}).get("skipped_step_share")
+                                                   for b in us.values()} for key, us in by_rate.items()}
             s["smoke_passed"] = bool(all(v for k, v in s["smoke_checks"].items() if k.startswith("c") and v is not None))
             write_all(status)
             if not ran:
                 raise N11Error("the selection step failed on the smoke output")
-    keep = ("status", "smoke_passed", "smoke_checks", "errors", "session", "rates", "folds", "smoke", "test_overrides",
+    keep = ("status", "smoke_passed", "smoke_checks", "smoke_skipped_step_share", "errors", "session", "rates", "folds", "smoke", "test_overrides",
             "processes", "stop_flag", "swapped",
             "runs_missing", "out_of_time", "start_check", "replay", "overview", "selection", "cache_copy", "environment",
             "validation_table", "seconds", "note")
@@ -2907,13 +2925,19 @@ def _mean4(sc: dict) -> float:
     return round(float(np.mean([round(float(v), DECIMALS) for v in sc.values()])), DECIMALS)
 
 
+EXT_D_CONVENTION = ("d = the mean over the folds of the differences of the 4-decimal fold scores, rounded to 4 decimals "
+                    "(as the keep rule); mean_a and mean_b are shown rounded, so their difference can be 0.0001 off d")
+
+
 def ext_compare(a: dict, b: dict) -> dict:
     """compare(A, B) of Rule D, for two rates that both have a mean (a, b: {fold: end score}, the same folds).
-    d = mean(A) - mean(B) at 4 decimals. LOWER: d < -0.005 and A is lower in at least 4 folds. HIGHER:
-    d > 0.005 and A is higher in at least 4 folds. BAND: |d| <= 0.005. SPLIT: anything else."""
+    d = mean(A) - mean(B) at 4 decimals, by EXT_D_CONVENTION (the keep rule's way, n11.decision): the mean
+    over the folds of the differences of the 4-decimal fold scores, then rounded to 4 decimals. LOWER:
+    d < -0.005 and A is lower in at least 4 folds. HIGHER: d > 0.005 and A is higher in at least 4 folds.
+    BAND: |d| <= 0.005. SPLIT: anything else."""
     folds = sorted(a)
     ma, mb = _mean4(a), _mean4(b)
-    d = _e4(ma) - _e4(mb)
+    d = _e4(float(np.mean([round(round(float(a[k]), DECIMALS) - round(float(b[k]), DECIMALS), DECIMALS) for k in folds])))
     lower = [k for k in folds if _e4(a[k]) < _e4(b[k])]
     higher = [k for k in folds if _e4(a[k]) > _e4(b[k])]
     band = _e4(EXT_BAND)
@@ -2935,16 +2959,20 @@ def ext_rule_d(end: dict, mid: float = EXT_LRS[0], upper: float = EXT_LRS[1], up
     upper_invalid: at least one run of U was invalid. reasons: {rate: why it has no mean}.
     c1 = compare(mid, base) or NONE; cur = mid if c1 is HIGHER, else base; c2 = compare(U, cur), or UNSTABLE
     / NOMEAN if U has no mean. The first line of the declared list that fits gives the words. r* = U if c2
-    is HIGHER, else cur. "optimum" is the rate the words name as the grid optimum (lines 4, 8, 10), else None."""
+    is HIGHER, else cur. "optimum" is the rate the words name as the grid optimum (lines 4, 8, 10), else None.
+    The sentence every line adds after a swap is its own field, words_swap, and a reason longer than
+    EXT_REASON_MAX characters is replaced by a pointer: no string can pass the summaries' 200 characters."""
     t = _lr_text
-    why = {float(k): v for k, v in (reasons or {}).items()}
+    why = {float(k): (v if len(str(v)) <= EXT_REASON_MAX else "several causes: see rule_d.reasons") for k, v in (reasons or {}).items()}
     full = {float(lr): sc for lr, sc in end.items() if len(sc) == n_folds and all(v is not None for v in sc.values())}
     out: dict = {"means": {_lr_key(lr): _mean4(sc) for lr, sc in sorted(full.items())}, "mid": float(mid), "upper": float(upper),
-                 "c1": None, "c2": None, "cur": None, "r_star": None, "optimum": None, "compare": {}}
+                 "c1": None, "c2": None, "cur": None, "r_star": None, "optimum": None,
+                 "compare": {"convention": EXT_D_CONVENTION}}
+
+    out["words_swap"] = (None if swapped_from is None else
+                         f"{t(swapped_from)} was unstable in folds 0 and 1 and was not run in the other three")
 
     def done(line: int, words: str, optimum=None):
-        if swapped_from is not None:
-            words += f"; {t(swapped_from)} was unstable in folds 0 and 1 and was not run in the other three"
         out.update({"line": {"k": line}, "words": words, "optimum": optimum})
         return out
 
@@ -3081,6 +3109,8 @@ def selection_ext(ext_units: dict, it3_units: dict | None = None, stop_flag: dic
     A session with test overrides is refused unless smoke (then the replay and the environment do not
     block: no score of a smoke run means anything). Returns the record with its time and sha256."""
     ref = json.loads(json.dumps(reference if reference is not None else EXT_REF))
+    if smoke:  # a smoke run's files hold 32 studies per fold: no interval, and iteration 3's file is not opened
+        n_boot = 0
     if not ext_units:
         raise ValueError("select: no unit of the extension found: attach the inner session's output")
     st = {key: _load_state(ud) for key, ud in ext_units.items()}
@@ -3256,11 +3286,13 @@ def selection_ext(ext_units: dict, it3_units: dict | None = None, stop_flag: dic
             parts.append(f"no unit for {_folds_text(absent)}")
         return "; ".join(parts) or "not finished"
 
-    swapped = any(math.isclose(lr, EXT_SWAP_LR) for lr in new) and any(math.isclose(lr, EXT_LRS[1]) for lr in new)
+    own = {float(key) for (key, _), b in st.items() if str(b.get("session")) not in {str(x) for x in describe}}
+    swapped = any(math.isclose(lr, EXT_SWAP_LR) for lr in own) and any(math.isclose(lr, EXT_LRS[1]) for lr in own)
     upper = EXT_SWAP_LR if swapped else EXT_LRS[1]
     u_invalid = any(v["run"].get("status") == "invalid" for (key, _), v in info.items() if math.isclose(float(key), upper))
-    rd = ext_rule_d(counted, EXT_LRS[0], upper, u_invalid, {lr: reason(lr) for lr in (EXT_LRS[0], upper)},
-                    EXT_LRS[1] if swapped else None, base)
+    why_no_mean = {lr: reason(lr) for lr in (EXT_LRS[0], upper)}
+    rd = ext_rule_d(counted, EXT_LRS[0], upper, u_invalid, why_no_mean, EXT_LRS[1] if swapped else None, base)
+    rd["reasons"] = {_lr_key(lr): v.split("; ") for lr, v in why_no_mean.items() if _lr_key(lr) not in rd["means"]}
     rd["label"] = None
     if blocked and blocked[0] in ("replay_gap_above_tolerance", "no_replay_record", "stop_flag"):
         rd["label"] = "inconclusive: reused and new scores cannot be compared at 0.005"
