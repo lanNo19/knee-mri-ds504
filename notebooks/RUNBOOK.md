@@ -441,6 +441,73 @@ The decision (Claude, outside Kaggle, from inner scores only; no test-fold numbe
     (units on the floor and above it). The graph and both tables go on a backup slide only.
 11. No outcome changes a model, reruns the head search or computes a test-fold number.
 
+## Slice-count check (it2c; added after the results)
+
+Declaration: it2c_slice_count_r2.md in the planning folder (r2, after review r1), written before any of
+these runs. Code: knee.nb.n13s, a new module (tests: tests/test_n13_slices.py). n13.py is unchanged.
+The five arms run at commit ecf264f. The later commit changes only the local decide step.
+Finding behind it: the proposal promised a search over the slice count and it was never searched; every
+model reads 32 slices per plane. Question: does the head, at its chosen settings, score lower on inner
+validation when it reads fewer of the 32 cached slices per plane?
+
+Each arm fits, per unit, the unit's chosen Stage A configuration at its chosen batch size on its inner
+folds, as arm bc does (seed 0, 30 epochs, patience 5). Only the slices the head reads differ: s32 reads
+all 32 (the base; it repeats bc), s16 positions 1, 3, ..., 31, s8 positions 2, 6, ..., 30, s4 positions
+4, 12, 20, 28, and s16b the 16 positions s16 leaves out (0, 2, ..., 30; descriptive only, no verdict).
+No arm refits on an outer training set, predicts a test fold or writes a unit folder.
+
+Rules for the five notebooks:
+1. Create each notebook as a fork of knee-n13-bc (CPU, image 20261117-122508). Keep "Pin to
+   original environment". The inputs stay as they are. Then replace the COMMIT line and replace cell 2.
+2. Cell 1 is the usual one (the pip install from GitHub), so Internet is On. Its first line, the same
+   in all five: `COMMIT = "ecf264fcc11b780e53940b29de86e5a0fc512ae2"`. A fork keeps the old COMMIT
+   line: replace it. Check after the run: knee_commit in each summary equals it.
+3. Accelerator None (CPU). A GPU session is refused by the code.
+4. Inputs, exactly these four, as knee-n13-bc: knee-n0, knee-n5, knee-n3-r and knee-n6a. Nothing else.
+5. Cell 2 is the exact text of the table below. "s16" and "s16b" look alike: read the arm name twice.
+6. The five run at the same time. budget_h is the soft stop of a session: after it no inner fit
+   starts, a running fit ends with its epoch, and the session ends with status "partial" and every
+   finished unit in its summary. Latest start 19:30; a session that starts late gets a smaller budget_h.
+7. A worker crash is not retried inside the session. Every unit still queued is then listed in
+   units_missing with error "worker crashed". Do not restart the session.
+8. Never attach an output of these arms to N7, N9 or N10. They hold no unit folder.
+
+| Notebook | Accelerator | Inputs | Cell 2 | Expected time | Pass |
+|---|---|---|---|---|---|
+| knee-n13-s32 | None (CPU) | knee-n0, knee-n5, knee-n3-r, knee-n6a | `from knee.nb import n13s; n13s.run_slices("s32", budget_h=4.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | about 40 min (bc took 36 min) | STEP n13_s32: OK; status "ok"; all_units_ok and leakage_assertion_passed true; added_after_results, test_overrides and chosen_ref_checked true; units_finished holds 10 units and units_missing none; settings.config.slices 32 and slice_positions "0,1,...,31"; each unit ok with config.batch_size equal to batch_chosen, step_ratio 1.0, schedule_epochs 30, patience 5, seed 0, device cpu, slices.config.slices 32; environment present; no head.pt and no predictions.csv in the output |
+| knee-n13-s16 | None (CPU) | the same | `from knee.nb import n13s; n13s.run_slices("s16", budget_h=4.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | under 40 min | as knee-n13-s32, but STEP n13_s16, slices 16 and slice_positions "1,3,...,31" |
+| knee-n13-s16b | None (CPU) | the same | `from knee.nb import n13s; n13s.run_slices("s16b", budget_h=4.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | under 40 min | as knee-n13-s32, but STEP n13_s16b, slices 16 and slice_positions "0,2,...,30" |
+| knee-n13-s8 | None (CPU) | the same | `from knee.nb import n13s; n13s.run_slices("s8", budget_h=4.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | under 40 min | as knee-n13-s32, but STEP n13_s8, slices 8 and slice_positions "2,6,...,30" |
+| knee-n13-s4 | None (CPU) | the same | `from knee.nb import n13s; n13s.run_slices("s4", budget_h=4.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})` | under 40 min | as knee-n13-s32, but STEP n13_s4, slices 4 and slice_positions "4,12,...,28" |
+
+A session that ends "partial": report it. Its missing units can run in knee-n13-<arm>-r: a fork of the
+arm's notebook, the same COMMIT, the same cell 2 plus `rerun=1, folds=(<k>,), encoders=("<encoder>",)`,
+on the same image. An encoder with fewer than 5 finished folds in an arm (or in s32) gets no verdict
+for that arm.
+
+The decision (Claude, outside Kaggle, from inner scores only; no test-fold number exists for these arms):
+1. Download the five agg_n13_<arm>_inner.json files (and each rerun's) into a new directory. The
+   batch-floor check's agg_n13_bc_inner.json gives the rerun check; iteration 2's
+   agg_n13_base0_inner.json and agg_n13_null_inner.json give s.
+2. `n13s.decide_slices(s32, s16, s8, s4, bc, base0, null, s16b=s16b)`: each argument a summary dict or
+   the list [original, rerun, ...]; s16, s8, s4, s16b and bc may be None. It is a pure function. The
+   planning folder's it2c_decision/run_decide_slices.py calls it and writes agg_n13_slices_decide.json
+   through the aggregate checker: the slices read sit under "config" keys.
+3. A status with no verdict at all, checked in this order on every arm summary given:
+   "no_base" (s32 did not run); "leakage_check_failed"; "chosen_ref_not_checked"; "commit_mismatch"
+   (more than one knee_commit, or not ecf264f); "env_mismatch" (the arms ran on different images).
+4. status "partial": at least one encoder and arm has "no verdict". status "decided": six verdicts
+   (s16, s8, s4 for each encoder), each "fewer slices cost", "fewer slices scored higher" or
+   "no difference shown": diff = mean over the 5 folds of (arm minus s32) at 4 decimals; cost when
+   diff < -0.005 and lower in at least 4 of 5 folds; higher when diff > 0.005 and higher in at least
+   4 of 5 folds; a fold at 0.0000 is neither; a tie at 0.0050 is inside "no difference shown".
+5. Descriptive, never in a verdict: rerun_check (s32 minus bc per unit; a unit above 0.0005 is listed
+   and the slide says so), position_effect (s16b minus s16 and s16b minus s32 per encoder), units,
+   mean_inner_score and median_best_epoch.
+6. The slide sentences: `n13s.slice_slide_sentences(record)`. One per encoder and arm, then the summary
+   line, then the rerun-noise sentence if any. No sentence names a count as the one to use.
+7. No outcome changes a model or computes a test-fold number. No submission.
+
 ## If a run fails
 
 The summary block shows `STEP <name>: FAILED - <ErrorType> at <file>:<line> in <function>()`.
