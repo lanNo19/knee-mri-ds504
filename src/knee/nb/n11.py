@@ -4012,3 +4012,282 @@ def dev_lrx(decision_record=None, selection=None, root=None, n_boot: int = N_BOO
 
 
 dev_extension = dev_lrx  # the name the declaration's code list uses
+
+
+# ================================================================ the edge point (it3_lr_edge_r1)
+# Fold 0 only, above the extension's top grid point. The GPU step is run_lrx at the inner session's commit
+# with nothing changed: run_lrx("edge", folds=(0,), rates=EDGE_LRS, swap=None, budget_h=2.0, expect=...).
+# The CPU step below reads aggregates only (the edge session's per-rate files and the inner session's
+# per-rate files) and writes the words fixed by the declaration. It chooses nothing: no pick, no fit and no
+# model changes, and no test-fold file exists for these rates. Additions only: nothing above is changed.
+
+EDGE_SESSION = "edge"
+EDGE_TOP = 5.12e-3  # factor 4 above 1.28e-3: the question's rate
+EDGE_MID = 2.56e-3  # the second GPU's rate (off the factor-4 grid; declared in it3_lr_edge_r1)
+EDGE_LRS = (EDGE_MID, EDGE_TOP)
+EDGE_FOLD = 0
+EDGE_BASE = EXT_LRS[1]  # 1.28e-3, fold 0's pick in the signed selection record
+EDGE_PLAN = "it3_lr_edge_r1"
+EDGE_SCOPE = "edge point of the encoder learning-rate search, DINOv2 B-lite, fold 0 only: added after the results (R10)"
+# commits at which everything run_lrx reaches is the inner session's text (2f5b27a; 79e95c5 only added lines
+# after select_lrx and changed n10.py, which run_lrx does not import): tests/test_n11x_edge.py checks it
+EDGE_COMMITS = ("2f5b27aeb7de774dc5729be42d94bf1e7dc29f1c", "79e95c5320e83442cbbc6ea42b0ea31a5b443082")
+# fold 0's end-of-schedule inner validation scores of the reused rates (8e-5 from iteration 3; 3.2e-4 and
+# 1.28e-3 from knee-n11x-inner v1, commit 2f5b27a; n11x_numbers.md; agg_n11x_select.json, sha256 below)
+EDGE_REF = {"source": "knee-n11x-inner v1 (2f5b27a) and iteration 3 (095c91f), fold 0, end of schedule, 4 decimals",
+            "end_val_macro_auc": {"8e-05": 0.7246, "0.00032": 0.7471, "0.00128": 0.7614},
+            "pick": EDGE_BASE,
+            "selection_sha256": "1fa6c2be3843bf499823bec2f90916eedf81fc854a297201d1e3ebd9755d078c"}
+EDGE_NOTE = ("descriptive: inner validation, fold 0 only (one site), one seed; a new rate is never eligible; fold 0's pick, "
+             "the refit model and the submission are not changed")
+
+
+def _edge_files(pattern: str, root=None) -> dict:
+    """{lr key: the parsed per-rate aggregate} for agg_<pattern>_<lr key>.json in the attached outputs (or in
+    root). Other files of the pattern (the session file, this step's own file) are left out; one rate in
+    two files is refused."""
+    out: dict = {}
+    pre = f"agg_{pattern}_"
+    for p in paths.glob_outputs(f"{pre}*.json", Path(root) if root else None):
+        key = p.name[len(pre):-len(".json")]
+        try:
+            float(key)
+        except ValueError:
+            continue
+        if key in out:
+            raise ValueError(f"edge: two files for rate {key}: attach each session once")
+        out[key] = json.loads(p.read_text())
+    return out
+
+
+def _edge_unit(f: dict) -> dict:
+    units = f.get("units")
+    if not isinstance(units, dict):
+        raise ValueError("edge: a per-rate file holds no unit blocks (write_error): read its state files instead")
+    return units.get(_unit(DINO, EDGE_FOLD)) or {}
+
+
+def _edge_class(run: dict, start: dict, base: float) -> tuple[str, float | None]:
+    """A new rate's class in fold 0 against `base` (a score): HIGHER / LOWER (more than 0.005 at 4 decimals),
+    BAND, or why it has no class (NO_RUN, START_FAILED, UNSTABLE, UNFINISHED)."""
+    if not run:
+        return "NO_RUN", None
+    if run.get("status") == "invalid":
+        return "UNSTABLE", None
+    if not (run.get("finished") and run.get("valid") and run.get("val_macro_auc") is not None):
+        return "UNFINISHED", None
+    if not start.get("passed"):
+        return "START_FAILED", None
+    d = _e4(run["val_macro_auc"]) - _e4(base)
+    return ("HIGHER" if d > _e4(EXT_BAND) else "LOWER" if d < -_e4(EXT_BAND) else "BAND"), round(d / 10 ** DECIMALS, DECIMALS)
+
+
+def edge_words(scores: dict, classes: dict, unstable: dict | None = None) -> dict:
+    """The declared words (it3_lr_edge_r1, section 3) for fold 0. scores: {rate: end score} of every rate
+    that counts (8e-5, 3.2e-4, 1.28e-3 and each new rate that finished, is valid and passed its start check);
+    classes: {new rate: class} of every new rate that was asked for; unstable: {new rate: (twelfth, reason)}.
+
+    p, the best point tested, by Rule S's step from 1.28e-3 (fold 0's pick) over the counted new rates in
+    rising order: a rate more than 0.005 above the current p becomes p. Then the first line that fits:
+    1 no new rate counts and 5.12e-3 is not unstable: not answered. 2 no new rate counts, 5.12e-3 unstable:
+    closed by instability above 1.28e-3. 3 p is the highest counted rate above 1.28e-3: still rising (or, with
+    5.12e-3 unstable, closed by instability above p). 4 every counted rate above p is lower by more than
+    0.005: located between the rate below p and the lowest rate above p. 5 the lowest rate above p is within
+    0.005: flat above p (a later rate lower by more than 0.005 closes it). 6 otherwise: not monotone."""
+    t = _lr_text
+    sc = {float(k): float(v) for k, v in scores.items()}
+    new = sorted(float(x) for x in classes)
+    counted = [r for r in new if r in sc]
+    grid = {8e-5, EXT_LRS[0], EDGE_BASE, EDGE_TOP}
+    p = EDGE_BASE
+    for r in counted:
+        if _e4(sc[r]) - _e4(sc[p]) > _e4(EXT_BAND):
+            p = r
+    off = [r for r in counted if not any(math.isclose(r, g) for g in grid)]
+    best = "the best grid point" if not off else "the best point tested"
+    above = [r for r in counted if r > p]
+    below = sorted(r for r in sc if r < p and _e4(sc[p]) - _e4(sc[r]) > _e4(EXT_BAND))
+    top_unstable = classes.get(EDGE_TOP) == "UNSTABLE"
+    ins = None
+    if top_unstable:
+        k, why = (unstable or {}).get(EDGE_TOP, (None, "unstable"))
+        ins = f"5.12e-3 was unstable in fold 0 (twelfth {k}: {why})"[:120]
+    elif EDGE_TOP in classes and EDGE_TOP not in sc:
+        ins = f"5.12e-3 has no counted end score in fold 0 ({classes[EDGE_TOP].lower().replace('_', ' ')})"
+
+    def d(a, b):
+        return round((_e4(sc[a]) - _e4(sc[b])) / 10 ** DECIMALS, DECIMALS)
+
+    out = {"best_point_tested": p, "best_point_text": t(p), "counted_new_rates": counted, "words_top": ins}
+    if not counted:
+        if top_unstable:
+            return {**out, "line": {"k": 2}, "words": "above 1.28e-3 closed by instability (warm-up one twelfth, no clipping, "
+                                                       "fp16), not by score; 1.28e-3 stays fold 0's best grid point"}
+        return {**out, "line": {"k": 1}, "words": "not answered: no new rate has a counted end score in fold 0 ("
+                + ", ".join(f"{t(r)} {classes[r].lower().replace('_', ' ')}" for r in new) + ")"}
+    if not above and p > EDGE_BASE:
+        if top_unstable and not math.isclose(p, EDGE_TOP):
+            return {**out, "line": {"k": 3}, "words": f"rises to {t(p)} ({d(p, EDGE_BASE):+.4f} over 1.28e-3); closed by "
+                                                       f"instability above {t(p)}, not by score; {t(p)} is {best}"}
+        return {**out, "line": {"k": 3}, "words": f"still rising: {t(p)} is {d(p, EDGE_BASE):+.4f} over 1.28e-3 in fold 0; "
+                                                   "open edge: fold 0's optimum is at or above it"}
+    lo = t(below[-1]) if below else "the lowest rate"
+    if above and all(_e4(sc[p]) - _e4(sc[r]) > _e4(EXT_BAND) for r in above):
+        return {**out, "line": {"k": 4}, "words": f"fold 0's best rate lies between {lo} and {t(above[0])}; {t(p)} is {best} "
+                                                   f"({t(above[0])} is lower by {d(above[0], p):+.4f})"}
+    if above and abs(_e4(sc[above[0]]) - _e4(sc[p])) <= _e4(EXT_BAND):
+        flat = [r for r in above if abs(_e4(sc[r]) - _e4(sc[p])) <= _e4(EXT_BAND)]
+        lower = [r for r in above if r > flat[-1] and _e4(sc[p]) - _e4(sc[r]) > _e4(EXT_BAND)]
+        if lower and all(r in flat for r in above if r < lower[0]):
+            return {**out, "line": {"k": 5}, "words": f"flat above {t(p)} to {t(flat[-1])} (within 0.005), lower at {t(lower[0])}: "
+                                                       f"fold 0's best rate lies between {lo} and {t(lower[0])}; {t(p)} is "
+                                                       f"{best}, the lower rate of the tie"}
+        if len(flat) == len(above):
+            return {**out, "line": {"k": 5}, "words": f"flat above {t(p)}: {t(flat[-1])} is within 0.005 of it in fold 0 "
+                                                       f"({d(flat[-1], p):+.4f}); {t(p)} stays {best}, the lower rate of the "
+                                                       "tie; the upper side is not closed by score"}
+    return {**out, "line": {"k": 6}, "words": f"not monotone above {t(p)} in fold 0: "
+            + ", ".join(f"{t(r)} {d(r, p):+.4f}" for r in above) + "; no bracket is named"}
+
+
+def edge_record(edge: dict, inner: dict | None = None, reference: dict | None = None, allow_overrides: bool = False) -> dict:
+    """The record of the edge point (it3_lr_edge_r1), from aggregates only. edge: {lr key: the edge session's
+    per-rate file}; inner: {lr key: the inner session's per-rate file} (None: the constants, environment not
+    compared). Refused: a file of another session, of a smoke run or with test overrides (unless
+    allow_overrides, the tests), a fold other than 0, a rate set other than (5.12e-3,) or EDGE_LRS.
+    Status "inconclusive" (no words): no replay record, a replay gap above 0.005, a commit outside
+    EDGE_COMMITS, or reference scores that differ from the inner session's files. Labels (words still given):
+    "across environments", "environment not compared". Signed (time and sha256)."""
+    ref = json.loads(json.dumps(reference if reference is not None else EDGE_REF))
+    if not edge:
+        raise ValueError("edge: no per-rate file of the edge session found (agg_n11x_edge_<lr key>.json)")
+    keys = sorted(edge, key=float)
+    allowed = ([_lr_key(EDGE_TOP)], [_lr_key(x) for x in EDGE_LRS])
+    if keys not in allowed:
+        raise ValueError("edge: the rates are not the declared ones (5.12e-3, or 2.56e-3 and 5.12e-3)")
+    for f in edge.values():
+        if f.get("session") != EDGE_SESSION or f.get("smoke"):
+            raise ValueError('edge: a file is not from the session "edge"')
+        if f.get("test_overrides") and not allow_overrides:
+            raise ValueError("edge: a file was written with test overrides: not a result")
+        if [int(x) for x in f.get("folds") or []] != [EDGE_FOLD]:
+            raise ValueError("edge: the edge session must hold fold 0 only")
+    heads_ = list(edge.values())
+    rec: dict = {"rule": "it3_lr_edge_r1 section 3 (n11.edge_record)", "plan": EDGE_PLAN, "scope": EDGE_SCOPE,
+                 "written_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "added_after_results": True,
+                 "decided_from": "inner validation scores of fold 0 only (R4); no test-fold file exists for these rates",
+                 "note": EDGE_NOTE, "band": EXT_BAND, "fold": EDGE_FOLD, "rates": [float(k) for k in keys],
+                 "reference": ref, "test_overrides": bool(allow_overrides or reference is not None),
+                 "knee_commit": agg.repo_commit()}
+    blocked: list = []
+    commits = sorted({str(f.get("knee_commit")) for f in heads_})
+    rec["edge_commits"] = commits
+    if len(commits) != 1 or commits[0] not in EDGE_COMMITS:
+        blocked.append("unknown_commit")
+    rec["edge_status"] = sorted({str(f.get("status")) for f in heads_})
+    # ---- the replay (one record for the session: the process of 5.12e-3 has it)
+    rp = next((f.get("replay") for f in heads_ if f.get("replay")), None)
+    rec["replay"] = rp
+    if rp is None:
+        blocked.insert(0, "no_replay_record")
+    elif not rp.get("passed") or int(rp.get("fold", -1)) != EDGE_FOLD or not math.isclose(float(rp.get("lr", 0)), EXT_REUSED_LR):
+        blocked.insert(0, "replay_gap_above_tolerance")
+    # ---- reference scores and environment
+    scores = {float(k): float(v) for k, v in ref["end_val_macro_auc"].items()}
+    envs = [f.get("environment") for f in heads_]
+    if inner:
+        differ = []
+        for key in (_lr_key(EXT_LRS[0]), _lr_key(EDGE_BASE)):
+            f = inner.get(key)
+            run = ((_edge_unit(f) if f else {}).get("ext") or {}).get("run") or {}
+            got = run.get("val_macro_auc")
+            if f is None or f.get("session") != "inner" or (f.get("test_overrides") and not allow_overrides) or got is None \
+                    or _e4(got) != _e4(ref["end_val_macro_auc"][key]):
+                differ.append(key)
+        rec["inner"] = {"attached": True, "rates": sorted(inner, key=float), "constants_equal_the_files": not differ,
+                        "constants_that_differ": differ, "knee_commits": sorted({str(f.get("knee_commit")) for f in inner.values()})}
+        if differ:
+            blocked.append("reference_mismatch")
+        envs += [f.get("environment") for f in inner.values()]
+    else:
+        rec["inner"] = {"attached": False, "note": "the reference scores are the constants; the environment is not compared"}
+    if not all(isinstance(x, dict) for x in envs):
+        raise ValueError("edge: a file has no environment record")
+    env_differ = sorted(k for k in set().union(*(x.keys() for x in envs)) if len({json.dumps(x.get(k), sort_keys=True) for x in envs}) > 1)
+    rec["environment"] = {"compared_with_inner_session": bool(inner), "differences": env_differ,
+                          "edge": envs[0]}
+    label = "across environments" if env_differ else None if inner else "environment not compared"
+    # ---- the new runs
+    classes, runs, unstable = {}, {}, {}
+    for key in keys:
+        u = _edge_unit(edge[key])
+        e = u.get("ext") or {}
+        run, start = e.get("run") or {}, e.get("start") or {}
+        cls, diff = _edge_class(run, start, scores[EDGE_BASE])
+        lr = float(key)
+        classes[lr] = cls
+        if cls in ("HIGHER", "LOWER", "BAND"):
+            scores[lr] = float(run["val_macro_auc"])
+        if cls == "UNSTABLE":
+            unstable[lr] = (int((run.get("invalid") or {}).get("k") or 0), str((run.get("invalid") or {}).get("reason") or "invalid"))
+        cfg = u.get("config") or {}
+        steps = cfg.get("steps_inner")
+        rms = e.get("tail_rms_before_training")
+        runs[key] = {"class": cls, "difference_to_1.28e-3": diff, "status": run.get("status", "no run"),
+                     "val_macro_auc": run.get("val_macro_auc"), "quarter_val_macro_auc": run.get("quarter_val_macro_auc"),
+                     "best": run.get("best"), "invalid": run.get("invalid"), "skipped_step_share": run.get("skipped_step_share"),
+                     "train_seconds": run.get("train_seconds"), "curve": run.get("curve"),
+                     "start_check": {"passed": start.get("passed"), "abs_difference": start.get("abs_difference")},
+                     "config": {"micro_batch_studies": cfg.get("micro_batch_studies"), "epochs": cfg.get("epochs"),
+                                "steps_inner": steps, "batch_size": cfg.get("batch_size"), "head_lr": cfg.get("head_lr")},
+                     "tail_rms_before_training": rms,
+                     "largest_move_per_weight": None if steps is None else round(lr * steps * 0.5, 3),
+                     "largest_move_note": "rate x inner steps x 0.5 (mean schedule factor): a worst case, every step one way"}
+    rec["runs"] = runs
+    # ---- the words
+    rec["scores"] = {_lr_key(lr): v for lr, v in sorted(scores.items())}
+    if blocked:
+        rec.update({"status": "inconclusive", "inconclusive_because": blocked, "line": None, "words": None,
+                    "words_as_shown": "inconclusive: the edge run and the inner session cannot be compared at 0.005 ("
+                                      + blocked[0].replace("_", " ") + ")"})
+    else:
+        w = edge_words(scores, classes, unstable)
+        rec.update({"status": "described", "inconclusive_because": [], **w,
+                    "words_as_shown": w["words"] if not label else f"{w['words'][:170]} [{label}]"})
+    rec["label"] = label
+    rec["replay_max_abs_gap"] = None if rp is None else rp.get("max_abs_gap")
+    rec["band_not_well_above_the_noise"] = None if rp is None else bool(rp.get("above_half_the_band"))
+    # ---- the curves (reported, never used by a rule)
+    curve_words = []
+    for key, r in runs.items():
+        b, end = r.get("best"), r.get("val_macro_auc")
+        if r["class"] in ("HIGHER", "LOWER", "BAND") and b and end is not None and int(b["k"]) <= TWELFTHS // 2 \
+                and _e4(b["val_macro_auc"]) - _e4(end) > _e4(EXT_BAND):
+            curve_words.append(f"at {_lr_text(float(key))} fold 0 peaks at twelfth {b['k']} ({b['val_macro_auc']:.4f}) and ends "
+                               f"{end:.4f}: a shorter schedule may favour it; not tested")
+    rec["words_curve"] = curve_words
+    rec["curve_note"] = "best twelfth and curves: reported, never used by a rule; " + CURVE_NOTE
+    rec["pick"] = {"fold_0": EDGE_BASE, "changed": False, "selection_sha256": ref.get("selection_sha256"),
+                   "note": "a new rate is never eligible: fold 0's pick, the refit model and the submission stay"}
+    return _signed(rec)
+
+
+def edge_lrx(root=None, quiet: bool = True, budget_h: float = 0.5, reference: dict | None = None,
+             allow_overrides: bool = False) -> dict:
+    """The CPU step of the edge point. Attached (or in root): the edge session's output (agg_n11x_edge_<lr
+    key>.json) and the inner session's (agg_n11x_inner_<lr key>.json; without it the reference scores are the
+    constants and the label is "environment not compared"). Aggregates only: no state file, no private
+    file, no test-fold file. Writes agg_n11x_edge_words.json, the signed record."""
+    name = f"{EXT_NAME}_{EDGE_SESSION}_words"
+    cfg = {"plan": EDGE_PLAN, "test_overrides": bool(allow_overrides or reference is not None)}
+    rec: dict = {}
+    with common.notebook(name, cfg, quiet=quiet, budget_h=budget_h):
+        edge = _edge_files(f"{EXT_NAME}_{EDGE_SESSION}", root)
+        inner = _edge_files(f"{EXT_NAME}_inner", root) or None
+        rec = edge_record(edge, inner, reference=reference, allow_overrides=allow_overrides)
+        agg.write(name, rec)
+    keep = ("status", "words_as_shown", "words", "line", "label", "inconclusive_because", "best_point_text", "words_top",
+            "words_curve", "replay_max_abs_gap", "band_not_well_above_the_noise", "scores", "environment", "edge_commits",
+            "pick", "note", "sha256", "written_at_utc")
+    common.summary({k: rec.get(k) for k in keep})
+    return rec

@@ -842,3 +842,34 @@ python scripts/plot_lrx.py --it3 agg_n11_a.json agg_n11_b.json --inner agg_n11x_
 ```
 
 Add `--refine agg_n11x_refine.json` if the refinement point ran. Written: g1_steps_to_the_optimum.png, g2_fold0.png, g2_all_folds.png. G1: quarter mark, end of schedule and (dashed, "reported, not used") the best twelfth of the mean curve; thin lines per fold, the thick mean only over rates with a mean by Rule D; filled markers = each fold's pick; crosses = invalid runs. G2: training and validation loss per rate for fold 0's pick and its grid neighbours, the validation AUC per twelfth under each panel.
+
+## Edge point N11x-edge (fold 0 above 1.28e-3; it3_lr_edge_r1)
+
+One GPU session on Dinmukhammed's account (teammate card: knee_plan/teammate_gpu_card.md), then one CPU step. Fold 0 only, rates 2.56e-3 and 5.12e-3, the inner session's protocol (start check, the replay of 8e-5 to the quarter mark in the 5.12e-3 process, seed 0, the full schedule). Descriptive only: no pick, no fit, no model and no submission changes. Every number is "added after the results" (R10). The text of it3_lr_edge_r1.md is in the plan before the run (R3).
+
+| Notebook | Accelerator | Internet | Inputs |
+|---|---|---|---|
+| knee-n11x-edge (Dinmukhammed's account) | GPU T4 x2 | On | Outputs of lanno19's knee-n0, knee-n3-r, knee-n4-sagittal, knee-n4-coronal, knee-n4-axial, knee-n5 and knee-n6a (shared with him). Nothing of iteration 3 or of the extension. No competition data |
+| knee-n11x-edge-words (lanno19, or locally) | None (CPU) | On | Outputs of knee-n11x-edge (shared with lanno19) and knee-n11x-inner. Nothing else |
+
+Cell 1 of knee-n11x-edge: the cell of every notebook with
+
+```python
+COMMIT = "2f5b27aeb7de774dc5729be42d94bf1e7dc29f1c"
+```
+
+(the inner session's commit; nothing run_lrx reaches differs at 79e95c5: tests/test_n11x_edge.py). Cell 2:
+
+```python
+from knee.nb import n11; n11.run_lrx("edge", folds=(0,), rates=(2.56e-3, 5.12e-3), swap=None, budget_h=2.0, expect={"n0_studies": "371cbe04", "n3_folds": "670ddcc8", "n5_index": "4ccecd01"})
+```
+
+Expected time: about 1.2 h (bound 1.4 h); the watchdog stops the step at 2.2 h. GPU 0 runs 2.56e-3, GPU 1 runs the replay and then 5.12e-3. The step refuses to start without two GPUs. Writes agg_n11x_edge.json, agg_n11x_edge_0.00256.json, agg_n11x_edge_0.00512.json and run.json.
+
+CPU step (COMMIT = the commit of branch it3-lrx-edge that holds edge_lrx):
+
+```python
+from knee.nb import n11; n11.edge_lrx()
+```
+
+It reads the per-rate aggregates only (agg_n11x_edge_<lr key>.json, agg_n11x_inner_<lr key>.json) and writes agg_n11x_edge_words.json (signed). Locally: KNEE_INPUT=<folder with the agg files> KNEE_WORKING=<out> python -c "from knee.nb import n11; n11.edge_lrx()". What to read: status ("described" or "inconclusive" with inconclusive_because), words_as_shown, words_top, label, words_curve, runs.<lr key> (class, difference_to_1.28e-3, best, curve), replay_max_abs_gap, pick.changed false.
