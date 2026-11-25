@@ -105,7 +105,9 @@ LIMITS = ["the folds share most training studies and two folds share a validatio
 SCOPE = "Stage B-lite on all five folds, iteration 3 (plan section 12): added after the results (R10)"
 PLAN = "iteration plan section 12 (it3_amendment_r3)"
 DEV_ARMS = ("frozen0", "head_only_seed_0", "b_lite")  # the arms dev() and dev_findings() compare
-FINDINGS_NOTE = "12 intervals are shown without a multiplicity correction; they describe, they decide nothing (R8)"
+FINDINGS_NOTE = ("the intervals (12 findings x 2 differences per encoder) are shown without a multiplicity correction; "
+                 "they describe, they decide nothing (R8)")
+TOO_FEW = "too few to show"  # a finding with 1 to 4 positive (or negative) studies: only its rounded count is written
 FINDING_PAIRS = {"meniscus_pair": ("Medial Meniscus", "Lateral Meniscus"), "oa_pair": ("Medial OA", "Lateral OA")}
 CURVE_NOTE = "training loss: dropout on, over the twelfth; validation loss: dropout off, at the twelfth's end"
 
@@ -2099,7 +2101,9 @@ def _findings_tag() -> dict:
 
 
 def _side_of_0(ci: dict) -> str:
-    if ci.get("lo") is None or ci.get("hi") is None:
+    """The side of 0 an interval lies on; "undefined" when it has no ends or a draw had no pair (valid_share
+    under 1: the interval then describes only the draws that happened to hold both classes)."""
+    if ci.get("lo") is None or ci.get("hi") is None or not (ci.get("valid_share") or 0.0) >= 1.0:
         return "undefined"
     return "above_0" if ci["lo"] > 0 else "below_0" if ci["hi"] < 0 else "includes_0"
 
@@ -2137,11 +2141,18 @@ def findings_block(A: dict, n_boot: int = N_BOOT, seed: int = 0) -> dict:
     for j, name in enumerate(FINDINGS):
         used = [k for i, k in enumerate(folds) if np.isfinite(per_fold["frozen0"][j, i])]
         val = {a: {"fold_stratified_auc": fs[a][j], "mean_of_fold_aucs": mean_folds(a, j)} for a in DEV_ARMS}
-        b = {"positives": agg.count(int((Y[:, j] == 1).sum())), "folds": used, "n_folds": len(used),
-             **{a: {k: _r(v) for k, v in val[a].items()} for a in DEV_ARMS}}
+        n_pos, n_neg = int((Y[:, j] == 1).sum()), int((Y[:, j] == 0).sum())
+        # as metrics.rates(suppress_small=True): with 1 to 4 studies in a class, an AUC, the share of valid
+        # draws or the list of folds would give the exact count back, so only the rounded count is written
+        few = 1 <= n_pos <= 4 or 1 <= n_neg <= 4
+        b = {"label": DEV_LABEL, "positives": agg.count(n_pos), "folds": None if few else used,
+             "n_folds": None if few else len(used),
+             **{a: {k: None if few else _r(v) for k, v in val[a].items()} for a in DEV_ARMS}}
+        if few:
+            b["suppressed"] = TOO_FEW
         for key, base in (("b_lite_minus_frozen0", "frozen0"), ("b_lite_minus_head_only", "head_only_seed_0")):
-            ci = _pct(col["b_lite"][:, j] - col[base][:, j])
-            b[key] = {**{k: _r(val["b_lite"][k] - val[base][k]) for k in val["b_lite"]},
+            ci = {"lo": None, "hi": None, "valid_share": None} if few else _pct(col["b_lite"][:, j] - col[base][:, j])
+            b[key] = {**{k: None if few else _r(val["b_lite"][k] - val[base][k]) for k in val["b_lite"]},
                       "fold_stratified_interval": ci, "interval_side": _side_of_0(ci)}
         side[name] = b["b_lite_minus_frozen0"]["interval_side"]
         out_f[name] = b
@@ -2174,7 +2185,9 @@ def dev_findings(decision_record=None, root=None, n_boot: int = N_BOOT, seed: in
     Per encoder and finding, for frozen0, head-only seed 0 and b-lite: the fold-stratified AUC (pairs inside
     one test fold) and the mean over folds of the fold's AUC (a fold where the finding lacks a class is left
     out; "folds" lists the folds used); b-lite minus each baseline, with dev()'s study-bootstrap interval of
-    the fold-stratified difference; the rounded number of positive studies. Per encoder: each fold's macro
+    the fold-stratified difference; the rounded number of positive studies. A finding with 1 to 4 positive
+    or negative studies gets its rounded count and nulls. An interval with a draw that had no pair has the
+    side "undefined". Per encoder: each fold's macro
     AUC per arm, and which findings' intervals of b-lite minus frozen0 lie above 0, below 0 or include 0.
     Writes agg_n11_dev_findings.json (aggregates only). Descriptive: nothing is decided from it (R8)."""
     dec = _decision(decision_record, root)

@@ -1,7 +1,8 @@
 """N11's per-finding description of the S2 test folds (n11.dev_findings), on hand-made prediction files.
 Tested: dev()'s gate (no decision record, an edited record, a changed prediction file); the per-finding AUCs
 against scikit-learn; the mean of the 12 findings against dev()'s macro; each fold's macro against dev()'s
-mean; the summary lists; the written file against agg's checks, with a finding that has under 5 positives."""
+mean; the summary lists; the written file against agg's checks; a finding with 1 to 4 positive or negative studies
+is written as its rounded count and nulls; an interval with a draw that had no pair has no side."""
 from __future__ import annotations
 
 import json
@@ -118,29 +119,29 @@ def test_per_finding_aucs_equal_sklearn(made):
                     num, den = num + a * pos * neg, den + pos * neg
                     per_fold.append(a)
                     used.append(k)
+                if j == RARE:  # one positive study in all: nothing but the rounded count (see the last test)
+                    assert F[name][arm] == {"fold_stratified_auc": None, "mean_of_fold_aucs": None}
+                    continue
                 assert F[name][arm]["fold_stratified_auc"] == pytest.approx(num / den, abs=6e-5), (e, arm, name)
                 assert F[name][arm]["mean_of_fold_aucs"] == pytest.approx(np.mean(per_fold), abs=6e-5)
                 assert F[name]["folds"] == used and F[name]["n_folds"] == len(used)
-        assert F[FINDINGS[RARE]]["folds"] == [0] and F[FINDINGS[GAP]]["folds"] == [0, 2, 3, 4]
+        assert F[FINDINGS[GAP]]["folds"] == [0, 2, 3, 4]
         assert F[FINDINGS[THIN]]["n_folds"] == 5
         for name in FINDINGS:
+            if name == FINDINGS[RARE]:
+                continue
             for key, base in (("b_lite_minus_frozen0", "frozen0"), ("b_lite_minus_head_only", "head_only_seed_0")):
                 for m in ("fold_stratified_auc", "mean_of_fold_aucs"):
                     assert F[name][key][m] == pytest.approx(F[name]["b_lite"][m] - F[name][base][m], abs=2e-4)
                 ci = F[name][key]["fold_stratified_interval"]
                 side = F[name][key]["interval_side"]
                 assert side == ("above_0" if ci["lo"] > 0 else "below_0" if ci["hi"] < 0 else "includes_0")
-                if name != FINDINGS[RARE]:  # one positive study: a draw without it has no pair
-                    assert ci["valid_share"] == 1.0 and ci["lo"] <= F[name][key]["fold_stratified_auc"] <= ci["hi"]
-        assert F[FINDINGS[RARE]]["b_lite_minus_frozen0"]["fold_stratified_interval"]["valid_share"] < 1.0
+                assert ci["valid_share"] == 1.0 and ci["lo"] <= F[name][key]["fold_stratified_auc"] <= ci["hi"]
 
 
 def test_macro_of_the_findings_and_fold_macros_equal_dev(made):
     for e in MAIN:
         r, d = made.s["encoders"][e], made.dev["encoders"][e]
-        for arm in ARMS:
-            vals = [r["findings"][f][arm]["fold_stratified_auc"] for f in FINDINGS]
-            assert np.mean(vals) == pytest.approx(d[arm]["fold_stratified_macro_auc"], abs=6e-5)
         pf = r["per_fold_macro"]
         assert [k for k in pf if k.startswith("fold_")] == [f"fold_{k}" for k in range(5)]
         for k in range(5):
@@ -167,6 +168,9 @@ def test_fold_macros_on_complete_folds_average_to_devs_mean(tmp_path, monkeypatc
     d = n11.dev(rec, root=root, n_boot=10, side_auc=False, quiet=True)
     assert set(s["encoders"]) == {MAIN[1]} and s["status"] == "ok"
     pf = s["encoders"][MAIN[1]]["per_fold_macro"]
+    for arm in ARMS:  # the macro of the 12 findings is dev()'s macro
+        vals = [s["encoders"][MAIN[1]]["findings"][f][arm]["fold_stratified_auc"] for f in FINDINGS]
+        assert np.mean(vals) == pytest.approx(d["encoders"][MAIN[1]][arm]["fold_stratified_macro_auc"], abs=6e-5)
     for arm in ARMS:
         assert np.mean([pf[f"fold_{k}"][arm] for k in range(5)]) == pytest.approx(d["encoders"][MAIN[1]][arm]["mean_of_fold_macros"], abs=6e-5)
     assert np.mean([pf[f"fold_{k}"]["b_lite_minus_frozen0"] for k in range(5)]) == pytest.approx(
@@ -183,7 +187,8 @@ def test_summary_groups_labels_and_agg_checks(made):
     assert not agg.UID_RE.search(made.text) and "t0_" not in made.text and "resolved" not in made.text
     tag = {"label": n11.DEV_LABEL, "descriptive": True, "added_after_results": True, "note": n11.FINDINGS_NOTE}
     assert n11.DEV_LABEL == "development: these studies were test studies in iteration 1; likely optimistic"
-    assert n11.FINDINGS_NOTE == "12 intervals are shown without a multiplicity correction; they describe, they decide nothing (R8)"
+    assert n11.FINDINGS_NOTE == ("the intervals (12 findings x 2 differences per encoder) are shown without a multiplicity "
+                                 "correction; they describe, they decide nothing (R8)")
     assert tag.items() <= payload.items() and payload["arms"] == list(ARMS) and payload["n_boot"] == 40
     groups = n11.finding_groups()
     assert groups["meniscus_pair"] == ["Medial Meniscus", "Lateral Meniscus"] and groups["oa_pair"] == ["Medial OA", "Lateral OA"]
@@ -194,7 +199,13 @@ def test_summary_groups_labels_and_agg_checks(made):
         for block in (r, r["per_fold_macro"], r["summary"]):
             assert tag.items() <= block.items()
         F = r["findings"]
-        assert F[FINDINGS[RARE]]["positives"] == "<5"  # one positive study in all: suppressed
+        rare = F[FINDINGS[RARE]]  # one positive study in all: the rounded count, nothing that gives 1 back
+        assert rare["positives"] == "<5" and rare["suppressed"] == n11.TOO_FEW and rare["folds"] is None and rare["n_folds"] is None
+        for key in ("b_lite_minus_frozen0", "b_lite_minus_head_only"):
+            assert rare[key] == {"fold_stratified_auc": None, "mean_of_fold_aucs": None, "interval_side": "undefined",
+                                 "fold_stratified_interval": {"lo": None, "hi": None, "valid_share": None}}
+        assert FINDINGS[RARE] in r["summary"]["all_findings"]["undefined"]
+        assert all(F[f]["label"] == n11.DEV_LABEL and ("suppressed" in F[f]) == (f == FINDINGS[RARE]) for f in FINDINGS)
         for j, name in enumerate(FINDINGS):
             if j != RARE:
                 n = sum(int((made.truth[(e, k, "frozen0")][1][:, j] == 1).sum()) for k in range(5))
@@ -223,3 +234,41 @@ def test_cli_entry_matches_the_runbook_card():
     meta = mk.metadata("u", "n11-dev-findings")
     assert meta["kernel_sources"] == mk.metadata("u", "n11-dev")["kernel_sources"] == ["u/knee-n11-a", "u/knee-n11-b", "u/knee-n11-decide"]
     assert meta["enable_gpu"] is False and meta["enable_internet"] == mk.metadata("u", "n11-dev")["enable_internet"]
+
+
+def test_small_classes_and_partly_valid_intervals_show_nothing():
+    from knee import agg
+    from knee.nb import n11
+
+    # an interval some draws could not give has no side, whatever its ends
+    assert n11._side_of_0({"lo": 0.1, "hi": 0.2, "valid_share": 0.999}) == "undefined"
+    assert n11._side_of_0({"lo": 0.1, "hi": 0.2, "valid_share": 1.0}) == "above_0"
+    assert n11._side_of_0({"lo": -0.2, "hi": -0.1, "valid_share": 1.0}) == "below_0"
+    assert n11._side_of_0({"lo": -0.1, "hi": 0.2, "valid_share": 1.0}) == "includes_0"
+    assert n11._side_of_0({"lo": None, "hi": None, "valid_share": 0.0}) == "undefined"
+    rng = np.random.default_rng(3)
+    n = 60
+    fold = np.repeat(np.arange(5), n)
+    Y = (rng.random((5 * n, 12)) < 0.4).astype(float)
+    Y[:, 0] = 0.0
+    Y[[0, 1, n, 2 * n], 0] = 1.0  # 4 positive studies in all
+    Y[:, 1] = 1.0
+    Y[[5, n + 5, 3 * n + 5], 1] = 0.0  # 3 negative studies in all
+    Y[:, 2] = 0.0  # no positive study: 0 identifies nobody and is written
+    Y[:, 3] = 0.0
+    Y[:5, 3] = 1.0  # 5 positive studies, all in fold 0: shown
+    A = {a: {"uid": np.arange(5 * n).astype(str), "P": rng.random((5 * n, 12)), "Y": Y, "fold": fold} for a in n11.DEV_ARMS}
+    r = n11.findings_block(A, n_boot=30, seed=0)
+    agg._check(json.loads(json.dumps(r, default=agg._json_default)))
+    F = r["findings"]
+    for j in (0, 1):
+        b = F[FINDINGS[j]]
+        assert b["suppressed"] == n11.TOO_FEW and b["folds"] is None and b["n_folds"] is None
+        assert all(b[a] == {"fold_stratified_auc": None, "mean_of_fold_aucs": None} for a in n11.DEV_ARMS)
+        assert b["b_lite_minus_frozen0"]["fold_stratified_interval"] == {"lo": None, "hi": None, "valid_share": None}
+        assert b["b_lite_minus_frozen0"]["interval_side"] == b["b_lite_minus_head_only"]["interval_side"] == "undefined"
+    assert F[FINDINGS[0]]["positives"] == "<5" and F[FINDINGS[1]]["positives"] == 295
+    assert F[FINDINGS[2]]["positives"] == 0 and F[FINDINGS[2]]["folds"] == [] and "suppressed" not in F[FINDINGS[2]]
+    assert F[FINDINGS[2]]["b_lite"]["fold_stratified_auc"] is None and F[FINDINGS[2]]["b_lite_minus_frozen0"]["interval_side"] == "undefined"
+    assert F[FINDINGS[3]]["positives"] == 5 and F[FINDINGS[3]]["folds"] == [0] and F[FINDINGS[3]]["b_lite"]["fold_stratified_auc"] is not None
+    assert "suppressed" not in F[FINDINGS[3]]

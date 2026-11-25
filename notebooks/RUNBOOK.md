@@ -587,7 +587,7 @@ Pass criteria (summary block and agg_n11_dev.json):
 
 ### 4b. knee-n11-dev-findings (optional; after knee-n11-dev; the per-finding description)
 
-CPU, internet On. Inputs: the same as knee-n11-dev (outputs of knee-n11-a, knee-n11-b, and knee-n11-c, knee-n11-d if they ran, and knee-n11-decide). Nothing else. Fork of knee-n11-dev, the same COMMIT.
+CPU, internet On. Inputs: the same as knee-n11-dev (outputs of knee-n11-a, knee-n11-b, and knee-n11-c, knee-n11-d if they ran, and knee-n11-decide). Nothing else (knee-n11-c and knee-n11-d: add by hand if they ran). Fork of knee-n11-dev. COMMIT = the reviewed commit that holds n11.dev_findings (named in the planning log); dev()'s code path is unchanged from 095c91f.
 
 ```python
 from knee.nb import n11; n11.dev_findings()
@@ -597,13 +597,13 @@ Expected time: 3-6 min. The gate is dev()'s: it refuses to run without a "decide
 
 What to read (summary block and agg_n11_dev_findings.json):
 1. STEP n11_dev_findings: OK. status "ok". decision.sha256 equals the recorded decision's.
-2. Check first: per encoder and arm, the mean of the 12 findings' fold_stratified_auc equals fold_stratified_macro_auc in agg_n11_dev.json (to 0.0001). A gap = stop and report.
-3. encoders.<encoder>.findings.<finding>: positives (rounded to 5; "<5" = too few to show), folds and n_folds (the folds where the finding has both classes), then per arm fold_stratified_auc and mean_of_fold_aucs, then b_lite_minus_frozen0 and b_lite_minus_head_only with fold_stratified_interval and interval_side (above_0, below_0, includes_0, undefined).
-4. encoders.<encoder>.per_fold_macro.fold_<k>: each arm's macro AUC in that fold and b_lite_minus_frozen0. null = a finding lacks a class in that fold. The mean of the five values is dev()'s mean_of_fold_macros.
+2. Check first: per encoder and arm, the mean of the 12 findings' fold_stratified_auc equals fold_stratified_macro_auc in agg_n11_dev.json (to 0.0002; both sides are rounded to 4 decimals). A gap = stop and report.
+3. encoders.<encoder>.findings.<finding>: positives (rounded to 5; "<5" = too few to show), folds and n_folds (the folds where the finding has both classes), then per arm fold_stratified_auc and mean_of_fold_aucs, then b_lite_minus_frozen0 and b_lite_minus_head_only with fold_stratified_interval and interval_side (above_0, below_0, includes_0, undefined). undefined = valid_share under 1 (a draw had no pair) or no interval. A finding with 1 to 4 positive or negative studies has suppressed "too few to show": its AUCs, differences, intervals, folds and n_folds are null.
+4. encoders.<encoder>.per_fold_macro.fold_<k>: each arm's macro AUC in that fold and b_lite_minus_frozen0. null = a finding lacks a class in that fold. The mean of the values that are not null is dev()'s mean_of_fold_macros.
 5. encoders.<encoder>.summary: all_findings and groups (meniscus_pair, oa_pair, all_other), each with the lists of findings whose interval of b_lite minus frozen0 lies above 0, below 0 or includes 0. The number of findings is the length of the list.
-6. Read a finding with few positives or n_folds under 5 with care: its interval is wide and valid_share can be under 1.
+6. Read a finding with few positives or n_folds under 5 with care: its interval is wide.
 
-Reading rule: every number here carries the development label (R6) and is descriptive. The 12 intervals have no multiplicity correction; they describe, they decide nothing (R8). The decision stays the record of knee-n11-decide.
+Reading rule: every number here carries the development label (R6) and is descriptive. The intervals (12 findings x 2 differences per encoder) have no multiplicity correction; they describe, they decide nothing (R8). The decision stays the record of knee-n11-decide.
 
 Rules for reading N11:
 1. The decision is the record's keep per encoder, from inner validation only (R4). Limits said with it (record.limits).
