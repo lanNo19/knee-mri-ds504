@@ -967,7 +967,7 @@ def _refs(text: str) -> set:
 def test_everything_reachable_from_run_slices_is_textually_the_arm_commit():
     """The Kaggle sessions of the five arms install SLICE_ARM_COMMIT. The later commit may change the local decide
     step only: (1) every file under src/ and pyproject.toml is that commit's, except n13s.py, and no module was
-    added; (2) in n13s.py every top-level statement of that commit is unchanged in text and order (the module
+    added except n13d.py, which none of them names; (2) in n13s.py every top-level statement of that commit is unchanged in text and order (the module
     docstring and the imports too) and the later statements only follow them; (3) nothing that run_slices
     reaches, by name, is a name added later."""
     from knee.nb import n13s
@@ -983,7 +983,12 @@ def test_everything_reachable_from_run_slices_is_textually_the_arm_commit():
         if f != f13s:
             assert _git("show", f"{arm}:{f}") == (REPO / f).read_bytes(), f
     on_disk = {p.relative_to(REPO).as_posix() for p in (REPO / "src").rglob("*.py")}
-    assert on_disk <= set(tracked)  # no module was added
+    # No module was added that an arm could reach. One module was added after the arm commit: n13d.py, the
+    # dropout-ceiling check (it2d). An arm run at the arm commit cannot import it: every other file is that
+    # commit's text (above), n13s.py's reachable statements are that commit's (below), and none names it.
+    assert on_disk - set(tracked) <= {"src/knee/nb/n13d.py"}
+    for f in (f13s, "src/knee/nb/n13.py", "src/knee/nb/__init__.py"):
+        assert "n13d" not in (REPO / f).read_text(), f
     old, new = _top(_git("show", f"{arm}:{f13s}").decode()), _top((REPO / f13s).read_text())
     assert [text for _, text in new[:len(old)]] == [text for _, text in old]  # same text, same order
     added = set().union(*(names for names, _ in new[len(old):]))

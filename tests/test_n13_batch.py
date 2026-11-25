@@ -796,11 +796,13 @@ def test_everything_reachable_from_an_arm_run_is_textually_commit_39c3c6f():
         if f != "src/knee/nb/n13.py":
             assert _git("show", f"{ARM}:{f}") == (REPO / f).read_bytes(), f
     on_disk = {p.relative_to(REPO).as_posix() for p in (REPO / "src").rglob("*.py")}
-    # No module was added that an arm could reach. One module was added after 39c3c6f: n13s.py, the slice-count
-    # check (it2c). An arm run at 39c3c6f cannot import it: every other file is that commit's text (above),
-    # n13.py's statements are that commit's (below), and neither names n13s.
-    assert on_disk - set(tracked) <= {"src/knee/nb/n13s.py"}
-    assert "n13s" not in (REPO / "src/knee/nb/n13.py").read_text() and "n13s" not in (REPO / "src/knee/nb/__init__.py").read_text()
+    # No module was added that an arm could reach. Two modules were added after 39c3c6f: n13s.py, the slice-count
+    # check (it2c), and n13d.py, the dropout-ceiling check (it2d). An arm run at 39c3c6f cannot import them: every
+    # other file is that commit's text (above), n13.py's statements are that commit's (below), and neither names them.
+    assert on_disk - set(tracked) <= {"src/knee/nb/n13s.py", "src/knee/nb/n13d.py"}
+    for added_module in ("n13s", "n13d"):
+        assert added_module not in (REPO / "src/knee/nb/n13.py").read_text()
+        assert added_module not in (REPO / "src/knee/nb/__init__.py").read_text()
     old, new = _top(_git("show", f"{ARM}:src/knee/nb/n13.py").decode()), _top((REPO / "src/knee/nb/n13.py").read_text())
     kept_old = [text for names, text in old if not names & DECIDE_ONLY]
     kept_new = [text for names, text in new if not names & (DECIDE_ONLY | DECIDE_NEW)]
